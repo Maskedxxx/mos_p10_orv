@@ -1,0 +1,25 @@
+# Веб-страница сервиса П-10 (карта гипотез ОРВ), порт 8030.
+# Установка и запуск — командами из отчёта, юнит сам себя не ставит.
+
+[Unit]
+Description=П-10 ОРВ: веб-страница карты гипотез (NiceGUI, порт 8030)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=masked
+Group=masked
+WorkingDirectory=/home/masked/projects/p10-orv
+ExecStart=/home/masked/projects/p10-orv/.venv/bin/python -m app.web
+# Логи уходят в journalctl -u p10-orv
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=p10-orv
+# Вывод не буферизуется, иначе логи прогона появляются в журнале с задержкой
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

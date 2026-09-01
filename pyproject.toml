@@ -1,0 +1,5 @@
+[project]
+name = "p10-orv"
+version = "0.1.0"
+description = "П-10: карта гипотез и запрос показателей по акту ОРВ"
+requires-python = ">=3.12"
