@@ -38,8 +38,10 @@ def _map() -> HypothesisMap:
             row_id=1, indicators=[1, 8], hypothesis="гипотеза 1",
             effect=Effect(metric="издержки заявителя, руб.", how_to_calculate="сумма расходов"),
             data=[
-                DataItem(metric="число заявок", source="запрос органу"),
+                # намеренно вперемешку: открытый первым — рендер обязан
+                # поднять «запрос органу» наверх сам (фикс N 2)
                 DataItem(metric="доля отказов", source="открытый", where="Мосстат"),
+                DataItem(metric="число заявок", source="запрос органу"),
             ],
             proof="дословная цитата 1", clause="5.1.4",
         ),
@@ -69,9 +71,28 @@ def _request() -> DataRequest:
 
 
 def _buckets(*, with_failed: bool) -> Buckets:
+    # индикаторы 1 и 8 — строка карты 1, индикатор 3 — строка карты 2
+    violated = [
+        # цитаты нет, вывод построен на внешней практике (случай индикатора 10
+        # живого прогона); пункт вердикта «9.9» намеренно расходится с пунктом
+        # строки карты «5.1.4» — карта не должна подменяться вердиктом
+        Verdict(indicator=1, name="межведомственное взаимодействие", verdict="нарушен",
+                rationale="практика показывает обратное", clause="9.9",
+                sources=["https://practice.example/1", "https://practice.example/2"]),
+        Verdict(indicator=8, name="оптимальный пакет документов", verdict="нарушен",
+                rationale="пакет избыточен", proof="цитата вердикта 8", clause="8.8",
+                sources=["https://practice.example/1"]),   # дубль адреса — дедупликация
+    ]
+    no_data = [
+        # у вердикта цитата ЕСТЬ, а строка карты 2 идёт без неё — подстановка
+        Verdict(indicator=3, name="актуальность законодательства", verdict="нет данных",
+                rationale="статистики нет", proof="цитата вердикта 3", clause="2.5",
+                missing_data="число обращений за 3 года"),
+    ]
     checked = [
         Verdict(indicator=2, name="электронная подача документов", verdict="соблюдён",
-                rationale="реализовано через портал госуслуг", proof="цитата", clause="2.1"),
+                rationale="реализовано через портал госуслуг", proof="цитата", clause="2.1",
+                sources=["https://docs.cntd.ru/document/3666532", "https://www.mos.ru/depr/"]),
         Verdict(indicator=5, name="возможность доработки пакета документов",
                 verdict="не применимо", rationale="требование к пакету отсутствует"),
     ]
@@ -81,7 +102,7 @@ def _buckets(*, with_failed: bool) -> Buckets:
             Verdict(indicator=9, name="содержание понятных требований", verdict="ошибка",
                     rationale="таймаут процесса после 900 с", attempts=3),
         ]
-    return Buckets(violated=[], no_data=[], checked=checked, failed=failed)
+    return Buckets(violated=violated, no_data=no_data, checked=checked, failed=failed)
 
 
 def _summary() -> str:
@@ -105,20 +126,34 @@ def _summary_unparseable() -> str:
     return "## Саммари\n\nПриказ ДСМИ от 09.08.2021 № 123 «О порядке».\n\nДалее текст саммари."
 
 
-def _find_header_row(ws) -> int:
-    """Найти строку заголовка листа «Карта гипотез» — она может быть сдвинута
-    вниз строками саммари."""
+def _find_header_row(ws, anchor: str = "Индикаторы") -> int:
+    """
+    Найти строку шапки листа по известному заголовку в любой колонке.
+
+    Привязываться к координатам нельзя: строка шапки едет вниз (строка
+    реквизитов акта, подпись листа), а колонки едут вправо (добавляется «№»).
+    Ищем сам заголовок.
+    """
     for i in range(1, ws.max_row + 1):
-        if ws.cell(row=i, column=1).value == "Индикаторы":
-            return i
-    raise AssertionError("заголовок листа «Карта гипотез» не найден")
+        for c in ws[i]:
+            if c.value == anchor:
+                return i
+    raise AssertionError(f"строка шапки с заголовком «{anchor}» не найдена")
+
+
+def _col(ws, header_row: int, name: str) -> int:
+    """Номер колонки по тексту её заголовка в строке шапки."""
+    for c in ws[header_row]:
+        if c.value == name:
+            return c.column
+    raise AssertionError(f"колонка «{name}» не найдена в строке {header_row}")
 
 
 def test_opens_with_openpyxl_and_four_sheets(tmp_runs_dir):
     path = build_excel(_map(), _request(), _buckets(with_failed=True), _summary(), "run_a")
     wb = load_workbook(path)
     assert wb.sheetnames == [
-        "Карта гипотез", "Запрос показателей", "Проверенные индикаторы", "Ошибки прогона",
+        "Карта гипотез", "Запрос показателей", "Нарушений не найдено", "Ошибки прогона",
     ]
 
 
@@ -131,50 +166,61 @@ def test_saved_as_08_result_in_run_dir(tmp_runs_dir):
 def test_failed_sheet_present_even_when_bucket_empty(tmp_runs_dir):
     path = build_excel(_map(), _request(), _buckets(with_failed=False), _summary(), "run_c")
     ws = load_workbook(path)["Ошибки прогона"]
-    assert [c.value for c in ws[1]] == ["Индикатор", "Что случилось", "Попыток"]
-    assert ws.max_row == 2  # шапка + одна строка «ошибок нет»
-    assert ws.cell(row=2, column=1).value == "ошибок нет"
+    hdr = _find_header_row(ws, "Что случилось")
+    assert [c.value for c in ws[hdr]] == ["Индикатор", "Что случилось", "Попыток"]
+    assert ws.max_row == hdr + 1  # шапка + одна строка «ошибок нет»
+    assert ws.cell(row=hdr + 1, column=1).value == "ошибок нет"
 
 
 def test_failed_sheet_lists_failures(tmp_runs_dir):
     path = build_excel(_map(), _request(), _buckets(with_failed=True), _summary(), "run_d")
     ws = load_workbook(path)["Ошибки прогона"]
-    assert ws.max_row == 2
-    assert "содержание понятных требований" in ws.cell(row=2, column=1).value
-    assert ws.cell(row=2, column=2).value == "таймаут процесса после 900 с"
-    assert ws.cell(row=2, column=3).value == 3
+    hdr = _find_header_row(ws, "Что случилось")
+    row = hdr + 1
+    assert ws.max_row == row
+    assert "содержание понятных требований" in ws.cell(row=row, column=_col(ws, hdr, "Индикатор")).value
+    assert ws.cell(row=row, column=_col(ws, hdr, "Что случилось")).value == "таймаут процесса после 900 с"
+    assert ws.cell(row=row, column=_col(ws, hdr, "Попыток")).value == 3
 
 
 def test_checked_sheet_lists_verdicts(tmp_runs_dir):
     path = build_excel(_map(), _request(), _buckets(with_failed=False), _summary(), "run_e")
-    ws = load_workbook(path)["Проверенные индикаторы"]
-    assert [c.value for c in ws[1]] == ["Индикатор", "Вердикт", "Обоснование", "Пруф", "Пункт"]
-    assert ws.max_row == 3  # шапка + 2 вердикта
-    assert "электронная подача документов" in ws.cell(row=2, column=1).value
-    assert ws.cell(row=2, column=2).value == "соблюдён"
+    ws = load_workbook(path)["Нарушений не найдено"]
+    hdr = _find_header_row(ws, "Вердикт")
+    assert [c.value for c in ws[hdr]] == [
+        "Индикатор", "Вердикт", "Обоснование", "На чём основано",
+    ]
+    assert ws.max_row == hdr + 2  # шапка + 2 вердикта
+    assert "электронная подача документов" in ws.cell(row=hdr + 1, column=_col(ws, hdr, "Индикатор")).value
+    assert ws.cell(row=hdr + 1, column=_col(ws, hdr, "Вердикт")).value == "соблюдён"
 
 
 def test_request_sheet_has_three_year_columns_not_four(tmp_runs_dir):
     path = build_excel(_map(), _request(), _buckets(with_failed=False), _summary(), "run_f")
     ws = load_workbook(path)["Запрос показателей"]
-    header = [c.value for c in ws[1]]
+    hdr = _find_header_row(ws, "Показатель")
+    header = [c.value for c in ws[hdr]]
     assert header[:2] == ["№", "Показатель"]
-    assert len(header) == 5  # № + Показатель + 3 года
-    assert len(header[2:]) == 3
+    # колонки годов ищем по виду заголовка, а не по позиции: между «Показателем»
+    # и годами могут появиться колонки связи с картой
+    years = [h for h in header if h and str(h).isdigit() and len(str(h)) == 4]
+    assert len(years) == 3
 
 
 def test_breakdown_rendered_as_subrows(tmp_runs_dir):
     path = build_excel(_map(), _request(), _buckets(with_failed=False), _summary(), "run_g")
     ws = load_workbook(path)["Запрос показателей"]
-    # строка 2: основной показатель "1", строки 3-4: подстроки "1.1"/"1.2"
-    assert ws.cell(row=2, column=1).value == "1"
-    assert ws.cell(row=3, column=1).value == "1.1"
-    assert ws.cell(row=3, column=2).value == "юридические лица"
-    assert ws.cell(row=4, column=1).value == "1.2"
-    assert ws.cell(row=4, column=2).value == "индивидуальные предприниматели"
+    hdr = _find_header_row(ws, "Показатель")
+    num, metric = _col(ws, hdr, "№"), _col(ws, hdr, "Показатель")
+    # первая строка после шапки: основной показатель "1", затем подстроки "1.1"/"1.2"
+    assert ws.cell(row=hdr + 1, column=num).value == "1"
+    assert ws.cell(row=hdr + 2, column=num).value == "1.1"
+    assert ws.cell(row=hdr + 2, column=metric).value == "юридические лица"
+    assert ws.cell(row=hdr + 3, column=num).value == "1.2"
+    assert ws.cell(row=hdr + 3, column=metric).value == "индивидуальные предприниматели"
     # показатель "2" без разрезов идёт сразу за подстроками первого
-    assert ws.cell(row=5, column=1).value == "2"
-    assert ws.max_row == 5
+    assert ws.cell(row=hdr + 4, column=num).value == "2"
+    assert ws.max_row == hdr + 4
 
 
 def test_map_data_cell_backrefs_point_to_existing_request_rows(tmp_runs_dir):
@@ -184,16 +230,23 @@ def test_map_data_cell_backrefs_point_to_existing_request_rows(tmp_runs_dir):
     ws_req = wb["Запрос показателей"]
 
     header_row = _find_header_row(ws_map)
-    data_row1 = ws_map.cell(row=header_row + 1, column=4).value  # колонка «Данные», строка карты 1
-    data_row2 = ws_map.cell(row=header_row + 2, column=4).value
+    data_col = _col(ws_map, header_row, "Данные")
+    data_row1 = ws_map.cell(row=header_row + 1, column=data_col).value  # строка карты 1
+    data_row2 = ws_map.cell(row=header_row + 2, column=data_col).value
 
     assert "№ 1" in data_row1           # запрос органу -> ссылается на показатель № 1
-    assert "открытый" in data_row1      # второй показатель без ссылки на запрос
-    assert "№ 1" not in data_row1.split("открытый")[1]  # ссылка не приклеена к «открытому»
+    assert "Открытые источники" in data_row1   # открытый показатель в своём блоке
+    # ссылка стоит в заголовке блока запроса и не приклеена к открытому блоку
+    assert "№" not in data_row1.split("Открытые источники")[1]
     assert "№ 2" in data_row2
 
     # номера "1" и "2" реально существуют на листе запроса (первая колонка)
-    request_nums = {str(ws_req.cell(row=r, column=1).value) for r in range(2, ws_req.max_row + 1)}
+    req_hdr = _find_header_row(ws_req, "Показатель")
+    req_num_col = _col(ws_req, req_hdr, "№")
+    request_nums = {
+        str(ws_req.cell(row=r, column=req_num_col).value)
+        for r in range(req_hdr + 1, ws_req.max_row + 1)
+    }
     assert {"1", "2"} <= request_nums
 
 
@@ -206,7 +259,7 @@ def test_summary_header_has_requisites_not_raw_markdown(tmp_runs_dir):
     ws_map = wb["Карта гипотез"]
 
     header_row = _find_header_row(ws_map)
-    assert header_row == 2  # ровно одна строка шапки перед заголовками колонок
+    assert header_row == 3  # реквизиты + подпись листа перед заголовками колонок
 
     summary_cell = ws_map.cell(row=1, column=1).value
     assert summary_cell != "Индикаторы"
@@ -217,9 +270,14 @@ def test_summary_header_has_requisites_not_raw_markdown(tmp_runs_dir):
     assert "9 августа 2021 г." in summary_cell
     assert "Департамент средств массовой информации и рекламы города Москвы" in summary_cell
 
-    for name in ("Карта гипотез", "Запрос показателей", "Проверенные индикаторы", "Ошибки прогона"):
+    for name, anchor in (
+        ("Карта гипотез", "Индикаторы"),
+        ("Запрос показателей", "Показатель"),
+        ("Нарушений не найдено", "Вердикт"),
+        ("Ошибки прогона", "Что случилось"),
+    ):
         ws = wb[name]
-        hdr = header_row if name == "Карта гипотез" else 1
+        hdr = _find_header_row(ws, anchor)
         assert ws.cell(row=hdr, column=1).font.bold is True
         assert ws.cell(row=hdr, column=1).fill.fgColor.rgb.endswith("1F4E78")
         assert ws.freeze_panes == ws.cell(row=hdr + 1, column=1).coordinate
@@ -228,7 +286,7 @@ def test_summary_header_has_requisites_not_raw_markdown(tmp_runs_dir):
 def test_no_summary_header_when_summary_empty(tmp_runs_dir):
     path = build_excel(_map(), _request(), _buckets(with_failed=False), "", "run_j")
     ws_map = load_workbook(path)["Карта гипотез"]
-    assert ws_map.cell(row=1, column=1).value == "Индикаторы"
+    assert _find_header_row(ws_map) == 2   # только подпись листа, строки реквизитов нет
 
 
 def test_no_summary_header_when_requisites_unrecognizable(tmp_runs_dir):
@@ -239,20 +297,402 @@ def test_no_summary_header_when_requisites_unrecognizable(tmp_runs_dir):
         _map(), _request(), _buckets(with_failed=False), _summary_unparseable(), "run_j2",
     )
     ws_map = load_workbook(path)["Карта гипотез"]
-    assert ws_map.cell(row=1, column=1).value == "Индикаторы"
-    assert ws_map.max_row == 3  # заголовок + 2 строки карты, ни одной мусорной сверху
+    assert _find_header_row(ws_map) == 2                   # подпись, мусорной строки нет
+    assert ws_map.max_row == 4                             # подпись + шапка + 2 строки карты
 
 
 def test_map_sheet_row_content(tmp_runs_dir):
     path = build_excel(_map(), _request(), _buckets(with_failed=False), "", "run_k")
     ws = load_workbook(path)["Карта гипотез"]
-    assert [c.value for c in ws[1]] == ["Индикаторы", "Гипотеза", "Эффект", "Данные", "Пруф", "Пункт"]
-    assert ws.cell(row=2, column=1).value == "1, 8"
-    assert ws.cell(row=2, column=2).value == "гипотеза 1"
-    assert "издержки заявителя" in ws.cell(row=2, column=3).value
-    assert "сумма расходов" in ws.cell(row=2, column=3).value
-    assert ws.cell(row=2, column=5).value == "дословная цитата 1"
-    assert ws.cell(row=2, column=6).value == "5.1.4"
+    hdr = _find_header_row(ws)
+    assert [c.value for c in ws[hdr]] == [
+        "№", "Индикаторы", "Гипотеза", "Эффект", "Данные", "На чём основано",
+    ]
+    row = hdr + 1
+    assert ws.cell(row=row, column=_col(ws, hdr, "Индикаторы")).value == (
+        "1. межведомственное взаимодействие\n8. оптимальный пакет документов"
+    )
+    assert ws.cell(row=row, column=_col(ws, hdr, "Гипотеза")).value == "гипотеза 1"
+    effect = ws.cell(row=row, column=_col(ws, hdr, "Эффект")).value
+    assert "издержки заявителя" in effect
+    assert "сумма расходов" in effect
+    basis = ws.cell(row=row, column=_col(ws, hdr, "На чём основано")).value
+    assert "«дословная цитата 1»" in basis
+    assert "п. 5.1.4" in basis
+
+
+# ----------------------------------------------------------------------
+# Фикс N 1 (трек багов, 2026-09-02): в карте гипотез у индикаторов не было
+# имён — только номера. Владелец: «в индикаторов нет имён индикаторов, а в
+# Проверенные индикаторы есть. Надо чтобы везде имена были».
+# ----------------------------------------------------------------------
+
+
+def test_map_indicator_column_has_names(tmp_runs_dir):
+    """Номер и имя, как на листе проверенных индикаторов, а не голая цифра."""
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), "", "run_ind_names")
+    ws = load_workbook(path)["Карта гипотез"]
+    hdr = _find_header_row(ws)
+    col = _col(ws, hdr, "Индикаторы")
+
+    # строка карты 1 объединяет индикаторы 1 и 8 — каждый на своей строке клетки
+    assert ws.cell(row=hdr + 1, column=col).value == (
+        "1. межведомственное взаимодействие\n8. оптимальный пакет документов"
+    )
+    # строка карты 2 — один индикатор
+    assert ws.cell(row=hdr + 2, column=col).value == "3. актуальность законодательства"
+
+
+def test_map_indicator_column_wide_enough_for_names(tmp_runs_dir):
+    """Ширина колонки под имена — как на листе проверенных индикаторов (34)."""
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), "", "run_ind_width")
+    ws = load_workbook(path)["Карта гипотез"]
+    hdr = _find_header_row(ws)
+    letter = ws.cell(row=hdr, column=_col(ws, hdr, "Индикаторы")).column_letter
+    assert ws.column_dimensions[letter].width >= 34
+
+
+# ----------------------------------------------------------------------
+# Фикс N 4 (трек багов, 2026-09-02): в колонке «Эффект» показатель и способ
+# его расчёта шли подряд без подписей — глазом не видно, где кончается «что
+# меряем» и начинается «как считать».
+# ----------------------------------------------------------------------
+
+
+def test_effect_cell_has_labels(tmp_runs_dir):
+    """Два блока подписаны и разделены пустой строкой."""
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), "", "run_effect")
+    ws = load_workbook(path)["Карта гипотез"]
+    hdr = _find_header_row(ws)
+    cell = ws.cell(row=hdr + 1, column=_col(ws, hdr, "Эффект")).value
+
+    assert cell == (
+        "Показатель:\n"
+        "издержки заявителя, руб.\n"
+        "\n"
+        "Как считать:\n"
+        "сумма расходов"
+    )
+
+
+# ----------------------------------------------------------------------
+# Фиксы N 2 и N 3 (трек багов, 2026-09-02): колонка «Данные» шла сплошным
+# текстом, тип источника был спрятан в скобках в середине строки, а номера
+# строк запроса приписывались КАЖДОМУ показателю целым списком («N 1, 2»
+# у обоих), из-за чего сноска переставала указывать на конкретную строку.
+#
+# Проверено на прогоне 20260825_093039_129668: сопоставить показатель карты
+# со строкой запроса по тексту невозможно — 0 точных совпадений из 20, модель
+# узла [6] переформулирует. Поэтому номера выносятся в ЗАГОЛОВОК блока: это
+# ровно та точность, что есть в данных (RequestItem.for_rows -> MapRow.row_id).
+# ----------------------------------------------------------------------
+
+
+def _data_cell(path, row_offset: int = 1) -> str:
+    ws = load_workbook(path)["Карта гипотез"]
+    hdr = _find_header_row(ws)
+    return ws.cell(row=hdr + row_offset, column=_col(ws, hdr, "Данные")).value
+
+
+def test_data_cell_groups_by_source(tmp_runs_dir):
+    """«Запрос в орган» выше «Открытых источников», хотя в данных порядок обратный."""
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), "", "run_data_group")
+    cell = _data_cell(path)
+    assert cell.index("Запрос в орган") < cell.index("Открытые источники")
+    assert cell.index("число заявок") < cell.index("доля отказов")
+
+
+def test_data_cell_open_sources_annotated(tmp_runs_dir):
+    """У открытого блока есть пояснение, что у органа это не запрашивают."""
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), "", "run_data_annot")
+    cell = _data_cell(path)
+    assert "Открытые источники (берём сами, у органа не запрашиваем):" in cell
+    assert "Мосстат" in cell           # адрес открытого источника сохранён
+    assert "(открытый" not in cell     # старая пометка в скобках убрана
+
+
+def test_data_cell_request_nums_on_block_not_items(tmp_runs_dir):
+    """Номер строки запроса стоит один раз в заголовке блока, а не у показателя."""
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), "", "run_data_nums")
+    cell = _data_cell(path)
+    lines = cell.splitlines()
+
+    head = [ln for ln in lines if ln.startswith("Запрос в орган")]
+    assert head == ["Запрос в орган (лист «Запрос показателей», № 1):"]
+    # ни одна строка-показатель номера не несёт
+    assert [ln for ln in lines if ln.startswith("—") and "№" in ln] == []
+    assert cell.count("№") == 1
+
+
+def test_data_cell_omits_empty_group(tmp_runs_dir):
+    """Строка без открытых показателей не печатает пустой заголовок группы."""
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), "", "run_data_empty")
+    cell = _data_cell(path, row_offset=2)   # строка карты 2 — только «запрос органу»
+    assert "Запрос в орган" in cell
+    assert "Открытые источники" not in cell
+
+
+# ----------------------------------------------------------------------
+# Фикс N 5 (трек багов, 2026-09-02): из документа не было понятно, откуда
+# взят пруф. Две мини-правки: заголовки «Пруф»/«Пункт» сводятся в одну
+# понятную колонку, и в неё возвращаются внешние источники, которые модель
+# находила, но которые терялись между шагом [2] и шагом [5] — ни Hypothesis,
+# ни MapRow поля sources не имеют.
+# ----------------------------------------------------------------------
+
+
+def _basis_cell(path, row_offset: int = 1) -> str:
+    ws = load_workbook(path)["Карта гипотез"]
+    hdr = _find_header_row(ws)
+    return ws.cell(row=hdr + row_offset, column=_col(ws, hdr, "На чём основано")).value
+
+
+def test_basis_column_replaces_proof_and_clause(tmp_runs_dir):
+    """Вместо «Пруф» и «Пункт» одна колонка «На чём основано»."""
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), "", "run_basis_hdr")
+    ws = load_workbook(path)["Карта гипотез"]
+    hdr = _find_header_row(ws)
+    headers = [c.value for c in ws[hdr]]
+    assert "На чём основано" in headers
+    assert "Пруф" not in headers
+    assert "Пункт" not in headers
+
+
+def test_basis_cell_has_norm_label(tmp_runs_dir):
+    """Цитата подписана как норма акта, с номером пункта из строки карты."""
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), "", "run_basis_norm")
+    cell = _basis_cell(path)
+    assert cell.startswith("Норма акта, п. 5.1.4:\n«дословная цитата 1»")
+
+
+def test_basis_clause_not_overridden_by_verdict(tmp_runs_dir):
+    """Пункт берётся из строки карты (5.1.4), а не из вердикта (9.9)."""
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), "", "run_basis_clause")
+    cell = _basis_cell(path)
+    assert "п. 5.1.4" in cell
+    assert "9.9" not in cell
+
+
+def test_basis_cell_carries_web_sources(tmp_runs_dir):
+    """Адреса из вердиктов индикаторов строки доезжают до документа, без дублей."""
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), "", "run_basis_src")
+    cell = _basis_cell(path)
+    assert "Внешние источники:" in cell
+    assert "— https://practice.example/1" in cell
+    assert "— https://practice.example/2" in cell
+    assert cell.count("https://practice.example/1") == 1   # индикаторы 1 и 8 дали дубль
+
+
+def test_basis_cell_falls_back_to_verdict_proof(tmp_runs_dir):
+    """Строка карты без цитаты берёт цитату вердикта своего индикатора."""
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), "", "run_basis_fb")
+    cell = _basis_cell(path, row_offset=2)   # строка карты 2: proof=None, clause=None
+    assert "«цитата вердикта 3»" in cell
+    assert cell.startswith("Норма акта:")    # пункта у строки карты нет — и не подставляем
+
+
+def test_basis_cell_states_when_no_quote_but_sources():
+    """Нет цитаты, но есть адреса — пишем прямо, а не оставляем пустоту."""
+    from app.nodes.excel import _render_basis_cell
+
+    cell = _render_basis_cell(None, "п. 2.2, 2.3, 4-6", ["https://www.privatmed.ru/a"])
+    assert cell.startswith("Норма акта, п. 2.2, 2.3, 4-6:")   # префикс «п.» не удваивается
+    assert "цитата не приведена" in cell
+    assert "внешних источниках" in cell
+    assert "— https://www.privatmed.ru/a" in cell
+
+
+def test_basis_cell_states_when_nothing_at_all():
+    """Ни цитаты, ни адресов — тоже словами, а не пустой клеткой."""
+    from app.nodes.excel import _render_basis_cell
+
+    assert _render_basis_cell(None, None, []) == "Норма акта:\nцитата из акта не приведена"
+
+
+# ----------------------------------------------------------------------
+# Фикс N 7.2 (трек багов, 2026-09-02): на листе проверенных индикаторов те же
+# «Пруф» и «Пункт» с тем же дефектом — адреса терялись. У индикатора 3 живого
+# прогона модель нашла шесть адресов, в файле не было ни одного.
+# ----------------------------------------------------------------------
+
+
+def test_checked_sheet_basis_column(tmp_runs_dir):
+    """Та же колонка «На чём основано», что и в карте, с теми же блоками."""
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), _summary(), "run_chk_basis")
+    ws = load_workbook(path)["Нарушений не найдено"]
+    hdr = _find_header_row(ws, "Вердикт")
+
+    assert [c.value for c in ws[hdr]] == [
+        "Индикатор", "Вердикт", "Обоснование", "На чём основано",
+    ]
+
+    basis = ws.cell(row=hdr + 1, column=_col(ws, hdr, "На чём основано")).value
+    assert basis.startswith("Норма акта, п. 2.1:\n«цитата»")
+    assert "Внешние источники:" in basis
+    assert "— https://docs.cntd.ru/document/3666532" in basis
+    assert "— https://www.mos.ru/depr/" in basis
+
+    # индикатор 5 «не применимо» — ни цитаты, ни адресов, но клетка не пустая
+    assert ws.cell(row=hdr + 2, column=_col(ws, hdr, "На чём основано")).value == (
+        "Норма акта:\nцитата из акта не приведена"
+    )
+
+
+# ----------------------------------------------------------------------
+# Фикс N 6 (трек багов, 2026-09-02): связь листов была односторонней. Из карты
+# в запрос номер вёл, обратно — никак: получив от органа цифры, аналитик не
+# видел, к какой гипотезе они относятся. Данные для связи уже посчитаны
+# (RequestItem.for_rows, RequestItem.clause, MapRow.row_id) — их не выводили.
+# ----------------------------------------------------------------------
+
+
+def test_map_sheet_has_row_number_column(tmp_runs_dir):
+    """Первая колонка карты — номер строки, тот самый, на который ссылается запрос."""
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), "", "run_rownum")
+    ws = load_workbook(path)["Карта гипотез"]
+    hdr = _find_header_row(ws)
+
+    assert [c.value for c in ws[hdr]] == [
+        "№", "Индикаторы", "Гипотеза", "Эффект", "Данные", "На чём основано",
+    ]
+    num = _col(ws, hdr, "№")
+    assert ws.cell(row=hdr + 1, column=num).value == 1
+    assert ws.cell(row=hdr + 2, column=num).value == 2
+
+
+def test_request_sheet_shows_source_rows(tmp_runs_dir):
+    """Показатель, обслуживающий две строки карты, показывает обе с индикаторами."""
+    request = DataRequest(
+        items=[RequestItem(num="1", metric="число заявок", clause="4",
+                           for_rows=[1, 2], breakdown=[])],
+        years=[2020, 2021, 2022],
+    )
+    path = build_excel(_map(), request, _buckets(with_failed=False), "", "run_req_src")
+    ws = load_workbook(path)["Запрос показателей"]
+    hdr = _find_header_row(ws, "Показатель")
+
+    assert ws.cell(row=hdr + 1, column=_col(ws, hdr, "Откуда запрос")).value == (
+        "стр. 1 — инд. 1, 8\nстр. 2 — инд. 3"
+    )
+
+
+def test_request_sheet_shows_clause(tmp_runs_dir):
+    """Пункт акта из RequestItem.clause выводится своей колонкой."""
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), "", "run_req_clause")
+    ws = load_workbook(path)["Запрос показателей"]
+    hdr = _find_header_row(ws, "Показатель")
+    assert ws.cell(row=hdr + 1, column=_col(ws, hdr, "Пункт акта")).value == "5.1.4"
+    # у показателя «2» пункта нет — клетка пустая, а не «None»
+    assert ws.cell(row=hdr + 4, column=_col(ws, hdr, "Пункт акта")).value in (None, "")
+
+
+def test_request_breakdown_subrows_have_no_backref(tmp_runs_dir):
+    """Подстроки разрезов ссылок не несут — они принадлежат родительской строке."""
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), "", "run_req_sub")
+    ws = load_workbook(path)["Запрос показателей"]
+    hdr = _find_header_row(ws, "Показатель")
+    src = _col(ws, hdr, "Откуда запрос")
+    assert ws.cell(row=hdr + 2, column=_col(ws, hdr, "№")).value == "1.1"
+    assert ws.cell(row=hdr + 2, column=src).value in (None, "")
+
+
+def test_backref_round_trip(tmp_runs_dir):
+    """Из карты в запрос и обратно — оба номера ведут на существующие строки."""
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), "", "run_roundtrip")
+    wb = load_workbook(path)
+    ws_map, ws_req = wb["Карта гипотез"], wb["Запрос показателей"]
+
+    map_hdr = _find_header_row(ws_map)
+    req_hdr = _find_header_row(ws_req, "Показатель")
+
+    map_ids = {
+        ws_map.cell(row=r, column=_col(ws_map, map_hdr, "№")).value
+        for r in range(map_hdr + 1, ws_map.max_row + 1)
+    }
+    req_nums = {
+        str(ws_req.cell(row=r, column=_col(ws_req, req_hdr, "№")).value)
+        for r in range(req_hdr + 1, ws_req.max_row + 1)
+    }
+
+    # туда: номер из блока «Запрос в орган» строки карты 1 есть на листе запроса
+    assert "№ 1" in ws_map.cell(row=map_hdr + 1, column=_col(ws_map, map_hdr, "Данные")).value
+    assert "1" in req_nums
+
+    # обратно: номер строки из «Откуда запрос» есть среди номеров карты
+    back = ws_req.cell(row=req_hdr + 1, column=_col(ws_req, req_hdr, "Откуда запрос")).value
+    assert back.startswith("стр. 1 — инд. ")
+    assert 1 in map_ids
+
+
+# ----------------------------------------------------------------------
+# Фикс N 7.1 (трек багов, 2026-09-02): из имени листа не понять принцип
+# отбора. «Проверенные индикаторы» не говорит, что здесь как раз те, по
+# которым гипотезы НЕ строились — владелец, глядя на готовый файл, не понял,
+# зачем этот лист нужен. В имя листа много не влезет (Excel режет на 31
+# знаке), поэтому смысл выносится первой строкой листа.
+# ----------------------------------------------------------------------
+
+_SHEETS_AND_ANCHORS = (
+    ("Карта гипотез", "Индикаторы"),
+    ("Запрос показателей", "Показатель"),
+    ("Нарушений не найдено", "Вердикт"),
+    ("Ошибки прогона", "Что случилось"),
+)
+
+
+def test_sheet_names_say_what_is_on_them(tmp_runs_dir):
+    path = build_excel(_map(), _request(), _buckets(with_failed=True), _summary(), "run_names")
+    wb = load_workbook(path)
+    assert wb.sheetnames == [name for name, _ in _SHEETS_AND_ANCHORS]
+
+
+def test_each_sheet_has_caption_above_header(tmp_runs_dir):
+    """На каждом листе есть строка-подпись, шапка колонок сдвинута под неё."""
+    path = build_excel(_map(), _request(), _buckets(with_failed=True), _summary(), "run_caption")
+    wb = load_workbook(path)
+    for name, anchor in _SHEETS_AND_ANCHORS:
+        ws = wb[name]
+        hdr = _find_header_row(ws, anchor)
+        caption = ws.cell(row=hdr - 1, column=1).value
+        assert caption and len(caption) > 30, f"нет подписи на листе «{name}»"
+        assert ws.cell(row=hdr - 1, column=1).font.italic is True
+
+
+def test_map_sheet_keeps_requisites_above_caption(tmp_runs_dir):
+    """Реквизиты акта остаются самой первой строкой, подпись — под ними."""
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), _summary(), "run_cap_req")
+    ws = load_workbook(path)["Карта гипотез"]
+    assert _find_header_row(ws) == 3            # реквизиты + подпись + шапка
+    assert "N 02-02-313/21" in ws.cell(row=1, column=1).value
+    assert ws.cell(row=2, column=1).value.startswith("Индикаторы, по которым найдено нарушение")
+
+
+def test_caption_counts_come_from_data_not_hardcoded(tmp_runs_dir):
+    """Числитель считается по факту прогона, знаменатель — из конфига."""
+    from app.config import all_indicators
+
+    total = len(all_indicators())
+    path = build_excel(_map(), _request(), _buckets(with_failed=True), _summary(), "run_cap_cnt")
+    wb = load_workbook(path)
+
+    # в карте две строки: индикаторы 1, 8 и 3 — три уникальных
+    assert f"3 из {total}" in wb["Карта гипотез"].cell(row=2, column=1).value
+    # проверенных в куче два
+    assert f"2 из {total}" in wb["Нарушений не найдено"].cell(row=1, column=1).value
+
+
+def test_caption_does_not_break_header_styling(tmp_runs_dir):
+    """Заливка шапки и freeze panes встали на сдвинутую строку."""
+    path = build_excel(_map(), _request(), _buckets(with_failed=True), _summary(), "run_cap_style")
+    wb = load_workbook(path)
+    for name, anchor in _SHEETS_AND_ANCHORS:
+        ws = wb[name]
+        hdr = _find_header_row(ws, anchor)
+        assert ws.cell(row=hdr, column=1).font.bold is True
+        assert ws.cell(row=hdr, column=1).fill.fgColor.rgb.endswith("1F4E78")
+        assert ws.freeze_panes == ws.cell(row=hdr + 1, column=1).coordinate
+        # подпись заливки шапки не получила
+        assert ws.cell(row=hdr - 1, column=1).fill.fgColor.rgb != "FF1F4E78"
 
 
 def test_compute_years_excludes_current_incomplete_year(monkeypatch):

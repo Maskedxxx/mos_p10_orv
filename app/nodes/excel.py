@@ -5,9 +5,9 @@
 версии, откуда переиспользованы стили оформления и compute_years). Собирает
 книгу с четырьмя листами:
 
-    Карта гипотез          — строки карты: индикаторы, гипотеза, эффект, данные, пруф, пункт
-    Запрос показателей     — номер, показатель, три колонки годов (пустые), разрезы подстроками
-    Проверенные индикаторы — куча buckets.checked: индикатор, вердикт, обоснование, пруф, пункт
+    Карта гипотез          — №, индикаторы, гипотеза, эффект, данные, на чём основано
+    Запрос показателей     — №, показатель, откуда запрос, пункт акта, три года (пустые)
+    Нарушений не найдено   — куча buckets.checked: индикатор, вердикт, обоснование, на чём основано
     Ошибки прогона         — куча buckets.failed: индикатор, что случилось, попыток
 
 Оформление — единый деловой стиль фазы 2 (тёмно-синяя шапка 1F4E78, белый
@@ -53,7 +53,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.worksheet.worksheet import Worksheet
 
-from app.config import REQUEST_YEARS_DEPTH
+from app.config import REQUEST_YEARS_DEPTH, all_indicators, get_indicator
 from app.contracts import Buckets, DataItem, DataRequest, Effect, HypothesisMap, Verdict
 from app.logger import get_run_logger
 from app.trace import run_dir
@@ -62,6 +62,7 @@ from app.trace import run_dir
 _HEADER_FILL = PatternFill("solid", fgColor="1F4E78")          # тёмно-синяя шапка
 _HEADER_FONT = Font(bold=True, color="FFFFFF", size=11)        # белый жирный
 _BODY_FONT = Font(size=11)
+_CAPTION_FONT = Font(size=10, italic=True, color="595959")     # подпись листа
 _WRAP_TOP = Alignment(wrap_text=True, vertical="top")          # перенос, верх
 _CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
 _CENTER_TOP = Alignment(horizontal="center", vertical="top")
@@ -70,7 +71,9 @@ _BORDER = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
 
 _SHEET_MAP = "Карта гипотез"
 _SHEET_REQUEST = "Запрос показателей"
-_SHEET_CHECKED = "Проверенные индикаторы"
+_SHEET_CHECKED = "Нарушений не найдено"   # было «Проверенные индикаторы»: имя не
+                                          # говорило, что здесь как раз те индикаторы,
+                                          # по которым гипотезы НЕ строились
 _SHEET_FAILED = "Ошибки прогона"
 
 
@@ -91,6 +94,21 @@ def compute_years(num_years: int = 4, end_year: int | None = None) -> list[int]:
     if end_year is None:
         end_year = datetime.date.today().year - 1
     return list(range(end_year - num_years + 1, end_year + 1))
+
+
+def _render_caption(ws: Worksheet, text: str) -> None:
+    """
+    Одна строка-подпись над шапкой: что за индикаторы на листе и по какому
+    принципу отобраны (фикс N 7.1 трека багов).
+
+    В имя листа смысл не влезает — Excel режет имена на 31 знаке, а владелец,
+    глядя на готовый файл, не понял, зачем лист «Проверенные индикаторы»
+    вообще нужен. Текст кладётся только в колонку A, соседние клетки строки
+    остаются пустыми, поэтому Excel даёт ему растечься по ширине листа —
+    объединять ячейки не нужно.
+    """
+    ws.append([text])
+    ws.cell(row=ws.max_row, column=1).font = _CAPTION_FONT
 
 
 def _style_header_row(ws: Worksheet, row: int) -> None:
@@ -202,37 +220,170 @@ def _row_to_request_nums(request: DataRequest) -> dict[int, list[str]]:
     return mapping
 
 
+# Номер пункта модель пишет и как «4», и как «п. 2.2, 2.3, 4-6» — свой префикс
+# в подписи клетки добавляем сами, поэтому чужой снимаем, чтобы не вышло
+# «Норма акта, п. п. 2.2».
+_CLAUSE_PREFIX_RE = re.compile(r"^\s*(?:п\.?|пункт[а-я]*)\s*", re.IGNORECASE)
+
+
+def _render_basis_cell(proof: str | None, clause: str | None, sources: list[str]) -> str:
+    """
+    Клетка «На чём основано»: норма акта с номером пункта и внешние источники
+    (фикс N 5 трека багов).
+
+    Заменяет пару колонок «Пруф» / «Пункт»: заголовок «Пруф» — жаргон, он не
+    сообщал, что в клетке дословная цитата из проверяемого акта, а «Пункт» не
+    сообщал, что это её адрес внутри акта.
+
+    Пустой цитаты не бывает: если её нет, клетка прямо говорит почему. Пустая
+    клетка при заполненном пункте читалась как нарушение без обоснования —
+    ровно так выглядел индикатор 10 живого прогона, у которого обоснованием
+    была публикация в интернете.
+    """
+    head = "Норма акта"
+    if clause:
+        cleaned = _CLAUSE_PREFIX_RE.sub("", clause).strip()
+        if cleaned:
+            head += f", п. {cleaned}"
+
+    if proof:
+        body = f"«{proof}»"
+    elif sources:
+        body = "цитата не приведена — вывод построен на внешних источниках, а не на тексте акта"
+    else:
+        body = "цитата из акта не приведена"
+
+    blocks = [f"{head}:\n{body}"]
+    if sources:
+        blocks.append("\n".join(["Внешние источники:"] + [f"— {s}" for s in sources]))
+    return "\n\n".join(blocks)
+
+
+def _verdicts_by_indicator(buckets: Buckets) -> dict[int, Verdict]:
+    """Все вердикты прогона по номеру индикатора — четыре кучи в один индекс."""
+    everything = buckets.violated + buckets.no_data + buckets.checked + buckets.failed
+    return {v.indicator: v for v in everything}
+
+
+def _row_verdicts(row_indicators: list[int], by_indicator: dict[int, Verdict]) -> list[Verdict]:
+    """Вердикты индикаторов одной строки карты, в порядке самих индикаторов."""
+    return [by_indicator[n] for n in row_indicators if n in by_indicator]
+
+
+def _dedup_sources(verdicts: list[Verdict]) -> list[str]:
+    """
+    Адреса из вердиктов строки карты, без дублей, с сохранением порядка.
+
+    Источники принадлежат вердикту индикатора, а не отдельной гипотезе: у
+    одного вердикта бывает несколько гипотез, адреса у них одни и те же.
+    Поэтому их переносит код, а не модель — протаскивать адреса через узлы
+    [4а]/[4б] и [5] значит дважды рискнуть, что модель их потеряет или
+    перепишет. Контракты Hypothesis и MapRow поля sources не имеют вовсе.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for v in verdicts:
+        for s in v.sources:
+            if s not in seen:
+                seen.add(s)
+                out.append(s)
+    return out
+
+
+def _first_verdict_proof(verdicts: list[Verdict]) -> str | None:
+    """
+    Первая непустая цитата среди вердиктов строки — подстановка, когда своей
+    цитаты у строки карты нет.
+
+    Не про запас: из семи строк живого прогона 20260825_093039_129668 три шли
+    без цитаты, и у одной из трёх (индикатор 11) цитата у вердикта была —
+    гипотеза её потеряла. Номер пункта так НЕ подставляется: гипотеза законно
+    затрагивает больше пунктов, чем вердикт.
+    """
+    for v in verdicts:
+        if v.proof:
+            return v.proof
+    return None
+
+
+def _indicators_label(numbers: list[int]) -> str:
+    """
+    Номера и имена индикаторов строки карты, каждый на своей строке клетки.
+
+    Имя тянется из конфига по номеру: строка карты хранит только номера
+    (MapRow.indicators), имён в ней нет — в отличие от вердикта, откуда их
+    берёт _indicator_label для листа проверенных индикаторов. Формат тот же,
+    чтобы оформление на обоих листах совпадало (фикс N 1 трека багов).
+    """
+    return "\n".join(f"{n}. {get_indicator(n).name}" for n in numbers)
+
+
 def _render_effect_cell(effect: Effect) -> str:
-    """Показатель эффекта и способ его расчёта в одной клетке, каждый на своей строке."""
-    return f"{effect.metric}\n{effect.how_to_calculate}"
+    """
+    Показатель эффекта и способ его расчёта в одной клетке, каждый под своей
+    подписью (фикс N 4 трека багов: без подписей два блока читались как один
+    длинный абзац).
+
+    Нумерация внутри «Как считать» остаётся такой, как её вернула модель —
+    одним абзацем. Резать её кодом по «1)» / «2)» нельзя: формулировка каждый
+    раз разная, это было бы гадание.
+    """
+    return (
+        f"Показатель:\n{effect.metric}\n"
+        f"\n"
+        f"Как считать:\n{effect.how_to_calculate}"
+    )
 
 
 def _render_map_data_cell(data: list[DataItem], nums: list[str]) -> str:
     """
-    Человекочитаемый рендер показателей строки карты для колонки «Данные».
+    Показатели строки карты двумя подписанными группами (фиксы N 2 и N 3).
 
-    Показателям с источником «запрос органу» дописывается обратная ссылка —
-    номера строк листа «Запрос показателей» (см. _row_to_request_nums), по
-    образцу рендера данных в build_excel.py фазы 2.
+    Сверху то, что запрашивают у органа, ниже открытые источники с пояснением,
+    что их берут сами. Порядок ВНУТРИ группы не трогаем — он от модели.
+    Пустая группа не печатается вовсе. Маркер — тире, а не цифры: цифры путались
+    бы с номерами листа «Запрос показателей».
+
+    Номера строк запроса стоят в ЗАГОЛОВКЕ блока, а не у каждого показателя.
+    Причина не косметическая: связь в данных существует только на уровне строки
+    карты (RequestItem.for_rows -> MapRow.row_id), до конкретного показателя её
+    нет. Сопоставить по тексту нельзя — на прогоне 20260825_093039_129668 узел
+    [6] переформулировал все показатели, точных совпадений 0 из 20. Раньше код
+    приписывал каждому показателю весь список номеров строки, и оба показателя
+    получали «N 1, 2» — сноска указывала в никуда.
     """
-    lines = []
-    for dp in data:
-        parts = [dp.source]
-        if dp.where:
-            parts.append(dp.where.strip())
-        if dp.source == "запрос органу" and nums:
-            parts.append("№ " + ", ".join(nums))
-        lines.append(f"{dp.metric} ({', '.join(parts)})")
-    return "\n".join(lines)
+    internal = [dp for dp in data if dp.source == "запрос органу"]
+    external = [dp for dp in data if dp.source != "запрос органу"]
+
+    blocks: list[str] = []
+
+    if internal:
+        head = "Запрос в орган"
+        if nums:
+            head += f" (лист «{_SHEET_REQUEST}», № {', '.join(nums)})"
+        blocks.append("\n".join([f"{head}:"] + [f"— {dp.metric}" for dp in internal]))
+
+    if external:
+        lines = ["Открытые источники (берём сами, у органа не запрашиваем):"]
+        for dp in external:
+            lines.append(f"— {dp.metric}")
+            if dp.where:
+                lines.append(f"  — {dp.where.strip()}")   # адрес источника подстрокой
+        blocks.append("\n".join(lines))
+
+    return "\n\n".join(blocks)
 
 
 def _format_map_sheet(ws: Worksheet, header_row: int) -> None:
     """Ширины колонок, шапка (с учётом строки реквизитов), перенос текста, рамки."""
-    for col, width in {"A": 14, "B": 46, "C": 40, "D": 52, "E": 40, "F": 10}.items():
+    for col, width in {"A": 6, "B": 34, "C": 46, "D": 40, "E": 52, "F": 52}.items():
         ws.column_dimensions[col].width = width
     _style_header_row(ws, header_row)
     for row in ws.iter_rows(min_row=header_row + 1, max_col=6):
-        for c in row:
+        row[0].font = _BODY_FONT
+        row[0].alignment = _CENTER_TOP        # номер строки — по центру, как № запроса
+        row[0].border = _BORDER
+        for c in row[1:]:
             c.font = _BODY_FONT
             c.alignment = _WRAP_TOP
             c.border = _BORDER
@@ -240,53 +391,89 @@ def _format_map_sheet(ws: Worksheet, header_row: int) -> None:
 
 def _render_map_sheet(
     wb: Workbook, hyp_map: HypothesisMap, row_to_nums: dict[int, list[str]], summary_md: str,
+    buckets: Buckets, caption: str,
 ) -> None:
-    """Лист «Карта гипотез»: опциональная шапка-реквизиты (одна строка) + 6 колонок карты."""
+    """
+    Лист «Карта гипотез»: опциональная шапка-реквизиты (одна строка) + 5 колонок.
+
+    buckets нужны для колонки «На чём основано»: внешние источники и запасная
+    цитата лежат в вердиктах, а не в строке карты (см. _dedup_sources).
+    """
     ws = wb.active
     ws.title = _SHEET_MAP
 
     header_line = _summary_header_line(summary_md)
-    has_header_line = header_line is not None
-    if has_header_line:
-        ws.append([header_line])
+    if header_line is not None:
+        ws.append([header_line])          # реквизиты акта — самая первая строка
+    _render_caption(ws, caption)
 
-    header_row = 2 if has_header_line else 1
-    ws.append(["Индикаторы", "Гипотеза", "Эффект", "Данные", "Пруф", "Пункт"])
+    header_row = ws.max_row + 1
+    ws.append(["№", "Индикаторы", "Гипотеза", "Эффект", "Данные", "На чём основано"])
 
+    by_indicator = _verdicts_by_indicator(buckets)
     for row in hyp_map.rows:
         nums = row_to_nums.get(row.row_id, [])
+        verdicts = _row_verdicts(row.indicators, by_indicator)
         ws.append([
-            ", ".join(str(i) for i in row.indicators),
+            row.row_id,          # адрес строки: на него ссылается лист запроса
+            _indicators_label(row.indicators),
             row.hypothesis,
             _render_effect_cell(row.effect),
             _render_map_data_cell(row.data, nums),
-            row.proof or "",
-            row.clause or "",
+            _render_basis_cell(
+                row.proof or _first_verdict_proof(verdicts),
+                row.clause,                       # пункт карты вердиктом не подменяется
+                _dedup_sources(verdicts),
+            ),
         ])
 
     _format_map_sheet(ws, header_row)
 
 
-def _format_request_sheet(ws: Worksheet) -> None:
+def _format_request_sheet(ws: Worksheet, header_row: int) -> None:
     """Ширины колонок, шапка, оформление тела (образец build_excel.py фазы 2)."""
     ws.column_dimensions["A"].width = 8
     ws.column_dimensions["B"].width = 60
-    for col in ("C", "D", "E"):
+    ws.column_dimensions["C"].width = 26      # «Откуда запрос» — ссылки на карту
+    ws.column_dimensions["D"].width = 14      # «Пункт акта»
+    for col in ("E", "F", "G"):
         ws.column_dimensions[col].width = 12
-    _style_header_row(ws, 1)
-    for row in ws.iter_rows(min_row=2, max_col=5):
+    _style_header_row(ws, header_row)
+    for row in ws.iter_rows(min_row=header_row + 1, max_col=7):
         row[0].font = _BODY_FONT
         row[0].alignment = _CENTER_TOP
         row[0].border = _BORDER
-        row[1].font = _BODY_FONT
-        row[1].alignment = _WRAP_TOP
-        row[1].border = _BORDER
-        for c in row[2:]:
+        for c in row[1:3]:                    # показатель и ссылки — с переносом
+            c.font = _BODY_FONT
+            c.alignment = _WRAP_TOP
+            c.border = _BORDER
+        for c in row[3:]:
             c.border = _BORDER
             c.alignment = _CENTER
 
 
-def _render_request_sheet(wb: Workbook, request: DataRequest, years: list[int]) -> None:
+def _render_source_rows_cell(for_rows: list[int], row_indicators: dict[int, list[int]]) -> str:
+    """
+    Обратная ссылка на карту: «стр. N — инд. M», каждая на своей строке клетки.
+
+    Получив от органа цифры, аналитик должен видеть, к какой гипотезе и какому
+    индикатору они относятся, не перебирая карту вручную (фикс N 6). Номера
+    строк уже посчитаны узлом [6] в RequestItem.for_rows, индикаторы берутся
+    из самой карты по row_id.
+    """
+    lines = []
+    for row_id in for_rows:
+        nums = row_indicators.get(row_id)
+        if nums is None:
+            continue                          # ссылка в никуда — узел [6] её уже залогировал
+        lines.append(f"стр. {row_id} — инд. {', '.join(str(n) for n in nums)}")
+    return "\n".join(lines)
+
+
+def _render_request_sheet(
+    wb: Workbook, request: DataRequest, years: list[int], hyp_map: HypothesisMap,
+    caption: str,
+) -> None:
     """
     Лист «Запрос показателей»: № | Показатель | три года (пустые клетки).
 
@@ -295,14 +482,25 @@ def _render_request_sheet(wb: Workbook, request: DataRequest, years: list[int]) 
     одной клетки.
     """
     ws = wb.create_sheet(_SHEET_REQUEST)
-    ws.append(["№", "Показатель"] + [str(y) for y in years])
+    _render_caption(ws, caption)
+    header_row = ws.max_row + 1
+    ws.append(["№", "Показатель", "Откуда запрос", "Пункт акта"] + [str(y) for y in years])
+
+    row_indicators = {row.row_id: row.indicators for row in hyp_map.rows}
+    empty_years = [None] * len(years)
 
     for item in request.items:
-        ws.append([item.num, item.metric, None, None, None])
+        ws.append([
+            item.num, item.metric,
+            _render_source_rows_cell(item.for_rows, row_indicators),
+            item.clause or "",
+            *empty_years,
+        ])
+        # подстроки разрезов ссылок не несут — они принадлежат родительской строке
         for i, breakdown in enumerate(item.breakdown, start=1):
-            ws.append([f"{item.num}.{i}", breakdown, None, None, None])
+            ws.append([f"{item.num}.{i}", breakdown, "", "", *empty_years])
 
-    _format_request_sheet(ws)
+    _format_request_sheet(ws, header_row)
 
 
 def _indicator_label(v: Verdict) -> str:
@@ -310,40 +508,49 @@ def _indicator_label(v: Verdict) -> str:
     return f"{v.indicator}. {v.name}"
 
 
-def _format_listing_sheet(ws: Worksheet, widths: dict[str, int]) -> None:
-    """Общее оформление для листов-куч (Проверенные индикаторы / Ошибки прогона)."""
+def _format_listing_sheet(ws: Worksheet, widths: dict[str, int], header_row: int) -> None:
+    """Общее оформление для листов-куч (Нарушений не найдено / Ошибки прогона)."""
     for col, width in widths.items():
         ws.column_dimensions[col].width = width
-    _style_header_row(ws, 1)
-    for row in ws.iter_rows(min_row=2, max_col=len(widths)):
+    _style_header_row(ws, header_row)
+    for row in ws.iter_rows(min_row=header_row + 1, max_col=len(widths)):
         for c in row:
             c.font = _BODY_FONT
             c.alignment = _WRAP_TOP
             c.border = _BORDER
 
 
-def _render_checked_sheet(wb: Workbook, checked: list[Verdict]) -> None:
-    """Лист «Проверенные индикаторы» из buckets.checked (соблюдён / не применимо)."""
+def _render_checked_sheet(wb: Workbook, checked: list[Verdict], caption: str) -> None:
+    """Лист «Нарушений не найдено» из buckets.checked (соблюдён / не применимо)."""
     ws = wb.create_sheet(_SHEET_CHECKED)
-    ws.append(["Индикатор", "Вердикт", "Обоснование", "Пруф", "Пункт"])
+    _render_caption(ws, caption)
+    header_row = ws.max_row + 1
+    ws.append(["Индикатор", "Вердикт", "Обоснование", "На чём основано"])
     for v in checked:
-        ws.append([_indicator_label(v), v.verdict, v.rationale, v.proof or "", v.clause or ""])
-    _format_listing_sheet(ws, {"A": 34, "B": 16, "C": 60, "D": 46, "E": 10})
+        # «Обоснование» — текст вердикта, «На чём основано» — цитата и адреса;
+        # рендер общий с листом карты, чтобы одно и то же выглядело одинаково
+        ws.append([
+            _indicator_label(v), v.verdict, v.rationale,
+            _render_basis_cell(v.proof, v.clause, list(v.sources)),
+        ])
+    _format_listing_sheet(ws, {"A": 34, "B": 16, "C": 60, "D": 52}, header_row)
 
 
-def _render_failed_sheet(wb: Workbook, failed: list[Verdict]) -> None:
+def _render_failed_sheet(wb: Workbook, failed: list[Verdict], caption: str) -> None:
     """
     Лист «Ошибки прогона» из buckets.failed — создаётся всегда. Пустая куча
     не значит пустой лист: аналитик должен видеть, что прогон отработал целиком.
     """
     ws = wb.create_sheet(_SHEET_FAILED)
+    _render_caption(ws, caption)
+    header_row = ws.max_row + 1
     ws.append(["Индикатор", "Что случилось", "Попыток"])
     if not failed:
         ws.append(["ошибок нет", "", ""])
     else:
         for v in failed:
             ws.append([_indicator_label(v), v.rationale, v.attempts])
-    _format_listing_sheet(ws, {"A": 34, "B": 60, "C": 10})
+    _format_listing_sheet(ws, {"A": 34, "B": 60, "C": 10}, header_row)
 
 
 def build_excel(
@@ -365,11 +572,33 @@ def build_excel(
     years = compute_years(num_years=REQUEST_YEARS_DEPTH)
     row_to_nums = _row_to_request_nums(request)
 
+    # Числитель подписей считается по факту прогона, знаменатель — из конфига:
+    # 12 индикаторов задаёт методика, зашивать это число в текст нельзя.
+    total = len(all_indicators())
+    map_indicators = {n for row in hypothesis_map.rows for n in row.indicators}
+
     wb = Workbook()
-    _render_map_sheet(wb, hypothesis_map, row_to_nums, summary_md)
-    _render_request_sheet(wb, request, years)
-    _render_checked_sheet(wb, buckets.checked)
-    _render_failed_sheet(wb, buckets.failed)
+    _render_map_sheet(
+        wb, hypothesis_map, row_to_nums, summary_md, buckets,
+        f"Индикаторы, по которым найдено нарушение или не хватило данных — "
+        f"{len(map_indicators)} из {total}. По каждому построена гипотеза: "
+        f"что не так, чем мерить эффект, какие данные нужны.",
+    )
+    _render_request_sheet(
+        wb, request, years, hypothesis_map,
+        "Данные, которых нет в открытом доступе. Заполняет орган-разработчик, "
+        "три последних завершённых года.",
+    )
+    _render_checked_sheet(
+        wb, buckets.checked,
+        f"Индикаторы, по которым гипотезы не строились — {len(buckets.checked)} из {total}. "
+        f"Вердикт «соблюдён» или «не применимо», с обоснованием и цитатой из акта.",
+    )
+    _render_failed_sheet(
+        wb, buckets.failed,
+        f"Индикаторы, проверка которых не завершилась. "
+        f"Пусто — значит все {total} отработали.",
+    )
 
     out_path = run_dir(run_id) / "08_result.xlsx"
     out_path.parent.mkdir(parents=True, exist_ok=True)  # папка прогона может ещё не существовать
