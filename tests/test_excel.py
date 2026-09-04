@@ -221,6 +221,7 @@ def test_verdicts_sheet_lists_all_buckets_sorted(tmp_runs_dir):
     hdr = _find_header_row(ws, "Вердикт")
     assert [c.value for c in ws[hdr]] == [
         "Индикатор", "Вердикт", "Обоснование", "На чём основано", "Где подробнее",
+        "Согласны?", "Если нет — какой верный", "Замечание",
     ]
     assert ws.max_row == hdr + 6                       # 1, 8 нарушен; 3 нет данных; 2, 5; 9 ошибка
     labels = [ws.cell(row=r, column=1).value for r in range(hdr + 1, ws.max_row + 1)]
@@ -381,6 +382,7 @@ def test_map_sheet_row_content(tmp_runs_dir):
     hdr = _find_header_row(ws)
     assert [c.value for c in ws[hdr]] == [
         "№", "Индикаторы", "Гипотеза", "Эффект", "Данные", "На чём основано",
+        "Оценка (1–5)", "Замечание",
     ]
     row = hdr + 1
     assert ws.cell(row=row, column=_col(ws, hdr, "Индикаторы")).value == (
@@ -642,6 +644,7 @@ def test_map_sheet_has_row_number_column(tmp_runs_dir):
 
     assert [c.value for c in ws[hdr]] == [
         "№", "Индикаторы", "Гипотеза", "Эффект", "Данные", "На чём основано",
+        "Оценка (1–5)", "Замечание",
     ]
     num = _col(ws, hdr, "№")
     assert ws.cell(row=hdr + 1, column=num).value == 1
@@ -783,6 +786,54 @@ def test_caption_does_not_break_header_styling(tmp_runs_dir):
         assert ws.freeze_panes == ws.cell(row=hdr + 1, column=1).coordinate
         # подпись заливки шапки не получила
         assert ws.cell(row=hdr - 1, column=1).fill.fgColor.rgb != "FF1F4E78"
+
+
+# ----------------------------------------------------------------------
+# Пул 3 (письмо заказчика 2026-09-04, п. 6.1): «включить оранжевые столбцы
+# (для заполнения экспертами) сразу в выгружаемый файл». Решение владельца:
+# всегда, одна книга. Образец — файлы экспертов ОС: заливка FFF2CC, на карте
+# и запросе «Оценка (1–5)» и «Замечание», на вердиктах «Согласны?», «Если нет —
+# какой верный», «Замечание»; на техническом листе ошибок колонок нет.
+# ----------------------------------------------------------------------
+
+_EXPERT_COLUMNS = {
+    "Карта гипотез": ("Индикаторы", ["Оценка (1–5)", "Замечание"]),
+    "Запрос показателей": ("Показатель", ["Оценка (1–5)", "Замечание"]),
+    "Вердикты": ("Вердикт", ["Согласны?", "Если нет — какой верный", "Замечание"]),
+}
+
+
+def test_expert_columns_present_and_orange(tmp_runs_dir):
+    """На трёх листах справа — колонки эксперта с заливкой FFF2CC во всём теле; на листе ошибок их нет."""
+    path = build_excel(_map(), _request(), _buckets(with_failed=True), _passport(), "run_expert")
+    wb = load_workbook(path)
+    for sheet, (anchor, names) in _EXPERT_COLUMNS.items():
+        ws = wb[sheet]
+        hdr = _find_header_row(ws, anchor)
+        header = [c.value for c in ws[hdr]]
+        assert header[-len(names):] == names, sheet
+        for name in names:
+            col = _col(ws, hdr, name)
+            assert ws.cell(row=hdr, column=col).fill.fgColor.rgb.endswith("1F4E78"), (sheet, name)  # шапка общая
+            for r in range(hdr + 1, ws.max_row + 1):
+                cell = ws.cell(row=r, column=col)
+                assert cell.fill.fgColor.rgb.endswith("FFF2CC"), (sheet, name, r)
+                assert cell.border.left.style == "thin", (sheet, name, r)
+    ws_err = wb["Ошибки прогона"]
+    hdr = _find_header_row(ws_err, "Что случилось")
+    assert [c.value for c in ws_err[hdr]] == ["Индикатор", "Что случилось", "Попыток"]
+
+
+def test_expert_columns_cover_breakdown_rows(tmp_runs_dir):
+    """Подстроки разрезов «1.1», «1.2» листа запроса тоже получают оранжевые клетки."""
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), _passport(), "run_expert_bd")
+    ws = load_workbook(path)["Запрос показателей"]
+    hdr = _find_header_row(ws, "Показатель")
+    col = _col(ws, hdr, "Оценка (1–5)")
+    sub_rows = [r for r in range(hdr + 1, ws.max_row + 1) if str(ws.cell(row=r, column=1).value).startswith("1.")]
+    assert sub_rows, "в фикстуре есть разрезы 1.1 и 1.2"
+    for r in sub_rows:
+        assert ws.cell(row=r, column=col).fill.fgColor.rgb.endswith("FFF2CC")
 
 
 def test_compute_years_excludes_current_incomplete_year(monkeypatch):

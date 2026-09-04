@@ -10,6 +10,9 @@
     Вердикты               — все вердикты четырёх куч: индикатор, вердикт, обоснование, на чём основано, где подробнее
     Ошибки прогона         — куча buckets.failed: индикатор, что случилось, попыток
 
+На первых трёх листах справа — оранжевые колонки для оценки экспертами
+(пул 3, п. 6.1 письма заказчика 2026-09-04), см. _append_expert_columns.
+
 Оформление — единый деловой стиль фазы 2 (тёмно-синяя шапка 1F4E78, белый
 жирный шрифт, перенос текста, тонкие рамки, freeze panes) — стилевые константы
 и подход к _style_header_row/_format_*_sheet перенесены как есть, отработаны
@@ -68,6 +71,7 @@ _CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
 _CENTER_TOP = Alignment(horizontal="center", vertical="top")
 _THIN = Side(style="thin", color="BFBFBF")
 _BORDER = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
+_EXPERT_FILL = PatternFill("solid", fgColor="FFF2CC")   # клетки для оценки экспертами (пул 3, п. 6.1)
 
 _SHEET_MAP = "Карта гипотез"
 _SHEET_REQUEST = "Запрос показателей"
@@ -324,6 +328,38 @@ def _render_map_data_cell(data: list[DataItem], nums: list[str]) -> str:
     return "\n\n".join(blocks)
 
 
+def _append_expert_columns(ws: Worksheet, header_row: int, names: list[str], widths: list[int]) -> None:
+    """
+    Дописать справа колонки для оценки экспертами: заголовок общим стилем шапки,
+    тело — оранжевая заливка FFF2CC, рамка, перенос.
+
+    Пул 3 (письмо заказчика 2026-09-04, п. 6.1): «включить оранжевые столбцы
+    (для заполнения экспертами) сразу в выгружаемый файл». Решение владельца —
+    всегда, одна книга. Имена колонок и цвет — как в файлах экспертов ОС,
+    которые они дорисовывали руками. Вызывать после _format_*_sheet: шапка уже
+    оформлена, ширина и стиль новых колонок задаются здесь.
+    """
+    first = ws.max_column + 1
+    for i, (name, width) in enumerate(zip(names, widths)):
+        col = first + i
+        head = ws.cell(row=header_row, column=col, value=name)
+        head.font = _HEADER_FONT
+        head.fill = _HEADER_FILL
+        head.alignment = _CENTER
+        head.border = _BORDER
+        ws.column_dimensions[head.column_letter].width = width
+        for r in range(header_row + 1, ws.max_row + 1):
+            c = ws.cell(row=r, column=col)
+            c.fill = _EXPERT_FILL
+            c.border = _BORDER
+            c.font = _BODY_FONT
+            c.alignment = _WRAP_TOP
+
+
+_EXPERT_SCORE_COLUMNS = (["Оценка (1–5)", "Замечание"], [12, 40])
+_EXPERT_VERDICT_COLUMNS = (["Согласны?", "Если нет — какой верный", "Замечание"], [12, 30, 40])
+
+
 def _format_map_sheet(ws: Worksheet, header_row: int) -> None:
     """Ширины колонок, шапка (с учётом строки реквизитов), перенос текста, рамки."""
     for col, width in {"A": 6, "B": 34, "C": 46, "D": 40, "E": 52, "F": 52}.items():
@@ -427,6 +463,7 @@ def _render_map_sheet(
 
     _append_unverified_rows(ws, hyp_map, buckets)   # «нет данных» без гипотез — тоже в карту
     _format_map_sheet(ws, header_row)
+    _append_expert_columns(ws, header_row, *_EXPERT_SCORE_COLUMNS)
 
 
 def _format_request_sheet(ws: Worksheet, header_row: int) -> None:
@@ -532,6 +569,7 @@ def _render_request_sheet(
             _append_item(item, dash_years)
 
     _format_request_sheet(ws, header_row)
+    _append_expert_columns(ws, header_row, *_EXPERT_SCORE_COLUMNS)
 
 
 def _indicator_label(v: Verdict) -> str:
@@ -594,6 +632,7 @@ def _render_verdicts_sheet(wb: Workbook, buckets: Buckets, hyp_map: HypothesisMa
             _where_details(v, hyp_map, unverified_ids),
         ])
     _format_listing_sheet(ws, {"A": 34, "B": 16, "C": 60, "D": 52, "E": 30}, header_row)
+    _append_expert_columns(ws, header_row, *_EXPERT_VERDICT_COLUMNS)
 
 
 def _render_failed_sheet(wb: Workbook, failed: list[Verdict], caption: str) -> None:
