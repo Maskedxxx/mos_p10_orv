@@ -34,7 +34,7 @@ def _hypothesis(text: str) -> Hypothesis:
     return Hypothesis(
         hypothesis=text,
         grounds="основание из карточки",
-        effects=[Effect(affected="бизнес", metric="число обращений", how_to_calculate="сумма за год")],
+        effects=[Effect(affected="бизнес", metric="число обращений", how_to_calculate="сумма за год", expected_trend="рост показателя относительно года до вступления акта подтвердит гипотезу")],
         data=[DataItem(metric="число заявок", source="запрос органу")],
     )
 
@@ -81,7 +81,7 @@ def _rows_from(flat_texts: list[tuple[int, str]]) -> list[MapRow]:
             indicators=[indicator],
             hypothesis=text,
             grounds="основание из карточки",
-            effects=[Effect(affected="бизнес", metric="число обращений", how_to_calculate="сумма за год")],
+            effects=[Effect(affected="бизнес", metric="число обращений", how_to_calculate="сумма за год", expected_trend="рост показателя относительно года до вступления акта подтвердит гипотезу")],
             data=[DataItem(metric="число заявок", source="запрос органу")],
         )
         for i, (indicator, text) in enumerate(flat_texts, start=1)

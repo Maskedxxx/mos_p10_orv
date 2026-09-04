@@ -27,7 +27,8 @@ def tmp_runs_dir(tmp_path, monkeypatch):
 
 @pytest.fixture
 def valid_effect() -> dict:
-    return {"affected": "бизнес", "metric": "количество обращений", "how_to_calculate": "сумма за год"}
+    return {"affected": "бизнес", "metric": "количество обращений", "how_to_calculate": "сумма за год",
+            "expected_trend": "рост числа обращений относительно года до вступления акта подтвердит гипотезу"}
 
 
 @pytest.fixture

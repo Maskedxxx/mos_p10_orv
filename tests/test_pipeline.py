@@ -108,7 +108,7 @@ def _make_hypothesis_set(n: int) -> HypothesisSet:
             Hypothesis(
                 hypothesis=f"гипотеза по индикатору {n}",
                 grounds="основание из карточки",
-                effects=[Effect(affected="бизнес", metric="число обращений", how_to_calculate="сумма за год")],
+                effects=[Effect(affected="бизнес", metric="число обращений", how_to_calculate="сумма за год", expected_trend="рост показателя относительно года до вступления акта подтвердит гипотезу")],
                 data=[DataItem(metric="число заявок", source="запрос органу")],
             )
         ],

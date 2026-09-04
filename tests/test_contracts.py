@@ -67,6 +67,13 @@ def test_effect_extra_field_rejected(valid_effect):
         Effect(**valid_effect, extra_field="лишнее")
 
 
+def test_effect_requires_expected_trend(valid_effect):
+    """Пул 3, п. 1б (письмо заказчика 2026-09-04): у эффекта обязана быть ожидаемая динамика."""
+    without = {k: v for k, v in valid_effect.items() if k != "expected_trend"}
+    with pytest.raises(ValidationError):
+        Effect(**without)
+
+
 def test_data_item_extra_field_rejected(valid_data_item):
     with pytest.raises(ValidationError):
         DataItem(**valid_data_item, extra_field="лишнее")
@@ -173,6 +180,7 @@ def test_verdict_attempts_below_1_rejected(valid_verdict_ok):
         (Verdict, "valid_verdict_ok", "rationale", "   "),
         (Effect, "valid_effect", "metric", ""),
         (Effect, "valid_effect", "how_to_calculate", "   "),
+        (Effect, "valid_effect", "expected_trend", ""),
         (DataItem, "valid_data_item", "metric", "  "),
         (Hypothesis, "valid_hypothesis", "hypothesis", ""),
         (Hypothesis, "valid_hypothesis", "grounds", "   "),

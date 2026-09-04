@@ -59,7 +59,7 @@ def _map() -> HypothesisMap:
     return HypothesisMap(rows=[
         MapRow(
             row_id=1, indicators=[1, 8], hypothesis="гипотеза 1", grounds="основание 1",
-            effects=[Effect(affected="бизнес", metric="издержки заявителя, руб.", how_to_calculate="сумма расходов")],
+            effects=[Effect(affected="бизнес", metric="издержки заявителя, руб.", how_to_calculate="сумма расходов", expected_trend="рост показателя относительно года до вступления акта подтвердит гипотезу")],
             data=[
                 # намеренно вперемешку: открытый первым — рендер обязан
                 # поднять «запрос органу» наверх сам (фикс N 2)
@@ -70,7 +70,7 @@ def _map() -> HypothesisMap:
         ),
         MapRow(
             row_id=2, indicators=[3], hypothesis="гипотеза 2", grounds="основание 2",
-            effects=[Effect(affected="бизнес", metric="срок рассмотрения, дней", how_to_calculate="среднее по выборке")],
+            effects=[Effect(affected="бизнес", metric="срок рассмотрения, дней", how_to_calculate="среднее по выборке", expected_trend="рост показателя относительно года до вступления акта подтвердит гипотезу")],
             data=[DataItem(metric="средний срок рассмотрения", source="запрос органу")],
         ),
     ], merges=[])
@@ -448,7 +448,10 @@ def test_effect_cell_has_labels(tmp_runs_dir):
         "издержки заявителя, руб.\n"
         "\n"
         "Как считать:\n"
-        "сумма расходов"
+        "сумма расходов\n"
+        "\n"
+        "Что подтвердит гипотезу:\n"
+        "рост показателя относительно года до вступления акта подтвердит гипотезу"
     )
 
 
@@ -457,7 +460,7 @@ def test_effect_cell_lists_every_effect(tmp_runs_dir):
     механизма) — в клетке оба блока, через пустую строку, ни один не потерян."""
     hyp_map = _map()
     hyp_map.rows[0].effects.append(
-        Effect(affected="город", metric="трудозатраты комиссии, чел.-часов", how_to_calculate="заседания × состав")
+        Effect(affected="город", metric="трудозатраты комиссии, чел.-часов", how_to_calculate="заседания × состав", expected_trend="рост показателя относительно года до вступления акта подтвердит гипотезу")
     )
     path = build_excel(hyp_map, _request(), _buckets(with_failed=False), None, "run_effects2")
     ws = load_workbook(path)["Карта гипотез"]
@@ -466,6 +469,7 @@ def test_effect_cell_lists_every_effect(tmp_runs_dir):
     assert "Кого задевает: бизнес" in cell and "Кого задевает: город" in cell
     assert "трудозатраты комиссии" in cell
     assert cell.count("Как считать:") == 2
+    assert cell.count("Что подтвердит гипотезу:") == 2   # пул 3, п. 1б
 
 
 # ----------------------------------------------------------------------

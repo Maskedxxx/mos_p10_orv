@@ -62,7 +62,7 @@ def _ok_call_result(n: int, *, attempts: int = 1, cost_usd: float = 0.01) -> Cal
     hypothesis = Hypothesis(
         hypothesis="требование избыточно",
         grounds="основание из карточки",
-        effects=[Effect(affected="бизнес", metric="число обращений", how_to_calculate="сумма за год")],
+        effects=[Effect(affected="бизнес", metric="число обращений", how_to_calculate="сумма за год", expected_trend="рост показателя относительно года до вступления акта подтвердит гипотезу")],
         data=[DataItem(metric="число заявок", source="открытый", where="Мосстат")],
     )
     value = HypothesisSet(

@@ -139,6 +139,13 @@ def test_example_in_prompt_validates_against_contract(path, model_cls, start, en
     model_cls.model_validate(_example_json(_read(path), start, end))
 
 
+@pytest.mark.parametrize("name", ["04a_hypotheses.md", "04b_hypotheses.md", "05_merge.md"])
+def test_hypothesis_prompts_mention_expected_trend(name):
+    """Пул 3, п. 1б: ключ expected_trend контракта Effect назван в правилах и примерах промптов гипотез и слияния."""
+    text = _read(PROMPTS_DIR / name)
+    assert text.count("expected_trend") >= 2, name
+
+
 def test_passport_prompt_does_not_mention_summary():
     assert "саммари" not in _read(PROMPT_PASSPORT).lower()
 

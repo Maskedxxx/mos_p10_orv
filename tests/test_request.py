@@ -25,7 +25,7 @@ def _row(row_id: int, *, source: str = "запрос органу") -> MapRow:
         row_id=row_id,
         indicators=[1],
         hypothesis=f"гипотеза {row_id}", grounds="основание",
-        effects=[Effect(affected="бизнес", metric="число обращений", how_to_calculate="сумма за год")],
+        effects=[Effect(affected="бизнес", metric="число обращений", how_to_calculate="сумма за год", expected_trend="рост показателя относительно года до вступления акта подтвердит гипотезу")],
         data=[DataItem(metric=f"показатель {row_id}", source=source, where=("Мосстат" if source == "открытый" else None))],
     )
 
@@ -214,7 +214,7 @@ def _row2(row_id: int, metrics: list[tuple[str, str]]) -> MapRow:
     """Строка карты с несколькими показателями: [(metric, source), ...]."""
     return MapRow(
         row_id=row_id, indicators=[1], hypothesis=f"гипотеза {row_id}", grounds="основание",
-        effects=[Effect(affected="бизнес", metric="число обращений", how_to_calculate="сумма за год")],
+        effects=[Effect(affected="бизнес", metric="число обращений", how_to_calculate="сумма за год", expected_trend="рост показателя относительно года до вступления акта подтвердит гипотезу")],
         data=[DataItem(metric=m, source=src, where=("Росстат" if src == "открытый" else None)) for m, src in metrics],
     )
 
