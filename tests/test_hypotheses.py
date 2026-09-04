@@ -263,7 +263,7 @@ def test_no_data_branch_uses_prompt_04b(run_id, tmp_prompts, monkeypatch):
 
     monkeypatch.setattr(hyp_module, "call", Mock(side_effect=_effect))
 
-    run_hypotheses_no_data(_buckets_no_data([3]), "текст", run_id)
+    run_hypotheses_no_data(_buckets_no_data([10]), "текст", run_id)   # 10, не 3: индикаторы 1-6 узел пропускает (Б1)
 
     assert "Промпт 04b" in seen_instructions[0]
 
@@ -333,7 +333,7 @@ def test_both_branches_concurrent_dont_lose_cost(tmp_runs_dir, tmp_prompts, monk
 
     def _run_no_data():
         try:
-            run_hypotheses_no_data(_buckets_no_data([3, 8]), "текст", rid)
+            run_hypotheses_no_data(_buckets_no_data([10, 8]), "текст", rid)   # оба из семейства «практика» (Б1)
         except Exception as exc:  # pragma: no cover
             errors.append(exc)
 
@@ -348,3 +348,16 @@ def test_both_branches_concurrent_dont_lose_cost(tmp_runs_dir, tmp_prompts, monk
     meta = load_json(rid, "meta.json", RunMeta)
     # 1.0 уже было + 3 вердикта violated * 0.10 + 2 вердикта no_data * 0.10
     assert meta.cost_usd == pytest.approx(1.0 + 0.30 + 0.20)
+
+
+def test_no_data_skips_text_family_indicators(run_id, tmp_prompts, monkeypatch):
+    """Б1 (ОС 2026-09-04). «Нет данных» у индикаторов 1-6 — незавершённая проверка
+    по тексту или правовой базе, а не пробел в практике: узел [4б] для них
+    не вызывается, гипотез нет. Индикаторы 7-12 обрабатываются как прежде."""
+    mock_call = Mock(side_effect=_default_side_effect)
+    monkeypatch.setattr(hyp_module, "call", mock_call)
+
+    result = run_hypotheses_no_data(_buckets_no_data([3, 4, 10, 11]), "текст", run_id)
+
+    assert mock_call.call_count == 2
+    assert [s.indicator for s in result] == [10, 11]

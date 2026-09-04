@@ -25,7 +25,7 @@ from app.contracts import (
     Merge,
     RunMeta,
 )
-from app.nodes.merge import merge_map
+from app.nodes.merge import _candidate_pairs, merge_map
 from app.runner import CallResult
 from app.trace import load_json, run_dir, save_json
 
@@ -242,3 +242,90 @@ def test_empty_input_skips_model_call(run_id, tmp_prompt, monkeypatch):
     assert hyp_map.rows == []
     assert hyp_map.merges == []
     mock_call.assert_not_called()
+
+
+# ---- ОС экспертов 2026-09-04, узел 5, находки В2/В4: кандидаты на слияние ----
+
+
+def _hyp_c(text: str, clause: str | None) -> Hypothesis:
+    """Гипотеза с заданным пунктом акта — для тестов кандидатов."""
+    h = _hypothesis(text)
+    return h.model_copy(update={"clause": clause})
+
+
+def _hset_c(indicator: int, items: list[tuple[str, str | None]]) -> HypothesisSet:
+    return HypothesisSet(
+        indicator=indicator, name=f"индикатор {indicator}", why_this_many="тест",
+        hypotheses=[_hyp_c(t, c) for t, c in items],
+    )
+
+
+def test_candidate_pairs_by_shared_clause():
+    """В4. Пары гипотез с общим номером пункта акта — кандидаты на слияние.
+    Случай 1112: инд. 10 «8» и инд. 11 «7, 8» — общий пункт 8, узел его
+    пропустил «на глаз»; теперь пара обязана попасть в кандидаты."""
+    flat = merge_module._flatten_hypotheses([
+        _hset_c(10, [("сроки могут не соблюдаться", "8"), ("отказы как барьер", "10")]),
+        _hset_c(11, [("сроки не соблюдаются на практике", "7, 8")]),
+    ])
+    pairs = _candidate_pairs(flat)
+    assert [(a, b) for a, b, _ in pairs] == [(1, 3)]
+    assert pairs[0][2] == ["8"]
+
+
+def test_candidate_pairs_ignore_annex_numbers_and_missing_clause():
+    """В4. «приложение 1» — не пункт: две гипотезы про разные пункты одного приложения
+    кандидатами не становятся; гипотеза без пункта — тоже."""
+    flat = merge_module._flatten_hypotheses([
+        _hset_c(4, [("а", "1.3 (п. 2.6 приложения 1 к постановлению)"),
+                    ("б", "1.11 (п. 7.1.6.3 приложения 1 к постановлению)"),
+                    ("в", None)]),
+    ])
+    assert _candidate_pairs(flat) == []
+
+
+def test_candidate_pairs_within_one_indicator_too():
+    """В3. Дубли внутри одного индикатора — тоже кандидаты (ГРАНТЫ инд. 6, обе п. 1.4)."""
+    flat = merge_module._flatten_hypotheses([_hset_c(6, [("а", "1.4"), ("б", "1.4")])])
+    assert [(a, b) for a, b, _ in _candidate_pairs(flat)] == [(1, 2)]
+
+
+def test_candidates_block_sent_to_model(run_id, tmp_prompt, monkeypatch):
+    """В4. Кандидаты уходят модели отдельным помеченным JSON-блоком после гипотез."""
+    seen = {}
+
+    def _effect(instruction, document, schema, **kwargs):
+        seen["doc"] = document
+        return _ok_call_result(HypothesisMap(rows=_rows_from([(10, "A"), (11, "B")]), merges=[]))
+
+    monkeypatch.setattr(merge_module, "call", Mock(side_effect=_effect))
+    merge_map([_hset_c(10, [("A", "8")]), _hset_c(11, [("B", "7, 8")])], "текст акта", run_id)
+    doc = seen["doc"]
+    assert "## КАНДИДАТЫ НА СЛИЯНИЕ (JSON)" in doc
+    assert doc.index("## ПРОНУМЕРОВАННЫЕ ГИПОТЕЗЫ (JSON)") < doc.index("## КАНДИДАТЫ НА СЛИЯНИЕ (JSON)")
+    assert '"row_ids": [\n      1,\n      2\n    ]' in doc or '"row_ids": [1, 2]' in doc
+    assert '"shared_clauses"' in doc
+
+
+def test_candidate_without_decision_is_logged_as_error(run_id, tmp_prompt, monkeypatch):
+    """В2/В4. Модель не дала решения по кандидату — это и есть «пропуск на глаз»
+    (1112 инд. 10↔11). Фиксируется в логе как ERROR, как и потеря строки."""
+    result_map = HypothesisMap(rows=_rows_from([(10, "A"), (11, "B")]), merges=[], decisions=[])
+    monkeypatch.setattr(merge_module, "call", Mock(return_value=_ok_call_result(result_map)))
+    merge_map([_hset_c(10, [("A", "8")]), _hset_c(11, [("B", "7, 8")])], "текст акта", run_id)
+    log_text = (run_dir(run_id) / "run.log").read_text(encoding="utf-8")
+    assert "ERROR" in log_text
+    assert "кандидат без решения" in log_text
+    assert "[1, 2]" in log_text
+
+
+def test_decision_for_every_candidate_no_error(run_id, tmp_prompt, monkeypatch):
+    """В4, граница: по каждому кандидату есть решение — ошибок в логе нет."""
+    result_map = HypothesisMap(
+        rows=_rows_from([(10, "A"), (11, "B")]), merges=[],
+        decisions=[{"row_ids": [1, 2], "merge": False, "reason": "механизмы разные"}],
+    )
+    monkeypatch.setattr(merge_module, "call", Mock(return_value=_ok_call_result(result_map)))
+    merge_map([_hset_c(10, [("A", "8")]), _hset_c(11, [("B", "7, 8")])], "текст акта", run_id)
+    log_text = (run_dir(run_id) / "run.log").read_text(encoding="utf-8")
+    assert "кандидат без решения" not in log_text

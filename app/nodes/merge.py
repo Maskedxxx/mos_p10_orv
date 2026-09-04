@@ -15,6 +15,12 @@
 по образцу app/nodes/hypotheses.py). Инструменты не нужны: слияние делается
 по уже собранным гипотезам и тексту акта, в интернет ходить незачем.
 
+Кандидаты на слияние (ОС экспертов 2026-09-04, узел 5): пары гипотез с общим
+номером пункта акта вычисляются кодом (_candidate_pairs) и уходят модели третьим
+блоком; по каждому кандидату модель обязана дать решение (PairDecision), пропуск
+фиксируется как ERROR (_check_decisions). Иначе дубли вида 1112 инд. 10↔11
+проходили молча.
+
 Провал вызова (CallResult.ok=False) НИКОГДА не превращается в выдуманную
 карту — узел собирает HypothesisMap из входящих гипотез как есть, каждая
 отдельной строкой, merges пустой (_fallback_map), и пишет предупреждение
@@ -36,6 +42,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 from app.config import ALLOWED_TOOLS_TEXT, PROMPT_MERGE
 from app.contracts import Hypothesis, HypothesisMap, HypothesisSet, MapRow
@@ -63,23 +70,89 @@ def _flatten_hypotheses(hypothesis_sets: list[HypothesisSet]) -> list[tuple[int,
     return flat
 
 
-def _build_document(document_md: str, flat: list[tuple[int, int, Hypothesis]]) -> str:
+# Номер пункта акта: «2.7», «5.3.6», «3.4.2(1)», «8». Голые числа без точки берём
+# только короткие (до двух цифр) — это пункты вида «п. 8», а не годы и номера актов.
+_CLAUSE_TOKEN_RE = re.compile(r"\d+(?:\.\d+)*(?:\(\d+\))?")
+# «приложение 1», «постановление № 743-ПП» внутри clause — не пункты, а адрес;
+# вырезаются до разбора, иначе все гипотезы одного приложения станут кандидатами.
+_CLAUSE_NOISE_RE = re.compile(
+    r"[Пп]риложени\w*\s*(?:№\s*)?\d+|[Пп]остановлени\w*\s*№?\s*\d+[-А-Яа-я]*"
+)
+
+
+def _clause_tokens(clause: str | None) -> set[str]:
+    """Номера пунктов акта из строки clause гипотезы; пусто, если пункта нет."""
+    if not clause:
+        return set()
+    cleaned = _CLAUSE_NOISE_RE.sub(" ", clause)
+    return {t for t in _CLAUSE_TOKEN_RE.findall(cleaned) if "." in t or len(t) <= 2}
+
+
+def _candidate_pairs(flat: list[tuple[int, int, Hypothesis]]) -> list[tuple[int, int, list[str]]]:
+    """
+    Пары гипотез с общим номером пункта акта — кандидаты на слияние (ОС экспертов,
+    узел 5, В2/В4).
+
+    Общий пункт — необходимое условие дубля, не достаточное: решает модель, но по
+    каждому кандидату она обязана дать решение (PairDecision), а не обходить набор
+    «на глаз». За 8 прогонов так был пропущен дубль 1112 инд. 10↔11 (общий п. 8).
+    Возвращает (row_id_a, row_id_b, общие пункты) в порядке номеров.
+    """
+    tokens = [(row_id, _clause_tokens(hyp.clause)) for row_id, _indicator, hyp in flat]
+    pairs: list[tuple[int, int, list[str]]] = []
+    for i in range(len(tokens)):
+        for j in range(i + 1, len(tokens)):
+            shared = tokens[i][1] & tokens[j][1]
+            if shared:
+                pairs.append((tokens[i][0], tokens[j][0], sorted(shared)))
+    return pairs
+
+
+def _build_document(
+    document_md: str,
+    flat: list[tuple[int, int, Hypothesis]],
+    candidates: list[tuple[int, int, list[str]]],
+) -> str:
     """
     Собрать документ для stdin: полный текст акта + пронумерованный список
-    гипотез отдельным помеченным JSON-блоком (по образцу hypotheses.py), чтобы
-    модель не путала текст акта с карточками гипотез.
+    гипотез + кандидаты на слияние, каждый отдельным помеченным JSON-блоком
+    (по образцу hypotheses.py), чтобы модель не путала текст акта с карточками.
     """
     numbered = [
         {"row_id": row_id, "indicator": indicator, **hyp.model_dump(mode="json")}
         for row_id, indicator, hyp in flat
     ]
     hyps_json = json.dumps(numbered, ensure_ascii=False, indent=2)
+    cands = [{"row_ids": [a, b], "shared_clauses": shared} for a, b, shared in candidates]
+    cands_json = json.dumps(cands, ensure_ascii=False, indent=2)
     return (
         "## ПОЛНЫЙ ТЕКСТ АКТА\n\n"
         f"{document_md}\n\n"
         "## ПРОНУМЕРОВАННЫЕ ГИПОТЕЗЫ (JSON)\n\n"
-        f"```json\n{hyps_json}\n```\n"
+        f"```json\n{hyps_json}\n```\n\n"
+        "## КАНДИДАТЫ НА СЛИЯНИЕ (JSON)\n\n"
+        f"```json\n{cands_json}\n```\n"
     )
+
+
+def _check_decisions(
+    candidates: list[tuple[int, int, list[str]]], hyp_map: HypothesisMap, logger,
+) -> None:
+    """
+    Проверить, что по каждому кандидату модель дала решение.
+
+    Кандидат без решения — тот самый «пропуск на глаз», ради которого кандидаты
+    введены. Как и потеря строки (_check_no_loss), фиксируется в логе как ERROR:
+    карта при этом сохраняется — слияние улучшает читаемость, но не должно ронять
+    прогон.
+    """
+    decided = {frozenset(d.row_ids) for d in hyp_map.decisions}
+    for a, b, shared in candidates:
+        if frozenset((a, b)) not in decided:
+            logger.error(
+                "merge: кандидат без решения %s (общий пункт %s) — модель обошла пару молча",
+                [a, b], ", ".join(shared),
+            )
 
 
 def _fallback_map(flat: list[tuple[int, int, Hypothesis]]) -> HypothesisMap:
@@ -160,7 +233,8 @@ def merge_map(
         return empty
 
     instruction = PROMPT_MERGE.read_text(encoding="utf-8")
-    document = _build_document(document_md, flat)
+    candidates = _candidate_pairs(flat)
+    document = _build_document(document_md, flat, candidates)
 
     result = call(
         instruction,
@@ -183,12 +257,14 @@ def merge_map(
     else:
         hyp_map = result.value
         _check_no_loss(n_input, hyp_map, logger)
+        _check_decisions(candidates, hyp_map, logger)
 
     save_json(run_id, "06_map.json", hyp_map)
     _add_cost_to_meta(run_id, result.cost_usd)
 
     logger.info(
-        "merge done: input=%d rows=%d merges=%d cost=$%.4f",
-        n_input, len(hyp_map.rows), len(hyp_map.merges), result.cost_usd,
+        "merge done: input=%d rows=%d merges=%d candidates=%d decisions=%d cost=$%.4f",
+        n_input, len(hyp_map.rows), len(hyp_map.merges), len(candidates),
+        len(hyp_map.decisions), result.cost_usd,
     )
     return hyp_map

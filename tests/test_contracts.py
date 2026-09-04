@@ -237,7 +237,9 @@ def test_all_field_names_across_all_models_are_latin():
         all_models |= _collect_models_recursively(root)
 
     # Защита от того, что рекурсия случайно не дошла до части моделей
-    assert len(all_models) == 12
+    # (13: + PairDecision — решение по кандидату на слияние, узел [5], ОС 2026-09-04;
+    #  14: + SourceRef — происхождение позиции запроса, узел [6], ОС 2026-09-04)
+    assert len(all_models) == 14
 
     for model_cls in all_models:
         for field_name in model_cls.model_fields:

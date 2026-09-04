@@ -176,6 +176,28 @@ class Merge(BaseModel):
         return self
 
 
+class PairDecision(BaseModel):
+    """
+    Решение модели по одной паре-кандидату на слияние (узел [5]).
+
+    Кандидатов находит код по общему номеру пункта акта (merge._candidate_pairs);
+    модель обязана по каждому сказать «слить / не слить» и почему. Введено по ОС
+    экспертов (2026-09-04, узел 5, В2/В4): за 8 прогонов узел пропустил дубль
+    1112 инд. 10↔11 с общим п. 8 — «на глаз» такие пары не замечаются.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    row_ids: list[int] = Field(min_length=2, max_length=2)
+    merge: bool
+    reason: str
+
+    @model_validator(mode="after")
+    def _check_not_blank(self) -> "PairDecision":
+        _not_blank(self.reason)
+        return self
+
+
 class HypothesisMap(BaseModel):
     """Итоговая карта гипотез с учётом слияний дублей."""
 
@@ -183,6 +205,29 @@ class HypothesisMap(BaseModel):
 
     rows: list[MapRow] = Field(default_factory=list)
     merges: list[Merge] = Field(default_factory=list)
+    # Решения по кандидатам на слияние; пусто у карт, собранных до введения
+    # кандидатов (старые прогоны и промпт v1) — поле необязательное.
+    decisions: list[PairDecision] = Field(default_factory=list)
+
+
+class SourceRef(BaseModel):
+    """
+    Показатель карты гипотез, вошедший в позицию запроса (узел [6]).
+
+    Введено по ОС экспертов (2026-09-04, узел 6, Г4): без происхождения позиции
+    код не мог проверить, что каждый показатель «запрос органу» попал в бланк
+    ровно один раз (ГРАНТЫ № 6 и № 7 — «а в чём отличие от предыдущего?»).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    row_id: int = Field(ge=1)
+    metric: str
+
+    @model_validator(mode="after")
+    def _check_not_blank(self) -> "SourceRef":
+        _not_blank(self.metric)
+        return self
 
 
 class RequestItem(BaseModel):
@@ -195,6 +240,12 @@ class RequestItem(BaseModel):
     clause: str | None = None
     for_rows: list[int] = Field(min_length=1)
     breakdown: list[str] = Field(default_factory=list)
+    # ОС 2026-09-04, узел 6 (Г1, Г2, Г4). Необязательные — ответы по промпту v1
+    # и старые 07_request.json остаются валидными.
+    kind: str = "показатель по годам"          # либо «перечень или реестр»
+    unit: str | None = None                    # единица отдельно от текста показателя
+    sources: list[SourceRef] = Field(default_factory=list)
+    note: str | None = None                    # чем позиция отличается от похожей соседней
 
     @model_validator(mode="after")
     def _check_not_blank(self) -> "RequestItem":
@@ -210,6 +261,9 @@ class DataRequest(BaseModel):
 
     items: list[RequestItem] = Field(default_factory=list)
     years: list[int] = Field(default_factory=list)
+    # Почему показатели «запрос органу» не вошли в бланк (ОС 2026-09-04, Г4);
+    # пусто у старых ответов.
+    why_dropped: str = ""
 
 
 class RunMeta(BaseModel):

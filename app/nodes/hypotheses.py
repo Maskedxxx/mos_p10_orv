@@ -46,6 +46,7 @@ from pathlib import Path
 
 from app.config import (
     ALLOWED_TOOLS_TEXT,
+    NO_DATA_TEXT_FAMILY,
     PROMPT_HYPOTHESES_NO_DATA,
     PROMPT_HYPOTHESES_VIOLATED,
 )
@@ -240,8 +241,21 @@ def run_hypotheses_no_data(
 
     Механика идентична run_hypotheses_violated (см. её docstring и docstring
     модуля) — отличаются только куча вердиктов и промпт (04b вместо 04a).
+
+    Индикаторы из NO_DATA_TEXT_FAMILY (1-6) пропускаются: их «нет данных» —
+    незавершённая проверка по тексту или правовой базе, а не пробел в практике;
+    гипотезы по ним не строятся, в Excel такой вердикт идёт строкой «проверка
+    не завершена» (ОС экспертов, Б1: МАДИ инд. 3 и «зелёные» инд. 4 дали ложные
+    гипотезы с оценками 1).
     """
+    practice = [v for v in buckets.no_data if v.indicator not in NO_DATA_TEXT_FAMILY]
+    skipped = [v.indicator for v in buckets.no_data if v.indicator in NO_DATA_TEXT_FAMILY]
+    if skipped:
+        get_run_logger(run_id).getChild("05_hypotheses_no_data").info(
+            "no_data: индикаторы %s пропущены — нехватка текста/правовой базы, гипотезы не строятся",
+            skipped,
+        )
     return _run_hypotheses(
-        buckets.no_data, document_md, run_id, PROMPT_HYPOTHESES_NO_DATA, "no_data",
+        practice, document_md, run_id, PROMPT_HYPOTHESES_NO_DATA, "no_data",
         max_workers, timeout_s, max_budget_usd,
     )

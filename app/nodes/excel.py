@@ -54,7 +54,7 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.worksheet.worksheet import Worksheet
 
 from app.config import REQUEST_YEARS_DEPTH, all_indicators, get_indicator
-from app.contracts import Buckets, DataItem, DataRequest, Effect, HypothesisMap, Verdict
+from app.contracts import Buckets, DataItem, DataRequest, Effect, HypothesisMap, RequestItem, Verdict
 from app.logger import get_run_logger
 from app.trace import run_dir
 
@@ -389,6 +389,41 @@ def _format_map_sheet(ws: Worksheet, header_row: int) -> None:
             c.border = _BORDER
 
 
+def _unverified_verdicts(hyp_map: HypothesisMap, buckets: Buckets) -> list[Verdict]:
+    """
+    Вердикты «нет данных», не представленные ни одной строкой карты — проверка
+    индикатора не завершена (ОС экспертов, Б1).
+
+    Так бывает, когда узел [4б] для индикатора не вызывался (семейство «текст /
+    правовая база», см. config.NO_DATA_TEXT_FAMILY) либо вернул пустой список
+    гипотез. Раньше такой вердикт не попадал ни на один лист, и аналитик не знал,
+    что проверка не доведена до конца.
+    """
+    covered = {n for row in hyp_map.rows for n in row.indicators}
+    return [v for v in buckets.no_data if v.indicator not in covered]
+
+
+def _append_unverified_rows(ws: Worksheet, hyp_map: HypothesisMap, buckets: Buckets) -> None:
+    """
+    Дописать в карту строки «проверка не завершена» — по одной на вердикт из
+    _unverified_verdicts. Нумерация продолжает строки карты; в запрос органу
+    такие строки не идут — дочитывает аналитик по правовой базе.
+    """
+    next_id = max((row.row_id for row in hyp_map.rows), default=0) + 1
+    for v in _unverified_verdicts(hyp_map, buckets):
+        ws.append([
+            next_id,
+            _indicators_label([v.indicator]),
+            "Проверка не завершена — не хватило текста или правовой базы.\n\n"
+            f"Что не проверено:\n{v.missing_data or 'не указано'}\n\n"
+            f"Как проверял агент:\n{v.rationale}",
+            "—",
+            "Дочитать самостоятельно по правовой базе. В запрос органу не идёт.",
+            _render_basis_cell(v.proof, v.clause, v.sources),
+        ])
+        next_id += 1
+
+
 def _render_map_sheet(
     wb: Workbook, hyp_map: HypothesisMap, row_to_nums: dict[int, list[str]], summary_md: str,
     buckets: Buckets, caption: str,
@@ -427,6 +462,7 @@ def _render_map_sheet(
             ),
         ])
 
+    _append_unverified_rows(ws, hyp_map, buckets)   # «нет данных» без гипотез — тоже в карту
     _format_map_sheet(ws, header_row)
 
 
@@ -470,6 +506,23 @@ def _render_source_rows_cell(for_rows: list[int], row_indicators: dict[int, list
     return "\n".join(lines)
 
 
+_KIND_LIST = "перечень или реестр"
+
+
+def _request_metric_label(item: RequestItem) -> str:
+    """
+    Текст показателя для клетки бланка: формулировка + единица измерения через
+    запятую («число заявок (пункт 5.1.4), ед.»). Единица — отдельное поле контракта
+    (ОС экспертов 2026-09-04, Г1: одна позиция — одна величина); у перечней её нет.
+    """
+    label = f"{item.metric}, {item.unit}" if item.unit else item.metric
+    if item.note:
+        # решение владельца 2026-09-04: похожие позиции остаются обе, но с пояснением,
+        # чем отличаются — чтобы эксперт не спрашивал «а в чём отличие от предыдущего?»
+        label += f"\nПояснение: {item.note}"
+    return label
+
+
 def _render_request_sheet(
     wb: Workbook, request: DataRequest, years: list[int], hyp_map: HypothesisMap,
     caption: str,
@@ -488,17 +541,32 @@ def _render_request_sheet(
 
     row_indicators = {row.row_id: row.indicators for row in hyp_map.rows}
     empty_years = [None] * len(years)
+    dash_years = ["—"] * len(years)          # у перечня клеток годов нет (Г2)
 
-    for item in request.items:
+    def _append_item(item, year_cells) -> None:
         ws.append([
-            item.num, item.metric,
+            item.num, _request_metric_label(item),
             _render_source_rows_cell(item.for_rows, row_indicators),
             item.clause or "",
-            *empty_years,
+            *year_cells,
         ])
         # подстроки разрезов ссылок не несут — они принадлежат родительской строке
         for i, breakdown in enumerate(item.breakdown, start=1):
-            ws.append([f"{item.num}.{i}", breakdown, "", "", *empty_years])
+            ws.append([f"{item.num}.{i}", breakdown, "", "", *year_cells])
+
+    counters = [it for it in request.items if it.kind != _KIND_LIST]
+    lists = [it for it in request.items if it.kind == _KIND_LIST]
+    for item in counters:
+        _append_item(item, empty_years)
+    if lists:
+        # ОС экспертов (2026-09-04, Г2): «перечень — это надо не в этой таблице»,
+        # «должно быть отдельным реестром» — перечни идут своим блоком, без годов
+        ws.append([
+            "", "Перечни и реестры — заполняются отдельным документом, без разбивки по годам",
+            "", "", *[""] * len(years),
+        ])
+        for item in lists:
+            _append_item(item, dash_years)
 
     _format_request_sheet(ws, header_row)
 
@@ -576,13 +644,15 @@ def build_excel(
     # 12 индикаторов задаёт методика, зашивать это число в текст нельзя.
     total = len(all_indicators())
     map_indicators = {n for row in hypothesis_map.rows for n in row.indicators}
+    map_indicators |= {v.indicator for v in _unverified_verdicts(hypothesis_map, buckets)}
 
     wb = Workbook()
     _render_map_sheet(
         wb, hypothesis_map, row_to_nums, summary_md, buckets,
         f"Индикаторы, по которым найдено нарушение или не хватило данных — "
         f"{len(map_indicators)} из {total}. По каждому построена гипотеза: "
-        f"что не так, чем мерить эффект, какие данные нужны.",
+        f"что не так, чем мерить эффект, какие данные нужны — либо отмечено, "
+        f"что проверка не завершена.",
     )
     _render_request_sheet(
         wb, request, years, hypothesis_map,

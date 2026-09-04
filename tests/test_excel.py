@@ -23,6 +23,7 @@ from app.contracts import (
     HypothesisMap,
     MapRow,
     RequestItem,
+    SourceRef,
     Verdict,
 )
 from app.nodes.excel import build_excel, compute_years
@@ -764,3 +765,126 @@ def test_summary_header_absent_when_requisites_missing():
     from app.nodes.excel import _summary_header_line
 
     assert _summary_header_line("# Саммари\n\n## 2. Что регулирует\n\nТекст.") is None
+
+
+def _buckets_with_unverified() -> Buckets:
+    """Как _buckets(with_failed=False), плюс «нет данных» по индикатору 4 БЕЗ строки
+    в карте — так бывает, когда узел [4б] для индикатора не вызывался (семейство
+    «текст / правовая база», Б1) либо вернул пустой список гипотез."""
+    b = _buckets(with_failed=False)
+    b.no_data.append(
+        Verdict(indicator=4, name="отсутствие дублирования требований", verdict="нет данных",
+                rationale="сопоставить требования п. 2.6 с Законом № 27 не удалось: текст закона не открылся",
+                proof="цитата вердикта 4", clause="2.6",
+                missing_data="текст статей Закона города Москвы от 13.11.2024 № 27"),
+    )
+    return b
+
+
+def test_map_has_unverified_row_for_no_data_without_hypotheses(tmp_runs_dir):
+    """Б1. Вердикт «нет данных» без гипотез раньше не попадал ни на один лист —
+    аналитик не узнавал, что проверка не завершена. Теперь это строка карты:
+    что не проверено и что в запрос органу не идёт."""
+    path = build_excel(_map(), _request(), _buckets_with_unverified(), _summary(), "run_unverified")
+    ws = load_workbook(path)["Карта гипотез"]
+    hdr = _find_header_row(ws)
+    rows = list(ws.iter_rows(min_row=hdr + 1, values_only=True))
+    assert len(rows) == 3, "две строки карты + одна строка незавершённой проверки"
+
+    num, ind, hyp, effect, data, basis = rows[2][:6]
+    assert num == 3, "нумерация продолжается за строками карты"
+    assert ind == "4. отсутствие дублирования требований"
+    assert "Проверка не завершена" in hyp
+    assert "текст статей Закона города Москвы от 13.11.2024 № 27" in hyp, "что не проверено — из missing_data"
+    assert "запрос органу не идёт" in data
+    assert "цитата вердикта 4" in basis and "2.6" in basis
+
+
+def test_map_caption_counts_unverified_indicators(tmp_runs_dir):
+    """Б1. Подпись карты обещает «нарушено или не хватило данных — N из 12»:
+    незавершённая проверка входит в N."""
+    path = build_excel(_map(), _request(), _buckets_with_unverified(), _summary(), "run_unverified_cap")
+    ws = load_workbook(path)["Карта гипотез"]
+    hdr = _find_header_row(ws)
+    caption = str(ws.cell(row=hdr - 1, column=1).value)
+    assert "4 из 12" in caption, caption   # индикаторы 1, 8, 3 из карты + 4 незавершённый
+
+
+def test_map_no_unverified_row_when_no_data_has_hypotheses(tmp_runs_dir):
+    """Б1, граница: «нет данных» по индикатору 3 уже представлен строкой карты 2 —
+    второй строки для него не появляется."""
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), _summary(), "run_no_dup")
+    ws = load_workbook(path)["Карта гипотез"]
+    hdr = _find_header_row(ws)
+    rows = list(ws.iter_rows(min_row=hdr + 1, values_only=True))
+    assert len(rows) == 2
+
+
+# ---- ОС экспертов 2026-09-04, узел 6: Г1 единица в бланке, Г2 перечни отдельным блоком ----
+
+
+def _request_v2() -> DataRequest:
+    return DataRequest(
+        items=[
+            RequestItem(num="1", kind="показатель по годам", metric="число заявок (пункт 5.1.4)", unit="ед.",
+                        clause="5.1.4", for_rows=[1], sources=[SourceRef(row_id=1, metric="число заявок")]),
+            RequestItem(num="2", kind="показатель по годам", metric="средний срок рассмотрения (пункт 2.5)",
+                        unit="календарных дней", clause="2.5", for_rows=[2],
+                        sources=[SourceRef(row_id=2, metric="средний срок рассмотрения")]),
+            RequestItem(num="3", kind="перечень или реестр",
+                        metric="перечень отклонённых заявок с датой и основанием (пункт 5.1.4)", unit=None,
+                        clause="5.1.4", for_rows=[1], sources=[SourceRef(row_id=1, metric="перечень отклонённых заявок")]),
+        ],
+        years=[2023, 2024, 2025],
+    )
+
+
+def test_request_sheet_shows_unit_with_metric(tmp_runs_dir):
+    """Г1. Единица измерения — отдельное поле контракта; в бланке чиновник видит её
+    рядом с показателем: «…, ед.», «…, календарных дней»."""
+    path = build_excel(_map(), _request_v2(), _buckets(with_failed=False), _summary(), "run_unit")
+    ws = load_workbook(path)["Запрос показателей"]
+    hdr = _find_header_row(ws, anchor="Показатель")
+    col = _col(ws, hdr, "Показатель")
+    cells = [ws.cell(row=r, column=col).value for r in range(hdr + 1, hdr + 3)]
+    assert cells[0] == "число заявок (пункт 5.1.4), ед."
+    assert cells[1] == "средний срок рассмотрения (пункт 2.5), календарных дней"
+
+
+def test_request_sheet_puts_lists_in_separate_block_without_years(tmp_runs_dir):
+    """Г2. Перечни и реестры — после показателей, под своей подписью, клетки годов
+    прочерком: «перечень — это надо не в этой таблице», «должно быть отдельным реестром»."""
+    path = build_excel(_map(), _request_v2(), _buckets(with_failed=False), _summary(), "run_lists")
+    ws = load_workbook(path)["Запрос показателей"]
+    hdr = _find_header_row(ws, anchor="Показатель")
+    rows = list(ws.iter_rows(min_row=hdr + 1, values_only=True))
+    texts = [str(r[1]) if r[1] is not None else "" for r in rows]
+    cap = next(i for i, t in enumerate(texts) if "Перечни и реестры" in t)
+    assert cap == 2, "подпись блока идёт сразу после двух показателей"
+    list_row = rows[cap + 1]
+    assert list_row[0] == "3"
+    assert list_row[1].startswith("перечень отклонённых заявок")
+    assert list_row[4:7] == ("—", "—", "—"), "клеток годов у перечня нет — прочерки"
+    assert rows[0][4:7] == (None, None, None), "у показателя клетки годов пустые для заполнения"
+
+
+def test_request_sheet_no_list_block_when_no_lists(tmp_runs_dir):
+    """Г2, граница: без перечней подписи блока нет."""
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), _summary(), "run_nolists")
+    ws = load_workbook(path)["Запрос показателей"]
+    assert not any("Перечни и реестры" in str(c.value) for row in ws.iter_rows() for c in row if c.value)
+
+
+def test_request_sheet_shows_note_under_metric(tmp_runs_dir):
+    """Решение владельца 2026-09-04 (вопрос 4): две похожие позиции остаются, но каждая
+    несёт пояснение, чем отличается — печатается второй строкой клетки «Показатель»."""
+    req = DataRequest(items=[
+        RequestItem(num="1", kind="показатель по годам", metric="количество отборов, проведённых (пункт 2.13)",
+                    unit="ед.", clause="2.13", for_rows=[1], sources=[SourceRef(row_id=1, metric="отборы")],
+                    note="только дошедшие до протокола; объявленные, но не состоявшиеся — в № 2"),
+    ], years=[2023, 2024, 2025])
+    path = build_excel(_map(), req, _buckets(with_failed=False), _summary(), "run_note")
+    ws = load_workbook(path)["Запрос показателей"]
+    hdr = _find_header_row(ws, anchor="Показатель")
+    cell = ws.cell(row=hdr + 1, column=_col(ws, hdr, "Показатель")).value
+    assert cell == "количество отборов, проведённых (пункт 2.13), ед.\nПояснение: только дошедшие до протокола; объявленные, но не состоявшиеся — в № 2"
