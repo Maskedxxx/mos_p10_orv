@@ -7,7 +7,7 @@
 
     Карта гипотез          — №, индикаторы, гипотеза, эффект, данные, на чём основано
     Запрос показателей     — №, показатель, откуда запрос, пункт акта, три года (пустые)
-    Нарушений не найдено   — куча buckets.checked: индикатор, вердикт, обоснование, на чём основано
+    Вердикты               — все вердикты четырёх куч: индикатор, вердикт, обоснование, на чём основано, где подробнее
     Ошибки прогона         — куча buckets.failed: индикатор, что случилось, попыток
 
 Оформление — единый деловой стиль фазы 2 (тёмно-синяя шапка 1F4E78, белый
@@ -71,9 +71,9 @@ _BORDER = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
 
 _SHEET_MAP = "Карта гипотез"
 _SHEET_REQUEST = "Запрос показателей"
-_SHEET_CHECKED = "Нарушений не найдено"   # было «Проверенные индикаторы»: имя не
-                                          # говорило, что здесь как раз те индикаторы,
-                                          # по которым гипотезы НЕ строились
+_SHEET_VERDICTS = "Вердикты"   # пул 3 (письмо заказчика 2026-09-04, п. 4): на листе
+                               # ВСЕ индикаторы, не только соблюдённые; имя — из письма.
+                               # История: «Проверенные индикаторы» → «Нарушений не найдено» (7.1)
 _SHEET_FAILED = "Ошибки прогона"
 
 
@@ -353,16 +353,29 @@ def _unverified_verdicts(hyp_map: HypothesisMap, buckets: Buckets) -> list[Verdi
     return [v for v in buckets.no_data if v.indicator not in covered]
 
 
+def _unverified_row_ids(hyp_map: HypothesisMap, buckets: Buckets) -> dict[int, int]:
+    """
+    Номер строки карты для каждого вердикта «проверка не завершена»: индикатор →
+    row_id. Нумерация продолжает строки карты. Считается здесь один раз, чтобы
+    карта и лист «Вердикты» ссылались на одно и то же число (пул 3, п. 4).
+    """
+    next_id = max((row.row_id for row in hyp_map.rows), default=0) + 1
+    return {
+        v.indicator: next_id + i
+        for i, v in enumerate(_unverified_verdicts(hyp_map, buckets))
+    }
+
+
 def _append_unverified_rows(ws: Worksheet, hyp_map: HypothesisMap, buckets: Buckets) -> None:
     """
     Дописать в карту строки «проверка не завершена» — по одной на вердикт из
     _unverified_verdicts. Нумерация продолжает строки карты; в запрос органу
     такие строки не идут — дочитывает аналитик по правовой базе.
     """
-    next_id = max((row.row_id for row in hyp_map.rows), default=0) + 1
+    row_ids = _unverified_row_ids(hyp_map, buckets)
     for v in _unverified_verdicts(hyp_map, buckets):
         ws.append([
-            next_id,
+            row_ids[v.indicator],
             _indicators_label([v.indicator]),
             "Проверка не завершена — не хватило текста или правовой базы.\n\n"
             f"Что не проверено:\n{v.missing_data or 'не указано'}\n\n"
@@ -371,7 +384,6 @@ def _append_unverified_rows(ws: Worksheet, hyp_map: HypothesisMap, buckets: Buck
             "Дочитать самостоятельно по правовой базе. В запрос органу не идёт.",
             _render_basis_cell(v.proof, v.clause, v.sources),
         ])
-        next_id += 1
 
 
 def _render_map_sheet(
@@ -528,7 +540,7 @@ def _indicator_label(v: Verdict) -> str:
 
 
 def _format_listing_sheet(ws: Worksheet, widths: dict[str, int], header_row: int) -> None:
-    """Общее оформление для листов-куч (Нарушений не найдено / Ошибки прогона)."""
+    """Общее оформление для листов-перечней (Вердикты / Ошибки прогона)."""
     for col, width in widths.items():
         ws.column_dimensions[col].width = width
     _style_header_row(ws, header_row)
@@ -539,20 +551,49 @@ def _format_listing_sheet(ws: Worksheet, widths: dict[str, int], header_row: int
             c.border = _BORDER
 
 
-def _render_checked_sheet(wb: Workbook, checked: list[Verdict], caption: str) -> None:
-    """Лист «Нарушений не найдено» из buckets.checked (соблюдён / не применимо)."""
-    ws = wb.create_sheet(_SHEET_CHECKED)
+def _where_details(v: Verdict, hyp_map: HypothesisMap, unverified_ids: dict[int, int]) -> str:
+    """
+    Колонка «Где подробнее» листа «Вердикты»: куда идти за разбором.
+
+    Нарушен и «нет данных» со строками карты — номера строк карты; «нет данных»
+    без строки — номер дописанной строки «проверка не завершена» (тот же, что
+    в карте); ошибка — лист ошибок; соблюдён и не применимо — подробностей нет,
+    обоснование и цитата уже в этой строке.
+    """
+    if v.verdict == "ошибка":
+        return f"лист «{_SHEET_FAILED}»"
+    rows = [row.row_id for row in hyp_map.rows if v.indicator in row.indicators]
+    if rows:
+        return f"{_SHEET_MAP}, стр. {', '.join(str(r) for r in rows)}"
+    if v.indicator in unverified_ids:
+        return f"{_SHEET_MAP}, стр. {unverified_ids[v.indicator]} — проверка не завершена"
+    return "—"
+
+
+def _render_verdicts_sheet(wb: Workbook, buckets: Buckets, hyp_map: HypothesisMap, caption: str) -> None:
+    """
+    Лист «Вердикты»: все вердикты четырёх куч по возрастанию номера индикатора.
+
+    Пул 3 (письмо заказчика 2026-09-04, п. 4): «сейчас одни индикаторы на листе
+    „Карта гипотез“, другие — на листе „Проверенные индикаторы“; предлагается
+    на втором указать сводную информацию о всех индикаторах (от 1 до 12)».
+    Карта остаётся как есть, сюда добавляется колонка «Где подробнее».
+    """
+    ws = wb.create_sheet(_SHEET_VERDICTS)
     _render_caption(ws, caption)
     header_row = ws.max_row + 1
-    ws.append(["Индикатор", "Вердикт", "Обоснование", "На чём основано"])
-    for v in checked:
+    ws.append(["Индикатор", "Вердикт", "Обоснование", "На чём основано", "Где подробнее"])
+    unverified_ids = _unverified_row_ids(hyp_map, buckets)
+    everything = buckets.violated + buckets.no_data + buckets.checked + buckets.failed
+    for v in sorted(everything, key=lambda v: v.indicator):
         # «Обоснование» — текст вердикта, «На чём основано» — цитата и адреса;
         # рендер общий с листом карты, чтобы одно и то же выглядело одинаково
         ws.append([
             _indicator_label(v), v.verdict, v.rationale,
             _render_basis_cell(v.proof, v.clause, list(v.sources)),
+            _where_details(v, hyp_map, unverified_ids),
         ])
-    _format_listing_sheet(ws, {"A": 34, "B": 16, "C": 60, "D": 52}, header_row)
+    _format_listing_sheet(ws, {"A": 34, "B": 16, "C": 60, "D": 52, "E": 30}, header_row)
 
 
 def _render_failed_sheet(wb: Workbook, failed: list[Verdict], caption: str) -> None:
@@ -610,10 +651,11 @@ def build_excel(
         "Данные, которых нет в открытом доступе. Заполняет орган-разработчик, "
         "три последних завершённых года.",
     )
-    _render_checked_sheet(
-        wb, buckets.checked,
-        f"Индикаторы, по которым гипотезы не строились — {len(buckets.checked)} из {total}. "
-        f"Вердикт «соблюдён» или «не применимо», с обоснованием и цитатой из акта.",
+    n_verdicts = sum(len(b) for b in (buckets.violated, buckets.no_data, buckets.checked, buckets.failed))
+    _render_verdicts_sheet(
+        wb, buckets, hypothesis_map,
+        f"Все индикаторы с вердиктами — {n_verdicts} из {total}. По нарушенным и «нет данных» "
+        f"подробности на листе «{_SHEET_MAP}», по сбоям — на листе «{_SHEET_FAILED}».",
     )
     _render_failed_sheet(
         wb, buckets.failed,

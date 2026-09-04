@@ -166,7 +166,7 @@ def test_opens_with_openpyxl_and_four_sheets(tmp_runs_dir):
     path = build_excel(_map(), _request(), _buckets(with_failed=True), _passport(), "run_a")
     wb = load_workbook(path)
     assert wb.sheetnames == [
-        "Карта гипотез", "Запрос показателей", "Нарушений не найдено", "Ошибки прогона",
+        "Карта гипотез", "Запрос показателей", "Вердикты", "Ошибки прогона",
     ]
 
 
@@ -196,16 +196,84 @@ def test_failed_sheet_lists_failures(tmp_runs_dir):
     assert ws.cell(row=row, column=_col(ws, hdr, "Попыток")).value == 3
 
 
-def test_checked_sheet_lists_verdicts(tmp_runs_dir):
-    path = build_excel(_map(), _request(), _buckets(with_failed=False), _passport(), "run_e")
-    ws = load_workbook(path)["Нарушений не найдено"]
+def _rows_by_indicator(ws, hdr: int) -> dict[int, int]:
+    """Номер строки листа по номеру индикатора («3. …» в первой колонке)."""
+    out = {}
+    for r in range(hdr + 1, ws.max_row + 1):
+        label = ws.cell(row=r, column=_col(ws, hdr, "Индикатор")).value
+        if label:
+            out[int(label.split(".")[0])] = r
+    return out
+
+
+# ----------------------------------------------------------------------
+# Пул 3 (письмо заказчика 2026-09-04, п. 4): «объединить вердикты по всем
+# индикаторам на одном листе». Решение владельца: нового листа не заводить,
+# третий лист называется «Вердикты» и показывает все 12, с отсылкой туда,
+# где подробности (карта — для нарушенных и «нет данных», лист ошибок — для сбоев).
+# ----------------------------------------------------------------------
+
+
+def test_verdicts_sheet_lists_all_buckets_sorted(tmp_runs_dir):
+    """На листе все вердикты четырёх куч по возрастанию номера индикатора, пять колонок."""
+    path = build_excel(_map(), _request(), _buckets(with_failed=True), _passport(), "run_e")
+    ws = load_workbook(path)["Вердикты"]
     hdr = _find_header_row(ws, "Вердикт")
     assert [c.value for c in ws[hdr]] == [
-        "Индикатор", "Вердикт", "Обоснование", "На чём основано",
+        "Индикатор", "Вердикт", "Обоснование", "На чём основано", "Где подробнее",
     ]
-    assert ws.max_row == hdr + 2  # шапка + 2 вердикта
-    assert "электронная подача документов" in ws.cell(row=hdr + 1, column=_col(ws, hdr, "Индикатор")).value
-    assert ws.cell(row=hdr + 1, column=_col(ws, hdr, "Вердикт")).value == "соблюдён"
+    assert ws.max_row == hdr + 6                       # 1, 8 нарушен; 3 нет данных; 2, 5; 9 ошибка
+    labels = [ws.cell(row=r, column=1).value for r in range(hdr + 1, ws.max_row + 1)]
+    assert [int(l.split(".")[0]) for l in labels] == [1, 2, 3, 5, 8, 9]
+    verdicts = [ws.cell(row=r, column=_col(ws, hdr, "Вердикт")).value for r in range(hdr + 1, ws.max_row + 1)]
+    assert verdicts == ["нарушен", "соблюдён", "нет данных", "не применимо", "нарушен", "ошибка"]
+
+
+def test_verdicts_sheet_points_to_map_rows(tmp_runs_dir):
+    """Нарушен и «нет данных» со строкой карты — ссылка на номер строки карты."""
+    path = build_excel(_map(), _request(), _buckets(with_failed=True), _passport(), "run_e2")
+    ws = load_workbook(path)["Вердикты"]
+    hdr = _find_header_row(ws, "Вердикт")
+    rows = _rows_by_indicator(ws, hdr)
+    where = _col(ws, hdr, "Где подробнее")
+    assert ws.cell(row=rows[1], column=where).value == "Карта гипотез, стр. 1"
+    assert ws.cell(row=rows[8], column=where).value == "Карта гипотез, стр. 1"
+    assert ws.cell(row=rows[3], column=where).value == "Карта гипотез, стр. 2"
+    assert ws.cell(row=rows[2], column=where).value == "—"
+    assert ws.cell(row=rows[5], column=where).value == "—"
+
+
+def test_verdicts_sheet_failed_points_to_errors_sheet(tmp_runs_dir):
+    path = build_excel(_map(), _request(), _buckets(with_failed=True), _passport(), "run_e3")
+    ws = load_workbook(path)["Вердикты"]
+    hdr = _find_header_row(ws, "Вердикт")
+    rows = _rows_by_indicator(ws, hdr)
+    assert ws.cell(row=rows[9], column=_col(ws, hdr, "Где подробнее")).value == "лист «Ошибки прогона»"
+    assert ws.cell(row=rows[9], column=_col(ws, hdr, "Обоснование")).value == "таймаут процесса после 900 с"
+
+
+def test_verdicts_sheet_unverified_points_to_same_row_as_map(tmp_runs_dir):
+    """«Нет данных» без строки карты: номер дописанной строки карты и на листе вердиктов один."""
+    buckets = _buckets(with_failed=False)
+    buckets.no_data.append(Verdict(
+        indicator=10, name="учёт практики применения", verdict="нет данных",
+        rationale="статистики жалоб нет", missing_data="число жалоб за 3 года",
+    ))
+    path = build_excel(_map(), _request(), buckets, _passport(), "run_e4")
+    wb = load_workbook(path)
+    ws_map = wb["Карта гипотез"]
+    map_hdr = _find_header_row(ws_map)
+    last = ws_map.max_row
+    assert "10. учёт практики применения" in ws_map.cell(row=last, column=_col(ws_map, map_hdr, "Индикаторы")).value
+    row_id = ws_map.cell(row=last, column=_col(ws_map, map_hdr, "№")).value
+    assert row_id == 3                                  # карта: строки 1, 2 → дописана 3
+
+    ws = wb["Вердикты"]
+    hdr = _find_header_row(ws, "Вердикт")
+    rows = _rows_by_indicator(ws, hdr)
+    assert ws.cell(row=rows[10], column=_col(ws, hdr, "Где подробнее")).value == (
+        f"Карта гипотез, стр. {row_id} — проверка не завершена"
+    )
 
 
 def test_request_sheet_has_three_year_columns_not_four(tmp_runs_dir):
@@ -281,7 +349,7 @@ def test_header_line_comes_from_passport_requisites(tmp_runs_dir):
     for name, anchor in (
         ("Карта гипотез", "Индикаторы"),
         ("Запрос показателей", "Показатель"),
-        ("Нарушений не найдено", "Вердикт"),
+        ("Вердикты", "Вердикт"),
         ("Ошибки прогона", "Что случилось"),
     ):
         ws = wb[name]
@@ -539,24 +607,21 @@ def test_basis_cell_states_when_nothing_at_all():
 # ----------------------------------------------------------------------
 
 
-def test_checked_sheet_basis_column(tmp_runs_dir):
+def test_verdicts_sheet_basis_column(tmp_runs_dir):
     """Та же колонка «На чём основано», что и в карте, с теми же блоками."""
     path = build_excel(_map(), _request(), _buckets(with_failed=False), _passport(), "run_chk_basis")
-    ws = load_workbook(path)["Нарушений не найдено"]
+    ws = load_workbook(path)["Вердикты"]
     hdr = _find_header_row(ws, "Вердикт")
+    rows = _rows_by_indicator(ws, hdr)
 
-    assert [c.value for c in ws[hdr]] == [
-        "Индикатор", "Вердикт", "Обоснование", "На чём основано",
-    ]
-
-    basis = ws.cell(row=hdr + 1, column=_col(ws, hdr, "На чём основано")).value
+    basis = ws.cell(row=rows[2], column=_col(ws, hdr, "На чём основано")).value
     assert basis.startswith("Норма акта, п. 2.1:\n«цитата»")
     assert "Внешние источники:" in basis
     assert "— https://docs.cntd.ru/document/3666532" in basis
     assert "— https://www.mos.ru/depr/" in basis
 
     # индикатор 5 «не применимо» — ни цитаты, ни адресов, но клетка не пустая
-    assert ws.cell(row=hdr + 2, column=_col(ws, hdr, "На чём основано")).value == (
+    assert ws.cell(row=rows[5], column=_col(ws, hdr, "На чём основано")).value == (
         "Норма акта:\nцитата из акта не приведена"
     )
 
@@ -653,13 +718,14 @@ def test_backref_round_trip(tmp_runs_dir):
 # отбора. «Проверенные индикаторы» не говорит, что здесь как раз те, по
 # которым гипотезы НЕ строились — владелец, глядя на готовый файл, не понял,
 # зачем этот лист нужен. В имя листа много не влезет (Excel режет на 31
-# знаке), поэтому смысл выносится первой строкой листа.
+# знаке), поэтому смысл выносится первой строкой листа. С пула 3 (2026-09-04)
+# третий лист — «Вердикты» со всеми индикаторами, подпись осталась.
 # ----------------------------------------------------------------------
 
 _SHEETS_AND_ANCHORS = (
     ("Карта гипотез", "Индикаторы"),
     ("Запрос показателей", "Показатель"),
-    ("Нарушений не найдено", "Вердикт"),
+    ("Вердикты", "Вердикт"),
     ("Ошибки прогона", "Что случилось"),
 )
 
@@ -701,8 +767,8 @@ def test_caption_counts_come_from_data_not_hardcoded(tmp_runs_dir):
 
     # в карте две строки: индикаторы 1, 8 и 3 — три уникальных
     assert f"3 из {total}" in wb["Карта гипотез"].cell(row=2, column=1).value
-    # проверенных в куче два
-    assert f"2 из {total}" in wb["Нарушений не найдено"].cell(row=1, column=1).value
+    # вердиктов во всех кучах шесть (1, 8, 3, 2, 5, 9)
+    assert f"6 из {total}" in wb["Вердикты"].cell(row=1, column=1).value
 
 
 def test_caption_does_not_break_header_styling(tmp_runs_dir):
