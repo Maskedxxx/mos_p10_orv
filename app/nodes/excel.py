@@ -3,8 +3,9 @@
 
 Модель не используется — чистый код, как и в фазе 2 (см. build_excel.py той
 версии, откуда переиспользованы стили оформления и compute_years). Собирает
-книгу с четырьмя листами:
+книгу с пятью листами:
 
+    Как заполнять          — инструкция эксперту: акт и дата от сервиса, ФИО и дата отзыва — оранжевые
     Карта гипотез          — №, индикаторы, гипотеза, эффект (кого задевает, показатель,
                              как считать, что подтвердит гипотезу), данные, на чём основано
     Запрос показателей     — №, показатель, откуда запрос, пункт акта, три года (пустые)
@@ -55,6 +56,7 @@ from pathlib import Path
 
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.worksheet.datavalidation import DataValidation
 from openpyxl.worksheet.worksheet import Worksheet
 
 from app.config import REQUEST_YEARS_DEPTH, all_indicators, get_indicator
@@ -74,6 +76,7 @@ _THIN = Side(style="thin", color="BFBFBF")
 _BORDER = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
 _EXPERT_FILL = PatternFill("solid", fgColor="FFF2CC")   # клетки для оценки экспертами (пул 3, п. 6.1)
 
+_SHEET_HOWTO = "Как заполнять"   # лист-инструкция для эксперта, первый в книге (пул 3, 6.2)
 _SHEET_MAP = "Карта гипотез"
 _SHEET_REQUEST = "Запрос показателей"
 _SHEET_VERDICTS = "Вердикты"   # пул 3 (письмо заказчика 2026-09-04, п. 4): на листе
@@ -335,10 +338,14 @@ def _render_map_data_cell(data: list[DataItem], nums: list[str]) -> str:
     return "\n\n".join(blocks)
 
 
+_EXPERT_LISTS = {"Оценка (1–5)": '"1,2,3,4,5"', "Согласны?": '"да,нет"'}   # выпадающие списки
+
+
 def _append_expert_columns(ws: Worksheet, header_row: int, names: list[str], widths: list[int]) -> None:
     """
     Дописать справа колонки для оценки экспертами: заголовок общим стилем шапки,
-    тело — оранжевая заливка FFF2CC, рамка, перенос.
+    тело — оранжевая заливка FFF2CC, рамка, перенос; у «Оценка (1–5)» и «Согласны?»
+    выпадающий список (_EXPERT_LISTS), как в шаблоне обратной связи экспертов ОС.
 
     Пул 3 (письмо заказчика 2026-09-04, п. 6.1): «включить оранжевые столбцы
     (для заполнения экспертами) сразу в выгружаемый файл». Решение владельца —
@@ -361,6 +368,10 @@ def _append_expert_columns(ws: Worksheet, header_row: int, names: list[str], wid
             c.border = _BORDER
             c.font = _BODY_FONT
             c.alignment = _WRAP_TOP
+        if name in _EXPERT_LISTS and ws.max_row > header_row:
+            dv = DataValidation(type="list", formula1=_EXPERT_LISTS[name], allow_blank=True)
+            dv.add(f"{head.column_letter}{header_row + 1}:{head.column_letter}{ws.max_row}")
+            ws.add_data_validation(dv)
 
 
 _EXPERT_SCORE_COLUMNS = (["Оценка (1–5)", "Замечание"], [12, 40])
@@ -429,6 +440,63 @@ def _append_unverified_rows(ws: Worksheet, hyp_map: HypothesisMap, buckets: Buck
         ])
 
 
+_MONTHS_RU = ("января", "февраля", "марта", "апреля", "мая", "июня",
+              "июля", "августа", "сентября", "октября", "ноября", "декабря")
+
+
+def _render_howto_sheet(wb: Workbook, passport: ActPassport | None) -> None:
+    """
+    Лист «Как заполнять» — первый в книге, инструкция эксперту по образцу шаблона
+    обратной связи, который до пула 3 собирался отдельно от пайплайна (файлы
+    экспертов ОС 2026-09-03: «Заполнено сервисом» / «Заполните вы» / шесть правил).
+
+    Заказчик (письмо 2026-09-04, п. 6.2): в файле от сервиса нет первого листа
+    «Как заполнять» и строк, заполняемых автоматически; владелец 2026-09-04 —
+    сделать на время тестирования. Имена листов в правилах — те же константы,
+    что у самих листов, чтобы инструкция не расходилась с книгой.
+    """
+    ws = wb.active
+    ws.title = _SHEET_HOWTO
+    ws.column_dimensions["A"].width = 34
+    ws.column_dimensions["B"].width = 80
+    now = datetime.datetime.now()
+    rendered = f"{now.day} {_MONTHS_RU[now.month - 1]} {now.year}, {now:%H:%M}"
+    act = _passport_header_line(passport) or "—"
+    rules = [
+        f"Пройдите три листа: «{_SHEET_MAP}», «{_SHEET_REQUEST}», «{_SHEET_VERDICTS}».",
+        "Оранжевые столбцы справа — ваши. Синие столбцы менять не нужно.",
+        f"На листах «{_SHEET_MAP}» и «{_SHEET_REQUEST}» поставьте оценку от 1 до 5: "
+        "щёлкните по ячейке и выберите значение из выпадающего списка.",
+        f"На листе «{_SHEET_VERDICTS}» оценки нет. Там ответ «да» или «нет» на вопрос "
+        "«Согласны?» — тоже из списка; если «нет», напишите рядом верный вердикт.",
+        "Замечание пишите своими словами. Одно «неверно» нам не поможет — нужно, что именно не так.",
+        "Готовый файл пришлите обратно. Имя файла не меняйте — по нему видно, о каком акте речь.",
+    ]
+    lines: list[tuple[str | None, str | None, str]] = [
+        ("Обратная связь по разбору нормативного акта", None, "title"),
+        (None, None, "blank"),
+        ("Заполнено сервисом", None, "section"),
+        ("Акт", act, "row"),
+        ("Разобран", rendered, "row"),
+        (None, None, "blank"),
+        ("Заполните вы", None, "section"),
+        ("ФИО", None, "orange"),
+        ("Дата отзыва", None, "orange"),
+        (None, None, "blank"),
+        ("Что нужно сделать", None, "section"),
+    ] + [(str(i), rule, "row") for i, rule in enumerate(rules, start=1)]
+    for a, b, kind in lines:
+        ws.append([a, b])
+        r = ws.max_row
+        ca, cb = ws.cell(row=r, column=1), ws.cell(row=r, column=2)
+        ca.font = Font(bold=True, size=14 if kind == "title" else 12 if kind == "section" else 11)
+        cb.font = _BODY_FONT
+        cb.alignment = _WRAP_TOP
+        if kind == "orange":
+            cb.fill = _EXPERT_FILL
+            cb.border = _BORDER
+
+
 def _render_map_sheet(
     wb: Workbook, hyp_map: HypothesisMap, row_to_nums: dict[int, list[str]],
     passport: ActPassport | None, buckets: Buckets, caption: str,
@@ -439,8 +507,7 @@ def _render_map_sheet(
     buckets нужны для колонки «На чём основано»: внешние источники и запасная
     цитата лежат в вердиктах, а не в строке карты (см. _dedup_sources).
     """
-    ws = wb.active
-    ws.title = _SHEET_MAP
+    ws = wb.create_sheet(_SHEET_MAP)
 
     header_line = _passport_header_line(passport)
     if header_line is not None:
@@ -685,6 +752,7 @@ def build_excel(
     map_indicators |= {v.indicator for v in _unverified_verdicts(hypothesis_map, buckets)}
 
     wb = Workbook()
+    _render_howto_sheet(wb, passport)          # первый лист — инструкция эксперту
     _render_map_sheet(
         wb, hypothesis_map, row_to_nums, passport, buckets,
         f"Индикаторы, по которым найдено нарушение или не хватило данных — "

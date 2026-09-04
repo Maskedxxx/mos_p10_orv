@@ -162,11 +162,11 @@ def _col(ws, header_row: int, name: str) -> int:
     raise AssertionError(f"колонка «{name}» не найдена в строке {header_row}")
 
 
-def test_opens_with_openpyxl_and_four_sheets(tmp_runs_dir):
+def test_opens_with_openpyxl_and_five_sheets(tmp_runs_dir):
     path = build_excel(_map(), _request(), _buckets(with_failed=True), _passport(), "run_a")
     wb = load_workbook(path)
     assert wb.sheetnames == [
-        "Карта гипотез", "Запрос показателей", "Вердикты", "Ошибки прогона",
+        "Как заполнять", "Карта гипотез", "Запрос показателей", "Вердикты", "Ошибки прогона",
     ]
 
 
@@ -740,7 +740,7 @@ _SHEETS_AND_ANCHORS = (
 def test_sheet_names_say_what_is_on_them(tmp_runs_dir):
     path = build_excel(_map(), _request(), _buckets(with_failed=True), _passport(), "run_names")
     wb = load_workbook(path)
-    assert wb.sheetnames == [name for name, _ in _SHEETS_AND_ANCHORS]
+    assert wb.sheetnames == ["Как заполнять"] + [name for name, _ in _SHEETS_AND_ANCHORS]
 
 
 def test_each_sheet_has_caption_above_header(tmp_runs_dir):
@@ -826,6 +826,51 @@ def test_expert_columns_present_and_orange(tmp_runs_dir):
     ws_err = wb["Ошибки прогона"]
     hdr = _find_header_row(ws_err, "Что случилось")
     assert [c.value for c in ws_err[hdr]] == ["Индикатор", "Что случилось", "Попыток"]
+
+
+def test_howto_sheet_is_first_and_filled_by_service(tmp_runs_dir):
+    """Лист-инструкция для эксперта: акт и дата — от сервиса, ФИО и дата отзыва — оранжевые, правила называют реальные листы."""
+    path = build_excel(_map(), _request(), _buckets(with_failed=True), _passport(), "run_howto")
+    wb = load_workbook(path)
+    ws = wb["Как заполнять"]
+    assert wb.sheetnames[0] == "Как заполнять"
+    assert ws.cell(row=1, column=1).value == "Обратная связь по разбору нормативного акта"
+    rows = {ws.cell(row=r, column=1).value: r for r in range(1, ws.max_row + 1)}
+    assert "N 02-02-313/21" in ws.cell(row=rows["Акт"], column=2).value
+    assert ws.cell(row=rows["Разобран"], column=2).value            # дата сборки, непустая
+    for label in ("ФИО", "Дата отзыва"):
+        cell = ws.cell(row=rows[label], column=2)
+        assert cell.value is None and cell.fill.fgColor.rgb.endswith("FFF2CC"), label
+    rules = "\n".join(str(ws.cell(row=r, column=2).value) for r in range(rows["Что нужно сделать"] + 1, ws.max_row + 1))
+    for name in ("Карта гипотез", "Запрос показателей", "Вердикты"):
+        assert f"«{name}»" in rules, name
+    assert "Проверенные индикаторы" not in rules
+    assert ws.max_row - rows["Что нужно сделать"] == 6
+
+
+def test_howto_sheet_without_passport_has_dash_for_act(tmp_runs_dir):
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), None, "run_howto_np")
+    ws = load_workbook(path)["Как заполнять"]
+    rows = {ws.cell(row=r, column=1).value: r for r in range(1, ws.max_row + 1)}
+    assert ws.cell(row=rows["Акт"], column=2).value == "—"
+
+
+def test_expert_columns_have_dropdown_lists(tmp_runs_dir):
+    """Оценка — список 1…5 на карте и запросе; «Согласны?» — да/нет на вердиктах (как в шаблоне экспертов ОС)."""
+    path = build_excel(_map(), _request(), _buckets(with_failed=True), _passport(), "run_dv")
+    wb = load_workbook(path)
+    for sheet, anchor, name, formula in (
+        ("Карта гипотез", "Индикаторы", "Оценка (1–5)", '"1,2,3,4,5"'),
+        ("Запрос показателей", "Показатель", "Оценка (1–5)", '"1,2,3,4,5"'),
+        ("Вердикты", "Вердикт", "Согласны?", '"да,нет"'),
+    ):
+        ws = wb[sheet]
+        hdr = _find_header_row(ws, anchor)
+        col_letter = ws.cell(row=hdr, column=_col(ws, hdr, name)).column_letter
+        dvs = [dv for dv in ws.data_validations.dataValidation if dv.formula1 == formula]
+        assert dvs, (sheet, name)
+        covered = str(dvs[0].sqref)
+        assert covered == f"{col_letter}{hdr + 1}:{col_letter}{ws.max_row}", (sheet, covered)
 
 
 def test_expert_columns_cover_breakdown_rows(tmp_runs_dir):
