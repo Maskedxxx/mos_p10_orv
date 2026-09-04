@@ -23,6 +23,7 @@ import pytest
 
 import app.pipeline as pipeline
 from app.contracts import (
+    ActPassport,
     Buckets,
     DataItem,
     DataRequest,
@@ -41,6 +42,27 @@ from app.nodes.hypotheses import _add_cost_to_meta
 from app.pipeline import run_pipeline
 from app.trace import load_json, new_run, run_dir, save_json, save_text
 
+
+def _minimal_passport_dict() -> dict:
+    """Минимальный валидный паспорт (все объекты «нет» с обоснованием) — для заглушек."""
+    no = {"state": "нет", "justification": "искал по всему тексту, не установлено"}
+    return {
+        "requisites": {"kind": "приказ", "number": "N 1", "date": "1 января 2024 г.",
+                       "authority": "Департамент", "title": "Об утверждении порядка"},
+        "status": {"status": "принят", "status_basis": "есть номер, дата, подпись",
+                   "effective_date": "21.08.2025", "effective_date_clause": None, "deferred": [], "repealed_clauses": []},
+        "addressee": {"scope": "внешним лицам", "categories": [{"name": "перевозчики", "clause": "п. 1"}], "distinctions": []},
+        "nature": {"actions": [{"action": "утверждает новое", "target": "Порядок", "clauses": ["п. 1"]}],
+                   "issued_under": [], "input_kind": "акт изменений не вносит"},
+        "requirements": {**no, "groups": []},
+        "procedure": {**no, "participants": None, "result": None, "has_document_check": None, "refusal_grounds": None, "clauses": []},
+        "documents": {**no, "items": [], "transfer_clauses": []},
+        "deadlines": {**no, "items": []},
+        "references": {**no, "acts": [], "authorities": []},
+        "allocation": {"competitive": {**no, "kind": None, "resource": None, "clauses": []}, "appointed": {**no, "items": []}},
+        "control": {**no, "authority": None, "subject": None, "measures": [], "outcomes": [], "clauses": []},
+    }
+
 # Плановые вердикты заглушки узла [2]: три нарушения, два пробела, пять
 # соблюдений, одно "не применимо" и одна ошибка — по ним считается сводка
 _VERDICT_PLAN: list[tuple[int, str]] = [
@@ -53,7 +75,7 @@ _VERDICT_PLAN: list[tuple[int, str]] = [
 
 # Стоимость, которую заглушка каждого узла прибавляет в meta.json
 _COSTS: dict[str, float] = {
-    "summary": 0.5,
+    "passport": 0.5,
     "verdicts": 2.0,
     "violated": 1.0,
     "no_data": 0.25,
@@ -116,7 +138,7 @@ class Fakes:
         self._lock = threading.Lock()
 
         # Что заглушки увидели/записали — для проверок в тестах
-        self.summary_seen: str | None = None
+        self.passport_seen: dict[str, object] = {}   # узел -> что ему пришло как паспорт
         self.sets_seen: list[HypothesisSet] = []
         self.indicators_ready_after_each: list[int] = []
         self.progress_at_sort: RunProgress | None = None
@@ -157,14 +179,14 @@ class Fakes:
         self._record("convert:end")
         return "текст акта"
 
-    def summary(self, document_md: str, run_id: str) -> str:
-        self._record("summary:start")
-        self._maybe_fail("summary")
-        text = "## 1. Реквизиты\n- **Вид акта:** приказ\n"
-        save_text(run_id, "02_summary.md", text)
-        self._pay(run_id, "summary")
-        self._record("summary:end")
-        return text
+    def passport(self, document_md: str, run_id: str, **kwargs) -> ActPassport | None:
+        self._record("passport:start")
+        self._maybe_fail("passport")
+        passport = ActPassport(**_minimal_passport_dict())
+        save_json(run_id, "02_passport.json", passport)
+        self._pay(run_id, "passport")
+        self._record("passport:end")
+        return passport
 
     def verdicts(
         self,
@@ -176,8 +198,10 @@ class Fakes:
         timeout_s: int = 900,
         max_budget_usd=None,
         on_verdict=None,
+        passport=None,
     ) -> list[Verdict]:
         self._record("verdicts:start")
+        self.passport_seen["verdicts"] = passport
         self._maybe_fail("verdicts")
         result: list[Verdict] = []
         for n, value in _VERDICT_PLAN:
@@ -215,11 +239,13 @@ class Fakes:
     def hypotheses_violated(
         self, buckets: Buckets, document_md: str, run_id: str, **kwargs,
     ) -> list[HypothesisSet]:
+        self.passport_seen["violated"] = kwargs.get("passport")
         return self._branch("violated", buckets.violated, run_id)
 
     def hypotheses_no_data(
         self, buckets: Buckets, document_md: str, run_id: str, **kwargs,
     ) -> list[HypothesisSet]:
+        self.passport_seen["no_data"] = kwargs.get("passport")
         return self._branch("no_data", buckets.no_data, run_id)
 
     def _branch(self, name: str, verdicts: list[Verdict], run_id: str) -> list[HypothesisSet]:
@@ -260,6 +286,9 @@ class Fakes:
 
     def request(self, hypothesis_map: HypothesisMap, run_id: str, **kwargs) -> DataRequest:
         self._record("request:start")
+        self.passport_seen["request"] = kwargs.get("passport")
+        self.passport_seen["request_effective_year"] = kwargs.get("effective_year")
+        self.passport_seen["request_document"] = kwargs.get("document_md")
         self._maybe_fail("request")
         items = [
             RequestItem(
@@ -274,9 +303,9 @@ class Fakes:
         self._record("request:end")
         return value
 
-    def excel(self, hypothesis_map, request, buckets, summary_md: str, run_id: str):
+    def excel(self, hypothesis_map, request, buckets, passport, run_id: str):
         self._record("excel:start")
-        self.summary_seen = summary_md
+        self.passport_seen["excel"] = passport
         self._maybe_fail("excel")
         path = run_dir(run_id) / "08_result.xlsx"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -292,7 +321,7 @@ def fakes(tmp_runs_dir, monkeypatch) -> Fakes:
     f = Fakes(run_id)
 
     monkeypatch.setattr(pipeline, "convert_to_markdown", f.convert)
-    monkeypatch.setattr(pipeline, "make_summary", f.summary)
+    monkeypatch.setattr(pipeline, "make_passport", f.passport)
     monkeypatch.setattr(pipeline, "run_verdicts", f.verdicts)
     monkeypatch.setattr(pipeline, "sort_verdicts", f.sort)
     monkeypatch.setattr(pipeline, "run_hypotheses_violated", f.hypotheses_violated)
@@ -325,11 +354,11 @@ def test_nodes_called_in_declared_order(fakes, act_file):
     run_pipeline(act_file, fakes.run_id)
 
     single = [e for e in fakes.events if e.split(":")[0] in (
-        "convert", "summary", "verdicts", "sort", "merge", "request", "excel",
+        "convert", "passport", "verdicts", "sort", "merge", "request", "excel",
     )]
     assert single == [
         "convert:start", "convert:end",
-        "summary:start", "summary:end",
+        "passport:start", "passport:end",
         "verdicts:start", "verdicts:end",
         "sort:start", "sort:end",
         "merge:start", "merge:end",
@@ -338,11 +367,20 @@ def test_nodes_called_in_declared_order(fakes, act_file):
     ]
 
 
-def test_document_and_summary_routed_to_expected_nodes(fakes, act_file):
-    """1.1. Саммари уходит только в узел [7] (шапка листа), а не в вердикты."""
+def test_passport_routed_to_expected_nodes(fakes, act_file):
+    """1.1. Паспорт уходит в вердикты, обе ветки гипотез, запрос (как JSON плюс
+    год вступления в силу и текст акта) и Excel — и НЕ уходит в слияние."""
     run_pipeline(act_file, fakes.run_id)
 
-    assert fakes.summary_seen == "## 1. Реквизиты\n- **Вид акта:** приказ\n"
+    seen = fakes.passport_seen
+    assert isinstance(seen["verdicts"], ActPassport)
+    assert isinstance(seen["violated"], ActPassport)
+    assert isinstance(seen["no_data"], ActPassport)
+    assert isinstance(seen["excel"], ActPassport)
+    assert isinstance(seen["request"], dict) and seen["request"]["requisites"]["authority"] == "Департамент"
+    assert seen["request_effective_year"] == 2025
+    assert seen["request_document"] == "текст акта"
+    assert "merge" not in seen
 
 
 # ---- 2. Одновременность веток [4а] и [4б] ----
@@ -489,20 +527,21 @@ def test_convert_failure_stops_the_run(fakes, act_file):
     assert result.excel_path is None
 
 
-def test_summary_failure_does_not_stop_the_run(fakes, act_file):
-    """7. Падение саммари прогон не останавливает: Excel собирается, шапка —
-    без реквизитов (в узел [7] уходит пустая строка)."""
-    fakes.fail = {"summary"}
+def test_passport_failure_stops_the_run(fakes, act_file):
+    """7. Падение паспорта останавливает прогон: без паспорта ворота всех 12
+    промптов недостоверны. Вердикты не вызываются, Excel не собирается."""
+    fakes.fail = {"passport"}
 
     result = run_pipeline(act_file, fakes.run_id)
 
-    assert result.status == "готов"
-    assert result.excel_path is not None
-    assert fakes.summary_seen == ""
+    assert result.status == "сбой"
+    assert result.excel_path is None
+    assert "паспорт акта" in (result.error or "")
+    assert "verdicts:start" not in fakes.events
 
     progress = _read_progress(fakes.run_id)
-    assert _node(progress, "summary").status == "сбой"
-    assert _node(progress, "excel").status == "готов"
+    assert _node(progress, "passport").status == "сбой"
+    assert _node(progress, "verdicts").status == "ожидает"
 
 
 def test_excel_failure_marks_run_failed_but_keeps_artifacts(fakes, act_file):
@@ -518,7 +557,7 @@ def test_excel_failure_marks_run_failed_but_keeps_artifacts(fakes, act_file):
 
     folder = run_dir(fakes.run_id)
     for artefact in (
-        "01_document.md", "02_summary.md", "03_verdicts/01.json", "04_buckets.json",
+        "01_document.md", "02_passport.json", "03_verdicts/01.json", "04_buckets.json",
         "05_hypotheses/01.json", "06_map.json", "07_request.json", "progress.json",
     ):
         assert (folder / artefact).exists(), artefact
@@ -572,7 +611,7 @@ def test_cost_is_summed_over_all_nodes(fakes, act_file):
 
     progress = _read_progress(fakes.run_id)
     assert progress.total_cost_usd == pytest.approx(expected_total)
-    assert _node(progress, "summary").cost_usd == pytest.approx(_COSTS["summary"])
+    assert _node(progress, "passport").cost_usd == pytest.approx(_COSTS["passport"])
     assert _node(progress, "verdicts").cost_usd == pytest.approx(_COSTS["verdicts"])
     # Узел гипотез — сумма обеих веток, он один на [4а] и [4б]
     assert _node(progress, "hypotheses").cost_usd == pytest.approx(

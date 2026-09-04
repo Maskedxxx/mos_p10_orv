@@ -78,6 +78,7 @@ from app.contracts import (
     Verdict,
 )
 from app.logger import get_run_logger
+from app.config import PASSPORT_TIMEOUT_S
 from app.nodes.convert import convert_to_markdown
 from app.nodes.excel import build_excel
 from app.nodes.hypotheses import (
@@ -88,7 +89,7 @@ from app.nodes.hypotheses import (
 from app.nodes.merge import merge_map
 from app.nodes.request import build_request
 from app.nodes.sort import sort_verdicts
-from app.nodes.summary import make_summary
+from app.nodes.passport import make_passport, passport_effective_year
 from app.nodes.verdicts import run_verdicts
 from app.trace import load_json, new_run, save_json, update_meta
 
@@ -100,7 +101,7 @@ PROGRESS_FILE = "progress.json"
 # лежат в RunProgress.hypotheses_branches.
 _NODES: list[tuple[str, str]] = [
     ("convert", "Конвертация акта в markdown"),
-    ("summary", "Саммари приказа"),
+    ("passport", "Паспорт акта"),
     ("verdicts", "Двенадцать индикаторов"),
     ("sort", "Разбор корзины вердиктов"),
     ("hypotheses", "Гипотезы: нарушения и пробелы"),
@@ -289,6 +290,7 @@ def _run_one_branch(
     branch: str,
     buckets: Buckets,
     document_md: str,
+    passport,
     run_id: str,
     timeout_s: int,
     max_budget_usd: float | None,
@@ -304,7 +306,7 @@ def _run_one_branch(
     try:
         sets = node_fn(
             buckets, document_md, run_id,
-            timeout_s=timeout_s, max_budget_usd=max_budget_usd,
+            passport=passport, timeout_s=timeout_s, max_budget_usd=max_budget_usd,
         )
     except Exception as exc:
         progress.branch_status(branch, "сбой")
@@ -317,6 +319,7 @@ def _run_hypotheses_branches(
     progress: _Progress,
     buckets: Buckets,
     document_md: str,
+    passport,
     run_id: str,
     timeout_s: int,
     max_budget_usd: float | None,
@@ -331,7 +334,7 @@ def _run_hypotheses_branches(
     with ThreadPoolExecutor(max_workers=2) as executor:
         futures = {
             branch: executor.submit(
-                _run_one_branch, progress, branch, buckets, document_md, run_id,
+                _run_one_branch, progress, branch, buckets, document_md, passport, run_id,
                 timeout_s, max_budget_usd,
             )
             for branch in ("violated", "no_data")
@@ -428,14 +431,20 @@ def run_pipeline(
         empty = _build_summary([], HypothesisMap(), DataRequest(), None)
         return _finish(progress, run_id, "сбой", empty, f"{type(exc).__name__}: {exc}")
 
-    # [1.1] саммари — падение не останавливает прогон: шапка Excel будет
-    # без реквизитов (см. _summary_header_line в app/nodes/excel.py)
-    summary_md = ""
+    # [1.1] паспорт акта — без него идти нельзя: ворота «не применимо» всех
+    # 12 промптов стоят на его ключах, годы бланка и шапка Excel — тоже из него
+    passport = None
     try:
-        with _node(progress, "summary"):
-            summary_md = make_summary(document_md, run_id)
-    except Exception:
-        pass  # причина уже записана в progress.json и run.log
+        with _node(progress, "passport"):
+            passport = make_passport(
+                document_md, run_id,
+                timeout_s=PASSPORT_TIMEOUT_S, max_budget_usd=max_budget_usd,
+            )
+            if passport is None:
+                raise RuntimeError("модель не вернула паспорт акта")
+    except Exception as exc:
+        empty = _build_summary([], HypothesisMap(), DataRequest(), None)
+        return _finish(progress, run_id, "сбой", empty, f"паспорт акта: {type(exc).__name__}: {exc}")
 
     # [2] двенадцать вердиктов параллельно, барьер внутри узла; готовность
     # каждого индикатора приходит колбэком по ходу — для счётчика "7 из 12"
@@ -445,6 +454,7 @@ def run_pipeline(
             progress.indicators_started()
             verdicts = run_verdicts(
                 document_md, run_id,
+                passport=passport,
                 timeout_s=timeout_s,
                 max_budget_usd=max_budget_usd,
                 on_verdict=progress.indicator_done,
@@ -465,7 +475,7 @@ def run_pipeline(
     # [4а]+[4б] одновременно, барьер после обеих
     progress.node_started("hypotheses")
     hypothesis_sets, branch_errors = _run_hypotheses_branches(
-        progress, buckets, document_md, run_id, timeout_s, max_budget_usd,
+        progress, buckets, document_md, passport, run_id, timeout_s, max_budget_usd,
     )
     if branch_errors:
         # Ветка упала — узел помечается сбоем, но прогон продолжается:
@@ -491,6 +501,9 @@ def run_pipeline(
         with _node(progress, "request"):
             request = build_request(
                 hypothesis_map, run_id,
+                document_md=document_md,
+                passport=passport.model_dump(mode="json"),
+                effective_year=passport_effective_year(passport),
                 timeout_s=timeout_s, max_budget_usd=max_budget_usd,
             )
     except Exception:
@@ -500,7 +513,7 @@ def run_pipeline(
     # прогон; промежуточные артефакты при этом остаются на диске
     try:
         with _node(progress, "excel"):
-            excel_path = build_excel(hypothesis_map, request, buckets, summary_md, run_id)
+            excel_path = build_excel(hypothesis_map, request, buckets, passport, run_id)
     except Exception as exc:
         summary = _build_summary(verdicts, hypothesis_map, request, None)
         return _finish(progress, run_id, "сбой", summary, f"{type(exc).__name__}: {exc}")

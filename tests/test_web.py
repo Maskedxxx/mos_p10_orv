@@ -393,7 +393,7 @@ def test_excel_file_is_none_when_nothing_was_assembled(tmp_runs_dir):
 def test_failed_node_tells_which_step_broke(tmp_runs_dir):
     nodes = [
         NodeState(key="convert", title="Конвертация акта в markdown", status="готов", duration_s=0.5),
-        NodeState(key="summary", title="Саммари приказа", status="сбой", error="RuntimeError: нет ответа"),
+        NodeState(key="passport", title="Паспорт акта", status="сбой", error="RuntimeError: нет ответа"),
     ]
     _write_progress(tmp_runs_dir, "run_broken", status="сбой", nodes=nodes)
 
@@ -402,7 +402,7 @@ def test_failed_node_tells_which_step_broke(tmp_runs_dir):
     node = web.failed_node(progress)
 
     assert node is not None
-    assert node.title == "Саммари приказа"
+    assert node.title == "Паспорт акта"
     assert "RuntimeError" in (node.error or "")
 
 

@@ -50,7 +50,7 @@ from app.config import (
     PROMPT_HYPOTHESES_NO_DATA,
     PROMPT_HYPOTHESES_VIOLATED,
 )
-from app.contracts import Buckets, HypothesisSet, RunMeta, Verdict
+from app.contracts import ActPassport, Buckets, HypothesisSet, RunMeta, Verdict
 from app.logger import get_run_logger
 from app.runner import call
 from app.trace import load_json, save_json, update_meta
@@ -77,19 +77,19 @@ def _add_cost_to_meta(run_id: str, cost_delta: float) -> None:
         update_meta(run_id, cost_usd=current.cost_usd + cost_delta)
 
 
-def _build_document(document_md: str, verdict: Verdict) -> str:
+def _build_document(document_md: str, passport_block_text: str, verdict: Verdict) -> str:
     """
-    Собрать документ для stdin агента: полный текст акта + карточка вердикта
-    отдельным помеченным JSON-блоком, чтобы модель не путала вердикт с текстом
-    акта. Карточка сериализуется читаемо (indent=2, кириллица без escape).
+    Собрать документ для stdin агента: полный текст акта, блок паспорта (если
+    есть), карточка вердикта — три помеченных блока в порядке, описанном
+    во входных данных промптов 04a/04b v2. Карточка сериализуется читаемо
+    (indent=2, кириллица без escape).
     """
     verdict_json = json.dumps(verdict.model_dump(mode="json"), ensure_ascii=False, indent=2)
-    return (
-        "## ПОЛНЫЙ ТЕКСТ АКТА\n\n"
-        f"{document_md}\n\n"
-        "## КАРТОЧКА ВЕРДИКТА (JSON)\n\n"
-        f"```json\n{verdict_json}\n```\n"
-    )
+    parts = ["## ПОЛНЫЙ ТЕКСТ АКТА\n\n" f"{document_md}\n"]
+    if passport_block_text:
+        parts.append(passport_block_text)
+    parts.append("## КАРТОЧКА ВЕРДИКТА (JSON)\n\n" f"```json\n{verdict_json}\n```\n")
+    return "\n".join(parts)
 
 
 def _empty_set(verdict: Verdict, error_text: str) -> HypothesisSet:
@@ -105,6 +105,7 @@ def _empty_set(verdict: Verdict, error_text: str) -> HypothesisSet:
 def _run_one_hypothesis(
     verdict: Verdict,
     document_md: str,
+    passport_block_text: str,
     run_id: str,
     instruction: str,
     timeout_s: int,
@@ -123,7 +124,7 @@ def _run_one_hypothesis(
     """
     n = verdict.indicator
     try:
-        document = _build_document(document_md, verdict)
+        document = _build_document(document_md, passport_block_text, verdict)
 
         result = call(
             instruction,
@@ -152,6 +153,7 @@ def _run_one_hypothesis(
 def _run_hypotheses(
     verdicts: list[Verdict],
     document_md: str,
+    passport_block_text: str,
     run_id: str,
     prompt_file: Path,
     branch_label: str,
@@ -171,7 +173,8 @@ def _run_hypotheses(
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [
             executor.submit(
-                _run_one_hypothesis, verdict, document_md, run_id, instruction, timeout_s, max_budget_usd,
+                _run_one_hypothesis, verdict, document_md, passport_block_text, run_id, instruction,
+                timeout_s, max_budget_usd,
             )
             for verdict in verdicts
         ]
@@ -202,6 +205,7 @@ def run_hypotheses_violated(
     document_md: str,
     run_id: str,
     *,
+    passport: ActPassport | None = None,
     max_workers: int = 12,
     timeout_s: int = 900,
     max_budget_usd: float | None = None,
@@ -220,8 +224,10 @@ def run_hypotheses_violated(
     гонка при записи в meta.json устранена локом, см. docstring модуля и
     _add_cost_to_meta.
     """
+    from app.nodes.passport import passport_block  # кольцевой импорт: passport.py берёт отсюда _add_cost_to_meta
+
     return _run_hypotheses(
-        buckets.violated, document_md, run_id, PROMPT_HYPOTHESES_VIOLATED, "violated",
+        buckets.violated, document_md, passport_block(passport), run_id, PROMPT_HYPOTHESES_VIOLATED, "violated",
         max_workers, timeout_s, max_budget_usd,
     )
 
@@ -231,6 +237,7 @@ def run_hypotheses_no_data(
     document_md: str,
     run_id: str,
     *,
+    passport: ActPassport | None = None,
     max_workers: int = 12,
     timeout_s: int = 900,
     max_budget_usd: float | None = None,
@@ -248,6 +255,8 @@ def run_hypotheses_no_data(
     не завершена» (ОС экспертов, Б1: МАДИ инд. 3 и «зелёные» инд. 4 дали ложные
     гипотезы с оценками 1).
     """
+    from app.nodes.passport import passport_block  # кольцевой импорт, см. run_hypotheses_violated
+
     practice = [v for v in buckets.no_data if v.indicator not in NO_DATA_TEXT_FAMILY]
     skipped = [v.indicator for v in buckets.no_data if v.indicator in NO_DATA_TEXT_FAMILY]
     if skipped:
@@ -256,6 +265,6 @@ def run_hypotheses_no_data(
             skipped,
         )
     return _run_hypotheses(
-        practice, document_md, run_id, PROMPT_HYPOTHESES_NO_DATA, "no_data",
+        practice, document_md, passport_block(passport), run_id, PROMPT_HYPOTHESES_NO_DATA, "no_data",
         max_workers, timeout_s, max_budget_usd,
     )

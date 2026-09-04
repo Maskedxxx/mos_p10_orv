@@ -12,11 +12,11 @@
 проглоченный сбой дал бы приказу зелёный свет там, где его просто не проверяли —
 это прямое требование владельца.
 
-В модель уходит только полный текст акта под заголовком-меткой "ПОЛНЫЙ ТЕКСТ АКТА".
-Саммари агентам НЕ подаётся: пруф обязан быть дословной цитатой из акта, а в саммари
-пересказ — цитировать оттуда нечего, значит полный текст нужен в любом случае и
-покрывает заодно потребность понять, о чём акт. Саммари остаётся артефактом прогона
-(02_summary.md) — для шапки итогового отчёта и для чтения человеком.
+В модель уходят полный текст акта под заголовком «## ПОЛНЫЙ ТЕКСТ АКТА» и паспорт
+акта под заголовком «## ПАСПОРТ АКТА» (JSON) — ровно так описаны входные данные
+в промптах индикаторов v2. Пруф обязан быть дословной цитатой из акта, поэтому
+полный текст нужен в любом случае; паспорт говорит агенту, ГДЕ искать и через
+какие ключи открываются ворота «не применимо».
 
 Инструменты берутся из config.get_indicator(n).route, а не хардкодятся по номерам:
 маршрут "текст" -> ALLOWED_TOOLS_TEXT (пустой список), "текст+интернет" ->
@@ -37,7 +37,7 @@ from app.config import (
     get_indicator,
     prompt_path,
 )
-from app.contracts import Verdict
+from app.contracts import ActPassport, Verdict
 from app.logger import get_run_logger
 from app.runner import call
 from app.trace import save_json, update_meta
@@ -45,16 +45,15 @@ from app.trace import save_json, update_meta
 # Длина, до которой обрезается текст ошибки в rationale вердикта "ошибка"
 _ERROR_RATIONALE_LIMIT = 2000
 
-def _build_document(document_md: str) -> str:
+def _build_document(document_md: str, passport_block_text: str) -> str:
     """
-    Собрать документ для stdin агента — только полный текст акта.
-
-    Саммари агентам НЕ подаётся: пруф обязан быть дословной цитатой из акта,
-    а в саммари пересказ — цитировать оттуда нечего. Полный текст закрывает
-    и потребность понять, о чём акт. Саммари остаётся артефактом прогона
-    (02_summary.md) — для шапки итогового отчёта и для чтения человеком.
+    Собрать документ для stdin агента: полный текст акта, затем блок паспорта
+    (пустая строка, если паспорта нет — так вызывают тесты узла).
     """
-    return "## ПОЛНЫЙ ТЕКСТ АКТА\n\n" + document_md
+    document = "## ПОЛНЫЙ ТЕКСТ АКТА\n\n" + document_md
+    if passport_block_text:
+        document += "\n\n" + passport_block_text
+    return document
 
 
 def _error_verdict(indicator_number: int, name: str, error_text: str, attempts: int) -> Verdict:
@@ -71,6 +70,7 @@ def _error_verdict(indicator_number: int, name: str, error_text: str, attempts: 
 def _run_one_indicator(
     n: int,
     document_md: str,
+    passport_block_text: str,
     run_id: str,
     timeout_s: int,
     max_budget_usd: float | None,
@@ -91,7 +91,7 @@ def _run_one_indicator(
         name_fallback = indicator.name
 
         instruction = prompt_path(n).read_text(encoding="utf-8")
-        document = _build_document(document_md)
+        document = _build_document(document_md, passport_block_text)
         allowed_tools = ALLOWED_TOOLS_TEXT if indicator.route == "текст" else ALLOWED_TOOLS_WEB
 
         result = call(
@@ -130,6 +130,7 @@ def run_verdicts(
     document_md: str,
     run_id: str,
     *,
+    passport: ActPassport | None = None,
     indicators: list[int] | None = None,
     max_workers: int = 12,
     timeout_s: int = 900,
@@ -162,10 +163,15 @@ def run_verdicts(
     verdicts_by_n: dict[int, Verdict] = {}
     cost_total = 0.0
 
+    # Блок паспорта собирается один раз на все 12 агентов. Импорт внутри функции:
+    # passport.py импортирует _add_cost_to_meta из hypotheses — кольцо на уровне модулей
+    from app.nodes.passport import passport_block
+
+    block = passport_block(passport)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [
             executor.submit(
-                _run_one_indicator, n, document_md, run_id, timeout_s, max_budget_usd,
+                _run_one_indicator, n, document_md, block, run_id, timeout_s, max_budget_usd,
             )
             for n in nums
         ]

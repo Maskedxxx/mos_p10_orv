@@ -286,10 +286,10 @@ def test_real_parallelism_faster_than_sum_of_delays(run_id, tmp_prompts_dir, mon
     assert duration < 1.0  # заведомо меньше последовательных 5*0.3=1.5с
 
 
-def test_summary_not_sent_to_agents(run_id, tmp_prompts_dir, monkeypatch):
-    """Саммари в stdin агента НЕ попадает — только полный текст акта (решение
-    владельца: пруф обязан быть дословной цитатой из акта, цитировать из
-    саммари нечего). Документ содержит текст акта и не содержит куска саммари."""
+def test_document_carries_full_act_text_under_marker(run_id, tmp_prompts_dir, monkeypatch):
+    """Полный текст акта уходит агенту под заголовком-меткой целиком (пруф обязан
+    быть дословной цитатой из акта); пересказов в документе нет. Паспорт при
+    вызове без него не добавляется — см. test_no_passport_block_without_passport."""
     seen_documents: dict[int, str] = {}
 
     def _effect(instruction, document, model_cls, **kwargs):
@@ -374,3 +374,33 @@ def test_on_verdict_failure_does_not_break_the_node(run_id, tmp_prompts_dir, mon
     assert len(result) == 12
     log_text = (run_dir(run_id) / "run.log").read_text(encoding="utf-8")
     assert "on_verdict упал" in log_text
+
+
+def test_passport_block_follows_act_text(run_id, monkeypatch, valid_passport):
+    """v2: паспорт уходит агенту вторым блоком «## ПАСПОРТ АКТА» после текста акта —
+    ровно так описаны входные данные в промптах индикаторов."""
+    from app.contracts import ActPassport
+    seen = {}
+
+    def _effect(instruction, document, schema, **kwargs):
+        seen["doc"] = document
+        return _ok_call_result(1)
+
+    monkeypatch.setattr(verdicts_module, "call", Mock(side_effect=_effect))
+    run_verdicts("ПОЛНЫЙ ТЕКСТ МАРКЕР", run_id, indicators=[1], passport=ActPassport(**valid_passport))
+    doc = seen["doc"]
+    assert doc.startswith("## ПОЛНЫЙ ТЕКСТ АКТА\n\nПОЛНЫЙ ТЕКСТ МАРКЕР")
+    assert "## ПАСПОРТ АКТА" in doc and doc.index("## ПОЛНЫЙ ТЕКСТ АКТА") < doc.index("## ПАСПОРТ АКТА")
+    assert '"scope": "внешним лицам"' in doc
+
+
+def test_no_passport_block_without_passport(run_id, monkeypatch):
+    seen = {}
+
+    def _effect(instruction, document, schema, **kwargs):
+        seen["doc"] = document
+        return _ok_call_result(1)
+
+    monkeypatch.setattr(verdicts_module, "call", Mock(side_effect=_effect))
+    run_verdicts("текст", run_id, indicators=[1])
+    assert "## ПАСПОРТ АКТА" not in seen["doc"]

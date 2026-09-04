@@ -361,3 +361,19 @@ def test_no_data_skips_text_family_indicators(run_id, tmp_prompts, monkeypatch):
 
     assert mock_call.call_count == 2
     assert [s.indicator for s in result] == [10, 11]
+
+
+def test_passport_block_between_text_and_card(run_id, tmp_prompts, monkeypatch, valid_passport):
+    """v2: текст акта → паспорт → карточка вердикта, как во входных данных 04a/04b."""
+    from app.contracts import ActPassport
+    seen = {}
+
+    def _effect(instruction, document, schema, **kwargs):
+        seen["doc"] = document
+        return _ok_call_result(1)
+
+    monkeypatch.setattr(hyp_module, "call", Mock(side_effect=_effect))
+    run_hypotheses_violated(_buckets_violated([1]), "ТЕКСТ", run_id, passport=ActPassport(**valid_passport))
+    doc = seen["doc"]
+    a = doc.index("## ПОЛНЫЙ ТЕКСТ АКТА"); b = doc.index("## ПАСПОРТ АКТА"); c = doc.index("## КАРТОЧКА ВЕРДИКТА (JSON)")
+    assert a < b < c

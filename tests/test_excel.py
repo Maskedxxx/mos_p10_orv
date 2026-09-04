@@ -27,8 +27,30 @@ from app.contracts import (
     Verdict,
 )
 from app.nodes.excel import build_excel, compute_years
+from app.contracts import ActPassport
 from app.trace import run_dir
 import pytest
+
+
+def _minimal_passport_dict() -> dict:
+    """Минимальный валидный паспорт (все объекты «нет» с обоснованием) — для заглушек."""
+    no = {"state": "нет", "justification": "искал по всему тексту, не установлено"}
+    return {
+        "requisites": {"kind": "приказ", "number": "N 1", "date": "1 января 2024 г.",
+                       "authority": "Департамент", "title": "Об утверждении порядка"},
+        "status": {"status": "принят", "status_basis": "есть номер, дата, подпись",
+                   "effective_date": "21.08.2025", "effective_date_clause": None, "deferred": [], "repealed_clauses": []},
+        "addressee": {"scope": "внешним лицам", "categories": [{"name": "перевозчики", "clause": "п. 1"}], "distinctions": []},
+        "nature": {"actions": [{"action": "утверждает новое", "target": "Порядок", "clauses": ["п. 1"]}],
+                   "issued_under": [], "input_kind": "акт изменений не вносит"},
+        "requirements": {**no, "groups": []},
+        "procedure": {**no, "participants": None, "result": None, "has_document_check": None, "refusal_grounds": None, "clauses": []},
+        "documents": {**no, "items": [], "transfer_clauses": []},
+        "deadlines": {**no, "items": []},
+        "references": {**no, "acts": [], "authorities": []},
+        "allocation": {"competitive": {**no, "kind": None, "resource": None, "clauses": []}, "appointed": {**no, "items": []}},
+        "control": {**no, "authority": None, "subject": None, "measures": [], "outcomes": [], "clauses": []},
+    }
 
 
 def _map() -> HypothesisMap:
@@ -108,25 +130,13 @@ def _buckets(*, with_failed: bool) -> Buckets:
     return Buckets(violated=violated, no_data=no_data, checked=checked, failed=failed)
 
 
-def _summary() -> str:
-    """Реалистичное саммари с секцией «1. Реквизиты» — по образцу живого прогона
-    (runs/20260824_154712_20b7d9/02_summary.md)."""
-    return (
-        "# Саммари нормативного правового акта\n\n"
-        "## 1. Реквизиты\n\n"
-        "- **Вид акта:** приказ\n"
-        "- **Номер:** N 02-02-313/21\n"
-        "- **Дата принятия:** 9 августа 2021 г.\n"
-        "- **Принявший орган:** Департамент средств массовой информации и рекламы города Москвы\n"
-        "- **Полное название:** «Об утверждении Порядка организации торгов»\n\n"
-        "## 2. Что регулирует\n\nДалее текст саммари.\n"
-    )
-
-
-def _summary_unparseable() -> str:
-    """Саммари без секции «1. Реквизиты» — реквизиты распознать нельзя (мусорный
-    ввод: два первых markdown-заголовка без структуры полей)."""
-    return "## Саммари\n\nПриказ ДСМИ от 09.08.2021 № 123 «О порядке».\n\nДалее текст саммари."
+def _passport() -> ActPassport:
+    """Паспорт акта с реквизитами по образцу живого прогона (приказ ДСМИ) — для шапки листа."""
+    d = _minimal_passport_dict()
+    d["requisites"] = {"kind": "приказ", "number": "N 02-02-313/21", "date": "9 августа 2021 г.",
+                       "authority": "Департамент средств массовой информации и рекламы города Москвы",
+                       "title": "Об утверждении Порядка организации торгов"}
+    return ActPassport(**d)
 
 
 def _find_header_row(ws, anchor: str = "Индикаторы") -> int:
@@ -153,7 +163,7 @@ def _col(ws, header_row: int, name: str) -> int:
 
 
 def test_opens_with_openpyxl_and_four_sheets(tmp_runs_dir):
-    path = build_excel(_map(), _request(), _buckets(with_failed=True), _summary(), "run_a")
+    path = build_excel(_map(), _request(), _buckets(with_failed=True), _passport(), "run_a")
     wb = load_workbook(path)
     assert wb.sheetnames == [
         "Карта гипотез", "Запрос показателей", "Нарушений не найдено", "Ошибки прогона",
@@ -161,13 +171,13 @@ def test_opens_with_openpyxl_and_four_sheets(tmp_runs_dir):
 
 
 def test_saved_as_08_result_in_run_dir(tmp_runs_dir):
-    path = build_excel(_map(), _request(), _buckets(with_failed=False), _summary(), "run_b")
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), _passport(), "run_b")
     assert path == run_dir("run_b") / "08_result.xlsx"
     assert path.exists()
 
 
 def test_failed_sheet_present_even_when_bucket_empty(tmp_runs_dir):
-    path = build_excel(_map(), _request(), _buckets(with_failed=False), _summary(), "run_c")
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), _passport(), "run_c")
     ws = load_workbook(path)["Ошибки прогона"]
     hdr = _find_header_row(ws, "Что случилось")
     assert [c.value for c in ws[hdr]] == ["Индикатор", "Что случилось", "Попыток"]
@@ -176,7 +186,7 @@ def test_failed_sheet_present_even_when_bucket_empty(tmp_runs_dir):
 
 
 def test_failed_sheet_lists_failures(tmp_runs_dir):
-    path = build_excel(_map(), _request(), _buckets(with_failed=True), _summary(), "run_d")
+    path = build_excel(_map(), _request(), _buckets(with_failed=True), _passport(), "run_d")
     ws = load_workbook(path)["Ошибки прогона"]
     hdr = _find_header_row(ws, "Что случилось")
     row = hdr + 1
@@ -187,7 +197,7 @@ def test_failed_sheet_lists_failures(tmp_runs_dir):
 
 
 def test_checked_sheet_lists_verdicts(tmp_runs_dir):
-    path = build_excel(_map(), _request(), _buckets(with_failed=False), _summary(), "run_e")
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), _passport(), "run_e")
     ws = load_workbook(path)["Нарушений не найдено"]
     hdr = _find_header_row(ws, "Вердикт")
     assert [c.value for c in ws[hdr]] == [
@@ -199,7 +209,7 @@ def test_checked_sheet_lists_verdicts(tmp_runs_dir):
 
 
 def test_request_sheet_has_three_year_columns_not_four(tmp_runs_dir):
-    path = build_excel(_map(), _request(), _buckets(with_failed=False), _summary(), "run_f")
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), _passport(), "run_f")
     ws = load_workbook(path)["Запрос показателей"]
     hdr = _find_header_row(ws, "Показатель")
     header = [c.value for c in ws[hdr]]
@@ -211,7 +221,7 @@ def test_request_sheet_has_three_year_columns_not_four(tmp_runs_dir):
 
 
 def test_breakdown_rendered_as_subrows(tmp_runs_dir):
-    path = build_excel(_map(), _request(), _buckets(with_failed=False), _summary(), "run_g")
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), _passport(), "run_g")
     ws = load_workbook(path)["Запрос показателей"]
     hdr = _find_header_row(ws, "Показатель")
     num, metric = _col(ws, hdr, "№"), _col(ws, hdr, "Показатель")
@@ -227,7 +237,7 @@ def test_breakdown_rendered_as_subrows(tmp_runs_dir):
 
 
 def test_map_data_cell_backrefs_point_to_existing_request_rows(tmp_runs_dir):
-    path = build_excel(_map(), _request(), _buckets(with_failed=False), _summary(), "run_h")
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), _passport(), "run_h")
     wb = load_workbook(path)
     ws_map = wb["Карта гипотез"]
     ws_req = wb["Запрос показателей"]
@@ -253,25 +263,20 @@ def test_map_data_cell_backrefs_point_to_existing_request_rows(tmp_runs_dir):
     assert {"1", "2"} <= request_nums
 
 
-def test_summary_header_has_requisites_not_raw_markdown(tmp_runs_dir):
-    """Шапка — ОДНА осмысленная строка с вид/номер/дата/орган, а не первые
-    попавшиеся markdown-заголовки саммари (правка владельца 2026-08-24: было
-    «Саммари нормативного правового акта» / «1. Реквизиты» — мусор без данных)."""
-    path = build_excel(_map(), _request(), _buckets(with_failed=False), _summary(), "run_i")
+def test_header_line_comes_from_passport_requisites(tmp_runs_dir):
+    """Шапка — ОДНА осмысленная строка вид/номер/дата/орган из паспорта акта
+    (раньше парсилась регулярками из markdown саммари; правка владельца 2026-08-24:
+    мусорная шапка хуже отсутствующей)."""
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), _passport(), "run_i")
     wb = load_workbook(path)
     ws_map = wb["Карта гипотез"]
 
     header_row = _find_header_row(ws_map)
     assert header_row == 3  # реквизиты + подпись листа перед заголовками колонок
 
-    summary_cell = ws_map.cell(row=1, column=1).value
-    assert summary_cell != "Индикаторы"
-    assert "Саммари нормативного правового акта" not in summary_cell  # не сырой заголовок
-    assert "Реквизиты" not in summary_cell                             # не обрывок оглавления
-    assert "приказ" in summary_cell
-    assert "N 02-02-313/21" in summary_cell
-    assert "9 августа 2021 г." in summary_cell
-    assert "Департамент средств массовой информации и рекламы города Москвы" in summary_cell
+    header = ws_map.cell(row=1, column=1).value
+    assert header == ("приказ N 02-02-313/21 от 9 августа 2021 г. "
+                      "(Департамент средств массовой информации и рекламы города Москвы)")
 
     for name, anchor in (
         ("Карта гипотез", "Индикаторы"),
@@ -286,26 +291,24 @@ def test_summary_header_has_requisites_not_raw_markdown(tmp_runs_dir):
         assert ws.freeze_panes == ws.cell(row=hdr + 1, column=1).coordinate
 
 
-def test_no_summary_header_when_summary_empty(tmp_runs_dir):
-    path = build_excel(_map(), _request(), _buckets(with_failed=False), "", "run_j")
+def test_header_line_for_draft_act_has_no_number_and_date(tmp_runs_dir):
+    """Проект акта: номера и даты нет — шапка «вид (проект) (орган)», без «None»."""
+    d = _minimal_passport_dict()
+    d["requisites"] = {**d["requisites"], "number": None, "date": None}
+    d["status"] = {**d["status"], "status": "проект", "effective_date": None}
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), ActPassport(**d), "run_draft")
+    header = load_workbook(path)["Карта гипотез"].cell(row=1, column=1).value
+    assert header == "приказ (проект) (Департамент)"
+
+
+def test_no_header_when_passport_missing(tmp_runs_dir):
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), None, "run_j")
     ws_map = load_workbook(path)["Карта гипотез"]
     assert _find_header_row(ws_map) == 2   # только подпись листа, строки реквизитов нет
 
 
-def test_no_summary_header_when_requisites_unrecognizable(tmp_runs_dir):
-    """Саммари непустое, но без секции «1. Реквизиты» / узнаваемых полей —
-    шапки нет вовсе, лист начинается сразу с заголовков колонок, мусорных
-    строк нет (требование владельца 2026-08-24: мусорная шапка хуже отсутствующей)."""
-    path = build_excel(
-        _map(), _request(), _buckets(with_failed=False), _summary_unparseable(), "run_j2",
-    )
-    ws_map = load_workbook(path)["Карта гипотез"]
-    assert _find_header_row(ws_map) == 2                   # подпись, мусорной строки нет
-    assert ws_map.max_row == 4                             # подпись + шапка + 2 строки карты
-
-
 def test_map_sheet_row_content(tmp_runs_dir):
-    path = build_excel(_map(), _request(), _buckets(with_failed=False), "", "run_k")
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), None, "run_k")
     ws = load_workbook(path)["Карта гипотез"]
     hdr = _find_header_row(ws)
     assert [c.value for c in ws[hdr]] == [
@@ -333,7 +336,7 @@ def test_map_sheet_row_content(tmp_runs_dir):
 
 def test_map_indicator_column_has_names(tmp_runs_dir):
     """Номер и имя, как на листе проверенных индикаторов, а не голая цифра."""
-    path = build_excel(_map(), _request(), _buckets(with_failed=False), "", "run_ind_names")
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), None, "run_ind_names")
     ws = load_workbook(path)["Карта гипотез"]
     hdr = _find_header_row(ws)
     col = _col(ws, hdr, "Индикаторы")
@@ -348,7 +351,7 @@ def test_map_indicator_column_has_names(tmp_runs_dir):
 
 def test_map_indicator_column_wide_enough_for_names(tmp_runs_dir):
     """Ширина колонки под имена — как на листе проверенных индикаторов (34)."""
-    path = build_excel(_map(), _request(), _buckets(with_failed=False), "", "run_ind_width")
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), None, "run_ind_width")
     ws = load_workbook(path)["Карта гипотез"]
     hdr = _find_header_row(ws)
     letter = ws.cell(row=hdr, column=_col(ws, hdr, "Индикаторы")).column_letter
@@ -364,7 +367,7 @@ def test_map_indicator_column_wide_enough_for_names(tmp_runs_dir):
 
 def test_effect_cell_has_labels(tmp_runs_dir):
     """Блок эффекта подписан: кого задевает, показатель, как считать."""
-    path = build_excel(_map(), _request(), _buckets(with_failed=False), "", "run_effect")
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), None, "run_effect")
     ws = load_workbook(path)["Карта гипотез"]
     hdr = _find_header_row(ws)
     cell = ws.cell(row=hdr + 1, column=_col(ws, hdr, "Эффект")).value
@@ -386,7 +389,7 @@ def test_effect_cell_lists_every_effect(tmp_runs_dir):
     hyp_map.rows[0].effects.append(
         Effect(affected="город", metric="трудозатраты комиссии, чел.-часов", how_to_calculate="заседания × состав")
     )
-    path = build_excel(hyp_map, _request(), _buckets(with_failed=False), "", "run_effects2")
+    path = build_excel(hyp_map, _request(), _buckets(with_failed=False), None, "run_effects2")
     ws = load_workbook(path)["Карта гипотез"]
     hdr = _find_header_row(ws)
     cell = ws.cell(row=hdr + 1, column=_col(ws, hdr, "Эффект")).value
@@ -416,7 +419,7 @@ def _data_cell(path, row_offset: int = 1) -> str:
 
 def test_data_cell_groups_by_source(tmp_runs_dir):
     """«Запрос в орган» выше «Открытых источников», хотя в данных порядок обратный."""
-    path = build_excel(_map(), _request(), _buckets(with_failed=False), "", "run_data_group")
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), None, "run_data_group")
     cell = _data_cell(path)
     assert cell.index("Запрос в орган") < cell.index("Открытые источники")
     assert cell.index("число заявок") < cell.index("доля отказов")
@@ -424,7 +427,7 @@ def test_data_cell_groups_by_source(tmp_runs_dir):
 
 def test_data_cell_open_sources_annotated(tmp_runs_dir):
     """У открытого блока есть пояснение, что у органа это не запрашивают."""
-    path = build_excel(_map(), _request(), _buckets(with_failed=False), "", "run_data_annot")
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), None, "run_data_annot")
     cell = _data_cell(path)
     assert "Открытые источники (берём сами, у органа не запрашиваем):" in cell
     assert "Мосстат" in cell           # адрес открытого источника сохранён
@@ -433,7 +436,7 @@ def test_data_cell_open_sources_annotated(tmp_runs_dir):
 
 def test_data_cell_request_nums_on_block_not_items(tmp_runs_dir):
     """Номер строки запроса стоит один раз в заголовке блока, а не у показателя."""
-    path = build_excel(_map(), _request(), _buckets(with_failed=False), "", "run_data_nums")
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), None, "run_data_nums")
     cell = _data_cell(path)
     lines = cell.splitlines()
 
@@ -446,7 +449,7 @@ def test_data_cell_request_nums_on_block_not_items(tmp_runs_dir):
 
 def test_data_cell_omits_empty_group(tmp_runs_dir):
     """Строка без открытых показателей не печатает пустой заголовок группы."""
-    path = build_excel(_map(), _request(), _buckets(with_failed=False), "", "run_data_empty")
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), None, "run_data_empty")
     cell = _data_cell(path, row_offset=2)   # строка карты 2 — только «запрос органу»
     assert "Запрос в орган" in cell
     assert "Открытые источники" not in cell
@@ -469,7 +472,7 @@ def _basis_cell(path, row_offset: int = 1) -> str:
 
 def test_basis_column_replaces_proof_and_clause(tmp_runs_dir):
     """Вместо «Пруф» и «Пункт» одна колонка «На чём основано»."""
-    path = build_excel(_map(), _request(), _buckets(with_failed=False), "", "run_basis_hdr")
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), None, "run_basis_hdr")
     ws = load_workbook(path)["Карта гипотез"]
     hdr = _find_header_row(ws)
     headers = [c.value for c in ws[hdr]]
@@ -480,14 +483,14 @@ def test_basis_column_replaces_proof_and_clause(tmp_runs_dir):
 
 def test_basis_cell_has_norm_label(tmp_runs_dir):
     """Цитата подписана как норма акта, с номером пункта из строки карты."""
-    path = build_excel(_map(), _request(), _buckets(with_failed=False), "", "run_basis_norm")
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), None, "run_basis_norm")
     cell = _basis_cell(path)
     assert cell.startswith("Норма акта, п. 5.1.4:\n«дословная цитата 1»")
 
 
 def test_basis_clause_not_overridden_by_verdict(tmp_runs_dir):
     """Пункт берётся из строки карты (5.1.4), а не из вердикта (9.9)."""
-    path = build_excel(_map(), _request(), _buckets(with_failed=False), "", "run_basis_clause")
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), None, "run_basis_clause")
     cell = _basis_cell(path)
     assert "п. 5.1.4" in cell
     assert "9.9" not in cell
@@ -495,7 +498,7 @@ def test_basis_clause_not_overridden_by_verdict(tmp_runs_dir):
 
 def test_basis_cell_carries_web_sources(tmp_runs_dir):
     """Адреса из вердиктов индикаторов строки доезжают до документа, без дублей."""
-    path = build_excel(_map(), _request(), _buckets(with_failed=False), "", "run_basis_src")
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), None, "run_basis_src")
     cell = _basis_cell(path)
     assert "Внешние источники:" in cell
     assert "— https://practice.example/1" in cell
@@ -505,7 +508,7 @@ def test_basis_cell_carries_web_sources(tmp_runs_dir):
 
 def test_basis_cell_falls_back_to_verdict_proof(tmp_runs_dir):
     """Строка карты без цитаты берёт цитату вердикта своего индикатора."""
-    path = build_excel(_map(), _request(), _buckets(with_failed=False), "", "run_basis_fb")
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), None, "run_basis_fb")
     cell = _basis_cell(path, row_offset=2)   # строка карты 2: proof=None, clause=None
     assert "«цитата вердикта 3»" in cell
     assert cell.startswith("Норма акта:")    # пункта у строки карты нет — и не подставляем
@@ -538,7 +541,7 @@ def test_basis_cell_states_when_nothing_at_all():
 
 def test_checked_sheet_basis_column(tmp_runs_dir):
     """Та же колонка «На чём основано», что и в карте, с теми же блоками."""
-    path = build_excel(_map(), _request(), _buckets(with_failed=False), _summary(), "run_chk_basis")
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), _passport(), "run_chk_basis")
     ws = load_workbook(path)["Нарушений не найдено"]
     hdr = _find_header_row(ws, "Вердикт")
 
@@ -568,7 +571,7 @@ def test_checked_sheet_basis_column(tmp_runs_dir):
 
 def test_map_sheet_has_row_number_column(tmp_runs_dir):
     """Первая колонка карты — номер строки, тот самый, на который ссылается запрос."""
-    path = build_excel(_map(), _request(), _buckets(with_failed=False), "", "run_rownum")
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), None, "run_rownum")
     ws = load_workbook(path)["Карта гипотез"]
     hdr = _find_header_row(ws)
 
@@ -588,7 +591,7 @@ def test_request_sheet_shows_source_rows(tmp_runs_dir):
                            sources=[SourceRef(row_id=1, metric="число заявок"), SourceRef(row_id=2, metric="число заявок")])],
         years=[2020, 2021, 2022],
     )
-    path = build_excel(_map(), request, _buckets(with_failed=False), "", "run_req_src")
+    path = build_excel(_map(), request, _buckets(with_failed=False), None, "run_req_src")
     ws = load_workbook(path)["Запрос показателей"]
     hdr = _find_header_row(ws, "Показатель")
 
@@ -599,7 +602,7 @@ def test_request_sheet_shows_source_rows(tmp_runs_dir):
 
 def test_request_sheet_shows_clause(tmp_runs_dir):
     """Пункт акта из RequestItem.clause выводится своей колонкой."""
-    path = build_excel(_map(), _request(), _buckets(with_failed=False), "", "run_req_clause")
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), None, "run_req_clause")
     ws = load_workbook(path)["Запрос показателей"]
     hdr = _find_header_row(ws, "Показатель")
     assert ws.cell(row=hdr + 1, column=_col(ws, hdr, "Пункт акта")).value == "5.1.4"
@@ -609,7 +612,7 @@ def test_request_sheet_shows_clause(tmp_runs_dir):
 
 def test_request_breakdown_subrows_have_no_backref(tmp_runs_dir):
     """Подстроки разрезов ссылок не несут — они принадлежат родительской строке."""
-    path = build_excel(_map(), _request(), _buckets(with_failed=False), "", "run_req_sub")
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), None, "run_req_sub")
     ws = load_workbook(path)["Запрос показателей"]
     hdr = _find_header_row(ws, "Показатель")
     src = _col(ws, hdr, "Откуда запрос")
@@ -619,7 +622,7 @@ def test_request_breakdown_subrows_have_no_backref(tmp_runs_dir):
 
 def test_backref_round_trip(tmp_runs_dir):
     """Из карты в запрос и обратно — оба номера ведут на существующие строки."""
-    path = build_excel(_map(), _request(), _buckets(with_failed=False), "", "run_roundtrip")
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), None, "run_roundtrip")
     wb = load_workbook(path)
     ws_map, ws_req = wb["Карта гипотез"], wb["Запрос показателей"]
 
@@ -662,14 +665,14 @@ _SHEETS_AND_ANCHORS = (
 
 
 def test_sheet_names_say_what_is_on_them(tmp_runs_dir):
-    path = build_excel(_map(), _request(), _buckets(with_failed=True), _summary(), "run_names")
+    path = build_excel(_map(), _request(), _buckets(with_failed=True), _passport(), "run_names")
     wb = load_workbook(path)
     assert wb.sheetnames == [name for name, _ in _SHEETS_AND_ANCHORS]
 
 
 def test_each_sheet_has_caption_above_header(tmp_runs_dir):
     """На каждом листе есть строка-подпись, шапка колонок сдвинута под неё."""
-    path = build_excel(_map(), _request(), _buckets(with_failed=True), _summary(), "run_caption")
+    path = build_excel(_map(), _request(), _buckets(with_failed=True), _passport(), "run_caption")
     wb = load_workbook(path)
     for name, anchor in _SHEETS_AND_ANCHORS:
         ws = wb[name]
@@ -680,8 +683,8 @@ def test_each_sheet_has_caption_above_header(tmp_runs_dir):
 
 
 def test_map_sheet_keeps_requisites_above_caption(tmp_runs_dir):
-    """Реквизиты акта остаются самой первой строкой, подпись — под ними."""
-    path = build_excel(_map(), _request(), _buckets(with_failed=False), _summary(), "run_cap_req")
+    """Реквизиты акта (из паспорта) остаются самой первой строкой, подпись — под ними."""
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), _passport(), "run_cap_req")
     ws = load_workbook(path)["Карта гипотез"]
     assert _find_header_row(ws) == 3            # реквизиты + подпись + шапка
     assert "N 02-02-313/21" in ws.cell(row=1, column=1).value
@@ -693,7 +696,7 @@ def test_caption_counts_come_from_data_not_hardcoded(tmp_runs_dir):
     from app.config import all_indicators
 
     total = len(all_indicators())
-    path = build_excel(_map(), _request(), _buckets(with_failed=True), _summary(), "run_cap_cnt")
+    path = build_excel(_map(), _request(), _buckets(with_failed=True), _passport(), "run_cap_cnt")
     wb = load_workbook(path)
 
     # в карте две строки: индикаторы 1, 8 и 3 — три уникальных
@@ -704,7 +707,7 @@ def test_caption_counts_come_from_data_not_hardcoded(tmp_runs_dir):
 
 def test_caption_does_not_break_header_styling(tmp_runs_dir):
     """Заливка шапки и freeze panes встали на сдвинутую строку."""
-    path = build_excel(_map(), _request(), _buckets(with_failed=True), _summary(), "run_cap_style")
+    path = build_excel(_map(), _request(), _buckets(with_failed=True), _passport(), "run_cap_style")
     wb = load_workbook(path)
     for name, anchor in _SHEETS_AND_ANCHORS:
         ws = wb[name]
@@ -764,29 +767,6 @@ _REQUISITES_BODY = """
 """
 
 
-@pytest.mark.parametrize("heading", [
-    "## 1. Реквизиты",
-    "## 1. Реквизиты акта",
-    "## Реквизиты акта",
-    "### Реквизиты",
-    "## 1 Реквизиты",
-])
-def test_summary_header_found_for_heading_variants(heading):
-    """Лишнее слово или иной уровень заголовка не должны лишать лист шапки."""
-    from app.nodes.excel import _summary_header_line
-
-    line = _summary_header_line(f"# Саммари\n\n{heading}\n{_REQUISITES_BODY}")
-    assert line is not None, f"секция не найдена при заголовке «{heading}»"
-    assert "100-ПП" in line and "25.02.2013" in line
-
-
-def test_summary_header_absent_when_requisites_missing():
-    """Без секции реквизитов шапки нет — мусорная хуже отсутствующей."""
-    from app.nodes.excel import _summary_header_line
-
-    assert _summary_header_line("# Саммари\n\n## 2. Что регулирует\n\nТекст.") is None
-
-
 def _buckets_with_unverified() -> Buckets:
     """Как _buckets(with_failed=False), плюс «нет данных» по индикатору 4 БЕЗ строки
     в карте — так бывает, когда узел [4б] для индикатора не вызывался (семейство
@@ -805,7 +785,7 @@ def test_map_has_unverified_row_for_no_data_without_hypotheses(tmp_runs_dir):
     """Б1. Вердикт «нет данных» без гипотез раньше не попадал ни на один лист —
     аналитик не узнавал, что проверка не завершена. Теперь это строка карты:
     что не проверено и что в запрос органу не идёт."""
-    path = build_excel(_map(), _request(), _buckets_with_unverified(), _summary(), "run_unverified")
+    path = build_excel(_map(), _request(), _buckets_with_unverified(), _passport(), "run_unverified")
     ws = load_workbook(path)["Карта гипотез"]
     hdr = _find_header_row(ws)
     rows = list(ws.iter_rows(min_row=hdr + 1, values_only=True))
@@ -823,7 +803,7 @@ def test_map_has_unverified_row_for_no_data_without_hypotheses(tmp_runs_dir):
 def test_map_caption_counts_unverified_indicators(tmp_runs_dir):
     """Б1. Подпись карты обещает «нарушено или не хватило данных — N из 12»:
     незавершённая проверка входит в N."""
-    path = build_excel(_map(), _request(), _buckets_with_unverified(), _summary(), "run_unverified_cap")
+    path = build_excel(_map(), _request(), _buckets_with_unverified(), _passport(), "run_unverified_cap")
     ws = load_workbook(path)["Карта гипотез"]
     hdr = _find_header_row(ws)
     caption = str(ws.cell(row=hdr - 1, column=1).value)
@@ -833,7 +813,7 @@ def test_map_caption_counts_unverified_indicators(tmp_runs_dir):
 def test_map_no_unverified_row_when_no_data_has_hypotheses(tmp_runs_dir):
     """Б1, граница: «нет данных» по индикатору 3 уже представлен строкой карты 2 —
     второй строки для него не появляется."""
-    path = build_excel(_map(), _request(), _buckets(with_failed=False), _summary(), "run_no_dup")
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), _passport(), "run_no_dup")
     ws = load_workbook(path)["Карта гипотез"]
     hdr = _find_header_row(ws)
     rows = list(ws.iter_rows(min_row=hdr + 1, values_only=True))
@@ -862,7 +842,7 @@ def _request_v2() -> DataRequest:
 def test_request_sheet_shows_unit_with_metric(tmp_runs_dir):
     """Г1. Единица измерения — отдельное поле контракта; в бланке чиновник видит её
     рядом с показателем: «…, ед.», «…, календарных дней»."""
-    path = build_excel(_map(), _request_v2(), _buckets(with_failed=False), _summary(), "run_unit")
+    path = build_excel(_map(), _request_v2(), _buckets(with_failed=False), _passport(), "run_unit")
     ws = load_workbook(path)["Запрос показателей"]
     hdr = _find_header_row(ws, anchor="Показатель")
     col = _col(ws, hdr, "Показатель")
@@ -874,7 +854,7 @@ def test_request_sheet_shows_unit_with_metric(tmp_runs_dir):
 def test_request_sheet_puts_lists_in_separate_block_without_years(tmp_runs_dir):
     """Г2. Перечни и реестры — после показателей, под своей подписью, клетки годов
     прочерком: «перечень — это надо не в этой таблице», «должно быть отдельным реестром»."""
-    path = build_excel(_map(), _request_v2(), _buckets(with_failed=False), _summary(), "run_lists")
+    path = build_excel(_map(), _request_v2(), _buckets(with_failed=False), _passport(), "run_lists")
     ws = load_workbook(path)["Запрос показателей"]
     hdr = _find_header_row(ws, anchor="Показатель")
     rows = list(ws.iter_rows(min_row=hdr + 1, values_only=True))
@@ -890,7 +870,7 @@ def test_request_sheet_puts_lists_in_separate_block_without_years(tmp_runs_dir):
 
 def test_request_sheet_no_list_block_when_no_lists(tmp_runs_dir):
     """Г2, граница: без перечней подписи блока нет."""
-    path = build_excel(_map(), _request(), _buckets(with_failed=False), _summary(), "run_nolists")
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), _passport(), "run_nolists")
     ws = load_workbook(path)["Запрос показателей"]
     assert not any("Перечни и реестры" in str(c.value) for row in ws.iter_rows() for c in row if c.value)
 
@@ -903,8 +883,17 @@ def test_request_sheet_shows_note_under_metric(tmp_runs_dir):
                     unit="ед.", clause="2.13", for_rows=[1], sources=[SourceRef(row_id=1, metric="отборы")],
                     note="только дошедшие до протокола; объявленные, но не состоявшиеся — в № 2"),
     ], years=[2023, 2024, 2025])
-    path = build_excel(_map(), req, _buckets(with_failed=False), _summary(), "run_note")
+    path = build_excel(_map(), req, _buckets(with_failed=False), _passport(), "run_note")
     ws = load_workbook(path)["Запрос показателей"]
     hdr = _find_header_row(ws, anchor="Показатель")
     cell = ws.cell(row=hdr + 1, column=_col(ws, hdr, "Показатель")).value
     assert cell == "количество отборов, проведённых (пункт 2.13), ед.\nПояснение: только дошедшие до протокола; объявленные, но не состоявшиеся — в № 2"
+
+
+def test_basis_cell_carries_grounds_from_verdict(tmp_runs_dir):
+    """Контракт v2: основание гипотезы (дословно из карточки вердикта) — в клетке
+    «На чём основано», последним блоком, после нормы и источников."""
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), None, "run_grounds")
+    cell = _basis_cell(path)
+    assert cell.startswith("Норма акта, п. 5.1.4:")
+    assert cell.endswith("Основание из вердикта:\nоснование 1")

@@ -54,7 +54,7 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.worksheet.worksheet import Worksheet
 
 from app.config import REQUEST_YEARS_DEPTH, all_indicators, get_indicator
-from app.contracts import Buckets, DataItem, DataRequest, Effect, HypothesisMap, RequestItem, Verdict
+from app.contracts import ActPassport, Buckets, DataItem, DataRequest, Effect, HypothesisMap, RequestItem, Verdict
 from app.logger import get_run_logger
 from app.trace import run_dir
 
@@ -126,86 +126,24 @@ def _style_header_row(ws: Worksheet, row: int) -> None:
     ws.freeze_panes = ws.cell(row=row + 1, column=1).coordinate
 
 
-# Секция реквизитов в саммари — по промпту prompts/01_summary.md ("1. Реквизиты:
-# вид акта, номер, дата, принявший орган, полное название"), заголовок раздела
-# фиксирован промптом. Формулировка ПОДПИСЕЙ полей внутри — нет (промпт прямо
-# требует "markdown, свободной структурой"), поэтому подписи матчим по ключевому
-# слову, а не по точному тексту.
-# Заголовок секции реквизитов. Промпт саммари задаёт смысл раздела, но не
-# точную формулировку заголовка — на живом прогоне модель написала
-# "## 1. Реквизиты акта" вместо "## 1. Реквизиты", и строгий якорь $ секцию
-# не нашёл, из-за чего лист карты остался без шапки. Поэтому хвост после
-# слова "Реквизиты" допускается, а номер пункта необязателен.
-_REQUISITES_HEADING_RE = re.compile(r"^#{1,3}\s*(?:\d+\.?\s*)?Реквизиты\b.*$", re.MULTILINE | re.IGNORECASE)
-_NEXT_HEADING_RE = re.compile(r"^##\s", re.MULTILINE)
-_BULLET_FIELD_RE = re.compile(r"^-\s*\*\*(.+?):\*\*\s*(.+)$")
-
-# Ключевые слова в подписи поля -> ключ в словаре реквизитов. Порядок важен
-# только для читаемости, не для матчинга (проверка "подстрока в подписи").
-_REQUISITE_KEYWORDS = {"вид": "вид", "номер": "номер", "дата": "дата", "орган": "орган"}
-
-
-def _requisites_section(summary_md: str) -> str:
+def _passport_header_line(passport: ActPassport | None) -> str | None:
     """
-    Вырезать текст секции "## 1. Реквизиты" — от её заголовка до следующего
-    заголовка того же уровня или до конца текста. Пустая строка, если такой
-    секции в саммари нет вовсе.
+    Шапка листа карты — одна строка реквизитов из паспорта акта:
+    «приказ N 78-15-3/24 от 16 января 2024 г. (МАДИ)». У проекта номера и даты
+    нет — остаются вид, «проект» и орган. Без паспорта шапки нет (правка
+    владельца 2026-08-24: мусорная шапка хуже отсутствующей).
     """
-    match = _REQUISITES_HEADING_RE.search(summary_md)
-    if not match:
-        return ""
-    start = match.end()
-    next_heading = _NEXT_HEADING_RE.search(summary_md, start)
-    end = next_heading.start() if next_heading else len(summary_md)
-    return summary_md[start:end]
-
-
-def _extract_requisites(summary_md: str) -> dict[str, str] | None:
-    """
-    Вытащить реквизиты (вид, номер, дата, орган) из секции "1. Реквизиты".
-
-    Строки секции — маркированный список вида "- **Подпись:** значение"
-    (см. живой прогон). Подпись матчим по ключевому слову ("вид" внутри
-    "Вид акта", "орган" внутри "Принявший орган" и т.п.), не по точному
-    тексту — промпт саммари не фиксирует формулировку подписи, только смысл
-    раздела. Если хоть один из четырёх реквизитов не нашёлся — возвращаем
-    None: разобрать не удалось, шапку рисовать не из чего (см. docstring
-    модуля и _render_map_sheet).
-    """
-    section = _requisites_section(summary_md)
-    if not section:
+    if passport is None:
         return None
-
-    fields: dict[str, str] = {}
-    for line in section.splitlines():
-        m = _BULLET_FIELD_RE.match(line.strip())
-        if not m:
-            continue
-        label, value = m.group(1).strip().lower(), m.group(2).strip()
-        if not value:
-            continue
-        for keyword, key in _REQUISITE_KEYWORDS.items():
-            if keyword in label and key not in fields:
-                fields[key] = value
-                break
-
-    if not all(key in fields for key in _REQUISITE_KEYWORDS.values()):
-        return None
-    return fields
-
-
-def _summary_header_line(summary_md: str) -> str | None:
-    """
-    Собрать одну осмысленную строку шапки листа карты из реквизитов саммари
-    (вид, номер, дата, орган). None, если реквизиты разобрать не удалось —
-    тогда шапки на листе не будет вовсе, лист начнётся сразу с заголовков
-    колонок (мусорная шапка хуже отсутствующей, см. правку владельца
-    2026-08-24).
-    """
-    fields = _extract_requisites(summary_md)
-    if fields is None:
-        return None
-    return f"{fields['вид']} {fields['номер']} от {fields['дата']} ({fields['орган']})"
+    r = passport.requisites
+    parts = [r.kind]
+    if passport.status.status == "проект":
+        parts.append("(проект)")
+    if r.number:
+        parts.append(r.number)
+    if r.date:
+        parts.append(f"от {r.date}")
+    return " ".join(parts) + f" ({r.authority})"
 
 
 def _row_to_request_nums(request: DataRequest) -> dict[int, list[str]]:
@@ -226,7 +164,9 @@ def _row_to_request_nums(request: DataRequest) -> dict[int, list[str]]:
 _CLAUSE_PREFIX_RE = re.compile(r"^\s*(?:п\.?|пункт[а-я]*)\s*", re.IGNORECASE)
 
 
-def _render_basis_cell(proof: str | None, clause: str | None, sources: list[str]) -> str:
+def _render_basis_cell(
+    proof: str | None, clause: str | None, sources: list[str], grounds: str | None = None,
+) -> str:
     """
     Клетка «На чём основано»: норма акта с номером пункта и внешние источники
     (фикс N 5 трека багов).
@@ -256,6 +196,9 @@ def _render_basis_cell(proof: str | None, clause: str | None, sources: list[str]
     blocks = [f"{head}:\n{body}"]
     if sources:
         blocks.append("\n".join(["Внешние источники:"] + [f"— {s}" for s in sources]))
+    if grounds:
+        # контракт v2: на чём стоит гипотеза — дословно из карточки вердикта
+        blocks.append(f"Основание из вердикта:\n{grounds}")
     return "\n\n".join(blocks)
 
 
@@ -432,8 +375,8 @@ def _append_unverified_rows(ws: Worksheet, hyp_map: HypothesisMap, buckets: Buck
 
 
 def _render_map_sheet(
-    wb: Workbook, hyp_map: HypothesisMap, row_to_nums: dict[int, list[str]], summary_md: str,
-    buckets: Buckets, caption: str,
+    wb: Workbook, hyp_map: HypothesisMap, row_to_nums: dict[int, list[str]],
+    passport: ActPassport | None, buckets: Buckets, caption: str,
 ) -> None:
     """
     Лист «Карта гипотез»: опциональная шапка-реквизиты (одна строка) + 5 колонок.
@@ -444,7 +387,7 @@ def _render_map_sheet(
     ws = wb.active
     ws.title = _SHEET_MAP
 
-    header_line = _summary_header_line(summary_md)
+    header_line = _passport_header_line(passport)
     if header_line is not None:
         ws.append([header_line])          # реквизиты акта — самая первая строка
     _render_caption(ws, caption)
@@ -466,6 +409,7 @@ def _render_map_sheet(
                 row.proof or _first_verdict_proof(verdicts),
                 row.clause,                       # пункт карты вердиктом не подменяется
                 _dedup_sources(verdicts),
+                row.grounds,
             ),
         ])
 
@@ -632,7 +576,7 @@ def build_excel(
     hypothesis_map: HypothesisMap,
     request: DataRequest,
     buckets: Buckets,
-    summary_md: str,
+    passport: ActPassport | None,
     run_id: str,
 ) -> Path:
     """
@@ -655,7 +599,7 @@ def build_excel(
 
     wb = Workbook()
     _render_map_sheet(
-        wb, hypothesis_map, row_to_nums, summary_md, buckets,
+        wb, hypothesis_map, row_to_nums, passport, buckets,
         f"Индикаторы, по которым найдено нарушение или не хватило данных — "
         f"{len(map_indicators)} из {total}. По каждому построена гипотеза: "
         f"что не так, чем мерить эффект, какие данные нужны — либо отмечено, "
