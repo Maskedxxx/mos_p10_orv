@@ -11,7 +11,8 @@ __pycache__/
 # Содержат рабочие документы города, в репозиторий не идут.
 runs/
 
-# Служебное
+# Служебное: var/nicegui/ — сессии браузера NiceGUI (см. config.NICEGUI_STORAGE_DIR)
+var/
 .nicegui/
 *.tmp
 .DS_Store

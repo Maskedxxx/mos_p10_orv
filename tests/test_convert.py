@@ -58,6 +58,15 @@ def test_convert_rejects_unsupported_format(tmp_path, tmp_runs_dir):
         convert_to_markdown(bad, run_id="run_convert_bad_format")
 
 
+def test_docling_runs_offline_from_local_cache():
+    """Импорт узла включает офлайн-режим huggingface: модели из кэша, без запросов в интернет (2026-09-04)."""
+    import os
+
+    import app.nodes.convert  # noqa: F401  — переменная выставляется при импорте
+
+    assert os.environ.get("HF_HUB_OFFLINE") == "1"
+
+
 def test_convert_pdf_produces_markdown(tmp_runs_dir):
     """PDF читается напрямую через docling, без LibreOffice."""
     pdf = FIXTURES / "act.pdf"

@@ -662,6 +662,19 @@ def test_secrets_file_fills_the_environment(tmp_path, env_without_secrets):
     assert config.storage_secret() == "клю=ч"
 
 
+def test_nicegui_sessions_live_in_var_dir(tmp_path, monkeypatch):
+    """Сессии браузера NiceGUI пишутся в var/nicegui/, а не в .nicegui/ в корне репо (2026-09-04)."""
+    from nicegui.storage import Storage
+
+    import app.web as web
+
+    target = tmp_path / "var" / "nicegui"
+    monkeypatch.setattr(config, "NICEGUI_STORAGE_DIR", target)
+    web.configure_storage_path()
+    assert Storage.path == target
+    assert target.is_dir()
+
+
 def test_secrets_loader_skips_comments_and_blank_lines(tmp_path, env_without_secrets):
     path = _write_secrets(
         tmp_path,

@@ -38,6 +38,9 @@ class Indicator:
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 PROMPTS_DIR = PROJECT_ROOT / "prompts"
 RUNS_DIR = PROJECT_ROOT / "runs"
+# Сессии браузера NiceGUI (storage-user-*.json). По умолчанию NiceGUI кладёт их
+# в .nicegui/ в текущей папке — 67 файлов засоряли корень репо (2026-09-04).
+NICEGUI_STORAGE_DIR = PROJECT_ROOT / "var" / "nicegui"
 
 # Сколько прогонов идёт одновременно (веб-страница app/web.py): остальные ждут в
 # очереди и стартуют сами, как только освободится слот. Один прогон — семь минут

@@ -58,6 +58,7 @@ from nicegui import app as nicegui_app
 from nicegui import run as nicegui_run
 from nicegui import ui
 from nicegui.events import UiEventArguments, UploadEventArguments
+from nicegui.storage import Storage
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.responses import Response
 
@@ -1043,6 +1044,7 @@ def main() -> None:
     """
     config.load_secrets()
     config.require_auth_settings()
+    configure_storage_path()
     ui.run(
         host="0.0.0.0",
         port=WEB_PORT,
@@ -1052,6 +1054,19 @@ def main() -> None:
         show=False,
         storage_secret=config.storage_secret(),
     )
+
+
+def configure_storage_path() -> None:
+    """
+    Направить файлы сессий NiceGUI в config.NICEGUI_STORAGE_DIR.
+
+    NiceGUI читает путь один раз при импорте (переменная NICEGUI_STORAGE_PATH,
+    иначе .nicegui/ в текущей папке) и хранит его атрибутом класса Storage —
+    поэтому меняем атрибут до ui.run(), а не переменную окружения в команде
+    запуска: путь задан кодом и не зависит от того, откуда запустили сервис.
+    """
+    Storage.path = config.NICEGUI_STORAGE_DIR
+    Storage.path.mkdir(parents=True, exist_ok=True)
 
 
 if __name__ in {"__main__", "__mp_main__"}:

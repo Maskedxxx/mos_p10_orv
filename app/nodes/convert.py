@@ -13,12 +13,21 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import tempfile
 import time
 from pathlib import Path
 
-from docling.document_converter import DocumentConverter
+# Модели docling (разметка страниц, OCR) лежат в локальном кэше huggingface.
+# Без этой переменной docling при каждом старте спрашивает huggingface.co,
+# актуальна ли модель, и на спарке этот запрос зависал без таймаута: DNS отдаёт
+# IPv6-адреса первыми, а IPv6 не маршрутизируется (2026-09-04, тест PDF висел
+# >5 мин, в офлайн-режиме — 4 с). Выставляется до импорта docling; если
+# пользователь задал переменную сам — не трогаем.
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+
+from docling.document_converter import DocumentConverter  # noqa: E402
 
 from app.config import ACCEPTED_EXTENSIONS, NEEDS_LIBREOFFICE
 from app.logger import get_run_logger
