@@ -13,6 +13,7 @@ import pytest
 from pydantic import BaseModel, ValidationError
 
 from app.contracts import (
+    ActPassport,
     Buckets,
     DataItem,
     DataRequest,
@@ -22,8 +23,10 @@ from app.contracts import (
     HypothesisSet,
     MapRow,
     Merge,
+    PairDecision,
     RequestItem,
     RunMeta,
+    SourceRef,
     Verdict,
 )
 
@@ -36,9 +39,12 @@ ALL_MODELS = [
     HypothesisSet,
     MapRow,
     Merge,
+    PairDecision,
     HypothesisMap,
+    SourceRef,
     RequestItem,
     DataRequest,
+    ActPassport,
     RunMeta,
 ]
 
@@ -169,7 +175,7 @@ def test_verdict_attempts_below_1_rejected(valid_verdict_ok):
         (Effect, "valid_effect", "how_to_calculate", "   "),
         (DataItem, "valid_data_item", "metric", "  "),
         (Hypothesis, "valid_hypothesis", "hypothesis", ""),
-        (Hypothesis, "valid_hypothesis", "affected", "   "),
+        (Hypothesis, "valid_hypothesis", "grounds", "   "),
         (HypothesisSet, "valid_hypothesis_set", "name", ""),
         (HypothesisSet, "valid_hypothesis_set", "why_this_many", "  "),
         (MapRow, "valid_map_row", "hypothesis", "   "),
@@ -203,7 +209,7 @@ def test_model_json_schema_has_additional_properties_false(model_cls):
 FIELD_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_.-]{1,64}$")
 
 # Корневые модели-артефакты: обход по их полям должен рекурсивно достать все 12 моделей
-ROOT_MODELS_FOR_FIELD_NAME_CHECK = [Verdict, Buckets, HypothesisSet, HypothesisMap, DataRequest, RunMeta]
+ROOT_MODELS_FOR_FIELD_NAME_CHECK = [Verdict, Buckets, HypothesisSet, HypothesisMap, DataRequest, ActPassport, RunMeta]
 
 
 def _extract_nested_models(annotation) -> list[type[BaseModel]]:
@@ -239,10 +245,127 @@ def test_all_field_names_across_all_models_are_latin():
     # Защита от того, что рекурсия случайно не дошла до части моделей
     # (13: + PairDecision — решение по кандидату на слияние, узел [5], ОС 2026-09-04;
     #  14: + SourceRef — происхождение позиции запроса, узел [6], ОС 2026-09-04)
-    assert len(all_models) == 14
+    assert len(all_models) == 39   # v2: + ActPassport с 24 вложенными, + PairDecision, + SourceRef
 
     for model_cls in all_models:
         for field_name in model_cls.model_fields:
             assert FIELD_NAME_PATTERN.match(field_name), (
                 f"{model_cls.__name__}.{field_name} не проходит regex имён полей"
             )
+
+
+# ---- v2 (2026-09-04): описание у каждого поля контрактов structured output ----
+
+# Контракты, которые уходят модели как --json-schema: описание поля = мини-промпт к нему.
+# Verdict сюда не входит намеренно: его поля описаны в промптах индикаторов текстом.
+OUTPUT_CONTRACT_ROOTS = [HypothesisSet, HypothesisMap, DataRequest, ActPassport]
+
+
+def test_every_output_contract_field_has_description():
+    """Требование владельца: у КАЖДОГО поля контракта structured output непустое
+    description — pydantic кладёт его в JSON-схему, модель читает как инструкцию."""
+    models: set = set()
+    for root in OUTPUT_CONTRACT_ROOTS:
+        models |= _collect_models_recursively(root)
+    missing = [
+        f"{m.__name__}.{name}"
+        for m in models for name, info in m.model_fields.items()
+        if not (info.description and info.description.strip())
+    ]
+    assert missing == [], f"поля без description: {missing}"
+
+
+def test_passport_schema_fits_argv_limit():
+    """Схема паспорта уходит одним аргументом argv; лимит Linux MAX_ARG_STRLEN = 131072."""
+    import json
+    size = len(json.dumps(ActPassport.model_json_schema(), ensure_ascii=False).encode())
+    assert size < 100_000, size
+
+
+# ---- v2: валидаторы новых контрактов ловят нарушения (перенос ручных проверок) ----
+
+
+def _hyp(**kw) -> dict:
+    base = {"hypothesis": "h", "grounds": "g",
+            "effects": [{"affected": "бизнес", "metric": "m", "how_to_calculate": "c"}],
+            "data": [{"metric": "d", "source": "запрос органу"}]}
+    base.update(kw)
+    return base
+
+
+def test_hypothesis_two_effects_same_group_rejected():
+    with pytest.raises(ValidationError):
+        Hypothesis(**_hyp(effects=[
+            {"affected": "бизнес", "metric": "a", "how_to_calculate": "c"},
+            {"affected": "бизнес", "metric": "b", "how_to_calculate": "c"},
+        ]))
+
+
+def test_data_item_open_requires_where_and_request_forbids_it():
+    with pytest.raises(ValidationError):
+        DataItem(metric="x", source="открытый")
+    with pytest.raises(ValidationError):
+        DataItem(metric="x", source="запрос органу", where="сайт")
+
+
+def _row(i: int, ind: list[int]) -> dict:
+    return {"row_id": i, "indicators": ind, "hypothesis": "h", "grounds": "g",
+            "effects": [{"affected": "бизнес", "metric": "m", "how_to_calculate": "c"}],
+            "data": [{"metric": "d", "source": "запрос органу"}]}
+
+
+@pytest.mark.parametrize("payload", [
+    {"rows": [_row(1, [1]), _row(3, [2])]},                                                  # row_id не сквозные
+    {"rows": [_row(1, [1])], "decisions": [{"row_ids": [1, 2], "merge": True, "reason": "r"}]},  # «слить» без слияния
+    {"rows": [_row(1, [1, 2])], "merges": [{"merged_row_ids": [1, 2], "reason": "r"}],
+     "decisions": [{"row_ids": [1, 2], "merge": False, "reason": "r"}]},                    # слито при «не сливать»
+    {"rows": [_row(1, [1])], "merges": [{"merged_row_ids": [1, 2], "reason": "r"},
+                                       {"merged_row_ids": [2, 3], "reason": "r"}]},          # строка в двух слияниях
+    {"rows": [_row(1, [7, 1])]},                                                             # indicators не по порядку
+])
+def test_hypothesis_map_inconsistency_rejected(payload):
+    with pytest.raises(ValidationError):
+        HypothesisMap(**payload)
+
+
+def _item(**kw) -> dict:
+    base = {"num": "1", "kind": "показатель по годам", "metric": "количество заявок (п. 1)", "unit": "ед.",
+            "for_rows": [1], "sources": [{"row_id": 1, "metric": "m"}]}
+    base.update(kw)
+    return base
+
+
+@pytest.mark.parametrize("item", [
+    _item(metric="количество и доля уведомлений с отказом"),                  # две величины
+    _item(metric="сумма грантов и количество получателей"),
+    _item(unit=None),                                                        # показатель без единицы
+    _item(kind="перечень или реестр", unit="ед."),                          # перечень с единицей
+    _item(for_rows=[2]),                                                     # for_rows ≠ sources
+    _item(breakdown=["по основаниям отказа, предусмотренным пунктом 5.3"]),  # разрез без перечисления
+    _item(unit="%"),                                                         # процентов нет
+])
+def test_request_item_violations_rejected(item):
+    with pytest.raises(ValidationError):
+        RequestItem(**item)
+
+
+def test_request_lists_must_follow_counters():
+    with pytest.raises(ValidationError):
+        DataRequest(items=[
+            _item(kind="перечень или реестр", unit=None, metric="перечень"),
+            _item(num="2", metric="количество", sources=[{"row_id": 1, "metric": "m2"}]),
+        ], years=[2025])
+
+
+def test_passport_state_must_match_content(valid_passport):
+    """«есть» без перечня и «нет» с перечнем отвергаются; проект с номером — тоже."""
+    bad = {**valid_passport, "requirements": {**valid_passport["requirements"], "state": "есть"}}
+    with pytest.raises(ValidationError):
+        ActPassport(**bad)
+    bad = {**valid_passport, "status": {**valid_passport["status"], "status": "проект"}}
+    with pytest.raises(ValidationError):
+        ActPassport(**bad)   # у проекта не может быть номера и даты
+
+
+def test_passport_valid_minimal(valid_passport):
+    assert ActPassport(**valid_passport).status.status == "принят"

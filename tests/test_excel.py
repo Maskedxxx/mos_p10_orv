@@ -36,8 +36,8 @@ def _map() -> HypothesisMap:
     запрос) и «открытый» рядом, вторая — целиком «запрос органу»."""
     return HypothesisMap(rows=[
         MapRow(
-            row_id=1, indicators=[1, 8], hypothesis="гипотеза 1",
-            effect=Effect(metric="издержки заявителя, руб.", how_to_calculate="сумма расходов"),
+            row_id=1, indicators=[1, 8], hypothesis="гипотеза 1", grounds="основание 1",
+            effects=[Effect(affected="бизнес", metric="издержки заявителя, руб.", how_to_calculate="сумма расходов")],
             data=[
                 # намеренно вперемешку: открытый первым — рендер обязан
                 # поднять «запрос органу» наверх сам (фикс N 2)
@@ -47,8 +47,8 @@ def _map() -> HypothesisMap:
             proof="дословная цитата 1", clause="5.1.4",
         ),
         MapRow(
-            row_id=2, indicators=[3], hypothesis="гипотеза 2",
-            effect=Effect(metric="срок рассмотрения, дней", how_to_calculate="среднее по выборке"),
+            row_id=2, indicators=[3], hypothesis="гипотеза 2", grounds="основание 2",
+            effects=[Effect(affected="бизнес", metric="срок рассмотрения, дней", how_to_calculate="среднее по выборке")],
             data=[DataItem(metric="средний срок рассмотрения", source="запрос органу")],
         ),
     ], merges=[])
@@ -60,11 +60,13 @@ def _request() -> DataRequest:
     return DataRequest(
         items=[
             RequestItem(
-                num="1", metric="число заявок (пункт 5.1.4), ед.", clause="5.1.4",
-                for_rows=[1], breakdown=["юридические лица", "индивидуальные предприниматели"],
+                num="1", kind="показатель по годам", metric="число заявок (пункт 5.1.4)", unit="ед.", clause="5.1.4",
+                for_rows=[1], sources=[SourceRef(row_id=1, metric="число заявок")],
+                breakdown=["юридические лица", "индивидуальные предприниматели"],
             ),
             RequestItem(
-                num="2", metric="средний срок рассмотрения, дней", for_rows=[2], breakdown=[],
+                num="2", kind="показатель по годам", metric="средний срок рассмотрения", unit="календарных дней",
+                for_rows=[2], sources=[SourceRef(row_id=2, metric="средний срок рассмотрения")], breakdown=[],
             ),
         ],
         years=[2020, 2021, 2022, 2023],
@@ -361,19 +363,36 @@ def test_map_indicator_column_wide_enough_for_names(tmp_runs_dir):
 
 
 def test_effect_cell_has_labels(tmp_runs_dir):
-    """Два блока подписаны и разделены пустой строкой."""
+    """Блок эффекта подписан: кого задевает, показатель, как считать."""
     path = build_excel(_map(), _request(), _buckets(with_failed=False), "", "run_effect")
     ws = load_workbook(path)["Карта гипотез"]
     hdr = _find_header_row(ws)
     cell = ws.cell(row=hdr + 1, column=_col(ws, hdr, "Эффект")).value
 
     assert cell == (
+        "Кого задевает: бизнес\n"
         "Показатель:\n"
         "издержки заявителя, руб.\n"
         "\n"
         "Как считать:\n"
         "сумма расходов"
     )
+
+
+def test_effect_cell_lists_every_effect(tmp_runs_dir):
+    """Контракт v2: у гипотезы несколько эффектов (бизнес и город от одного
+    механизма) — в клетке оба блока, через пустую строку, ни один не потерян."""
+    hyp_map = _map()
+    hyp_map.rows[0].effects.append(
+        Effect(affected="город", metric="трудозатраты комиссии, чел.-часов", how_to_calculate="заседания × состав")
+    )
+    path = build_excel(hyp_map, _request(), _buckets(with_failed=False), "", "run_effects2")
+    ws = load_workbook(path)["Карта гипотез"]
+    hdr = _find_header_row(ws)
+    cell = ws.cell(row=hdr + 1, column=_col(ws, hdr, "Эффект")).value
+    assert "Кого задевает: бизнес" in cell and "Кого задевает: город" in cell
+    assert "трудозатраты комиссии" in cell
+    assert cell.count("Как считать:") == 2
 
 
 # ----------------------------------------------------------------------
@@ -564,8 +583,9 @@ def test_map_sheet_has_row_number_column(tmp_runs_dir):
 def test_request_sheet_shows_source_rows(tmp_runs_dir):
     """Показатель, обслуживающий две строки карты, показывает обе с индикаторами."""
     request = DataRequest(
-        items=[RequestItem(num="1", metric="число заявок", clause="4",
-                           for_rows=[1, 2], breakdown=[])],
+        items=[RequestItem(num="1", kind="показатель по годам", metric="число заявок", unit="ед.", clause="4",
+                           for_rows=[1, 2], breakdown=[],
+                           sources=[SourceRef(row_id=1, metric="число заявок"), SourceRef(row_id=2, metric="число заявок")])],
         years=[2020, 2021, 2022],
     )
     path = build_excel(_map(), request, _buckets(with_failed=False), "", "run_req_src")

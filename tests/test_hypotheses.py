@@ -61,12 +61,12 @@ def _ok_call_result(n: int, *, attempts: int = 1, cost_usd: float = 0.01) -> Cal
     """Успешный CallResult с провалидированным HypothesisSet (одна гипотеза) внутри."""
     hypothesis = Hypothesis(
         hypothesis="требование избыточно",
-        affected="субъекты МСП",
-        effect=Effect(metric="число обращений", how_to_calculate="сумма за год"),
-        data=[DataItem(metric="число заявок", source="открытый")],
+        grounds="основание из карточки",
+        effects=[Effect(affected="бизнес", metric="число обращений", how_to_calculate="сумма за год")],
+        data=[DataItem(metric="число заявок", source="открытый", where="Мосстат")],
     )
     value = HypothesisSet(
-        indicator=n, name=f"индикатор {n}", why_this_many="выявлено одно нарушение",
+        indicator=n, name=f"индикатор {n}", violation_kind="издержки", why_this_many="выявлено одно нарушение",
         hypotheses=[hypothesis],
     )
     return CallResult(

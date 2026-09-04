@@ -318,21 +318,28 @@ def _indicators_label(numbers: list[int]) -> str:
     return "\n".join(f"{n}. {get_indicator(n).name}" for n in numbers)
 
 
-def _render_effect_cell(effect: Effect) -> str:
+def _render_effect_cell(effects: list[Effect]) -> str:
     """
-    Показатель эффекта и способ его расчёта в одной клетке, каждый под своей
-    подписью (фикс N 4 трека багов: без подписей два блока читались как один
-    длинный абзац).
+    Эффекты гипотезы в одной клетке: блок на каждый эффект — кого задевает,
+    показатель, способ расчёта, каждый под своей подписью (фикс N 4 трека
+    багов: без подписей блоки читались как один длинный абзац).
+
+    Контракт v2 (2026-09-04): у гипотезы несколько эффектов — по одному на
+    группу-плательщика («бизнес» и «город» от одного механизма), поэтому блоки
+    идут друг за другом через пустую строку.
 
     Нумерация внутри «Как считать» остаётся такой, как её вернула модель —
     одним абзацем. Резать её кодом по «1)» / «2)» нельзя: формулировка каждый
     раз разная, это было бы гадание.
     """
-    return (
-        f"Показатель:\n{effect.metric}\n"
+    blocks = [
+        f"Кого задевает: {e.affected}\n"
+        f"Показатель:\n{e.metric}\n"
         f"\n"
-        f"Как считать:\n{effect.how_to_calculate}"
-    )
+        f"Как считать:\n{e.how_to_calculate}"
+        for e in effects
+    ]
+    return "\n\n".join(blocks)
 
 
 def _render_map_data_cell(data: list[DataItem], nums: list[str]) -> str:
@@ -453,7 +460,7 @@ def _render_map_sheet(
             row.row_id,          # адрес строки: на него ссылается лист запроса
             _indicators_label(row.indicators),
             row.hypothesis,
-            _render_effect_cell(row.effect),
+            _render_effect_cell(row.effects),
             _render_map_data_cell(row.data, nums),
             _render_basis_cell(
                 row.proof or _first_verdict_proof(verdicts),

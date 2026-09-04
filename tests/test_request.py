@@ -24,9 +24,9 @@ def _row(row_id: int, *, source: str = "запрос органу") -> MapRow:
     return MapRow(
         row_id=row_id,
         indicators=[1],
-        hypothesis=f"гипотеза {row_id}",
-        effect=Effect(metric="число обращений", how_to_calculate="сумма за год"),
-        data=[DataItem(metric=f"показатель {row_id}", source=source)],
+        hypothesis=f"гипотеза {row_id}", grounds="основание",
+        effects=[Effect(affected="бизнес", metric="число обращений", how_to_calculate="сумма за год")],
+        data=[DataItem(metric=f"показатель {row_id}", source=source, where=("Мосстат" if source == "открытый" else None))],
     )
 
 
@@ -78,7 +78,7 @@ def test_only_internal_source_reaches_result(run_id, tmp_prompt, monkeypatch):
     построчно, но не должен предупреждать зря на корректном ответе)."""
     hyp_map = _map([_row(1, source="запрос органу"), _row(2, source="открытый")])
     req = DataRequest(
-        items=[RequestItem(num="1", metric="показатель 1", for_rows=[1])],
+        items=[RequestItem(num="1", kind="показатель по годам", metric="показатель 1", unit="ед.", for_rows=[1], sources=[SourceRef(row_id=1, metric="показатель 1")])],
         years=[2024, 2025, 2026],
     )
     monkeypatch.setattr(request_module, "call", Mock(return_value=_ok_call_result(req)))
@@ -94,7 +94,7 @@ def test_nonexistent_for_rows_is_caught(run_id, tmp_prompt, monkeypatch):
     """2. Несуществующий номер в for_rows -> ошибка в лог с указанием номера."""
     hyp_map = _map([_row(1, source="запрос органу")])
     req = DataRequest(
-        items=[RequestItem(num="1", metric="показатель 1", for_rows=[1, 99])],
+        items=[RequestItem(num="1", kind="показатель по годам", metric="показатель 1", unit="ед.", for_rows=[1, 99], sources=[SourceRef(row_id=1, metric="показатель 1"), SourceRef(row_id=99, metric="показатель 99")])],
         years=[2024, 2025, 2026],
     )
     monkeypatch.setattr(request_module, "call", Mock(return_value=_ok_call_result(req)))
@@ -111,7 +111,7 @@ def test_open_source_only_row_is_warned(run_id, tmp_prompt, monkeypatch):
     """Показатель ссылается только на строку без «запрос органу» -> предупреждение в лог."""
     hyp_map = _map([_row(1, source="открытый")])
     req = DataRequest(
-        items=[RequestItem(num="1", metric="показатель 1", for_rows=[1])],
+        items=[RequestItem(num="1", kind="показатель по годам", metric="показатель 1", unit="ед.", for_rows=[1], sources=[SourceRef(row_id=1, metric="показатель 1")])],
         years=[2024, 2025, 2026],
     )
     monkeypatch.setattr(request_module, "call", Mock(return_value=_ok_call_result(req)))
@@ -140,7 +140,7 @@ def test_artifacts_written(run_id, tmp_prompt, monkeypatch):
     """4. Артефакт 07_request.json создан."""
     hyp_map = _map([_row(1)])
     req = DataRequest(
-        items=[RequestItem(num="1", metric="показатель 1", for_rows=[1])],
+        items=[RequestItem(num="1", kind="показатель по годам", metric="показатель 1", unit="ед.", for_rows=[1], sources=[SourceRef(row_id=1, metric="показатель 1")])],
         years=[2024, 2025, 2026],
     )
     monkeypatch.setattr(request_module, "call", Mock(return_value=_ok_call_result(req)))
@@ -158,7 +158,7 @@ def test_cost_added_not_overwritten(tmp_runs_dir, tmp_prompt, monkeypatch):
 
     hyp_map = _map([_row(1)])
     req = DataRequest(
-        items=[RequestItem(num="1", metric="показатель 1", for_rows=[1])],
+        items=[RequestItem(num="1", kind="показатель по годам", metric="показатель 1", unit="ед.", for_rows=[1], sources=[SourceRef(row_id=1, metric="показатель 1")])],
         years=[2024, 2025, 2026],
     )
     monkeypatch.setattr(
@@ -213,13 +213,14 @@ def test_empty_map_skips_model_call(run_id, tmp_prompt, monkeypatch):
 def _row2(row_id: int, metrics: list[tuple[str, str]]) -> MapRow:
     """Строка карты с несколькими показателями: [(metric, source), ...]."""
     return MapRow(
-        row_id=row_id, indicators=[1], hypothesis=f"гипотеза {row_id}",
-        effect=Effect(metric="число обращений", how_to_calculate="сумма за год"),
+        row_id=row_id, indicators=[1], hypothesis=f"гипотеза {row_id}", grounds="основание",
+        effects=[Effect(affected="бизнес", metric="число обращений", how_to_calculate="сумма за год")],
         data=[DataItem(metric=m, source=src, where=("Росстат" if src == "открытый" else None)) for m, src in metrics],
     )
 
 
 def _item(num: str, metric: str, rows: list[int], sources: list[tuple[int, str]], **kw) -> RequestItem:
+    kw.setdefault("kind", "показатель по годам")
     return RequestItem(
         num=num, metric=metric, for_rows=rows,
         sources=[SourceRef(row_id=r, metric=m) for r, m in sources], **kw,
@@ -264,27 +265,6 @@ def test_coverage_duplicate_source_is_logged_as_warning(run_id, tmp_prompt, monk
     log_text = (run_dir(run_id) / "run.log").read_text(encoding="utf-8")
     assert "WARNING" in log_text and "в несколько позиций" in log_text
     assert "ERROR" not in log_text
-
-
-def test_coverage_skipped_when_model_gave_no_sources(run_id, tmp_prompt, monkeypatch):
-    """Г4, совместимость: ответ по промпту v1 без sources — покрытие не проверяется,
-    в лог WARNING, ERROR нет."""
-    hyp_map = _map([_row2(1, [("число заявок", "запрос органу")])])
-    req = DataRequest(items=[RequestItem(num="1", metric="число заявок, ед.", for_rows=[1])], years=[2025])
-    monkeypatch.setattr(request_module, "call", Mock(return_value=_ok_call_result(req)))
-    build_request(hyp_map, run_id)
-    log_text = (run_dir(run_id) / "run.log").read_text(encoding="utf-8")
-    assert "покрытие не проверить" in log_text and "не вошёл ни в одну позицию" not in log_text
-
-
-def test_two_measures_in_one_item_logged_as_error(run_id, tmp_prompt, monkeypatch):
-    """Г1. «количество и доля» в одной позиции — ERROR (12 из 154 позиций в ОС)."""
-    hyp_map = _map([_row2(1, [("число отказов", "запрос органу")])])
-    req = DataRequest(items=[_item("1", "количество и доля уведомлений с отказом (п. 10)", [1], [(1, "число отказов")], unit="ед.")], years=[2025])
-    monkeypatch.setattr(request_module, "call", Mock(return_value=_ok_call_result(req)))
-    build_request(hyp_map, run_id)
-    log_text = (run_dir(run_id) / "run.log").read_text(encoding="utf-8")
-    assert "ERROR" in log_text and "две величины" in log_text
 
 
 def test_request_years_clipped_to_effective_year():

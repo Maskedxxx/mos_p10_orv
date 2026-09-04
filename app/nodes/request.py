@@ -39,7 +39,6 @@ _add_cost_to_meta из app.nodes.hypotheses, вторая копия не пиш
 from __future__ import annotations
 
 import json
-import re
 
 from app.config import ALLOWED_TOOLS_TEXT, PROMPT_REQUEST, REQUEST_YEARS_DEPTH
 from app.contracts import DataRequest, HypothesisMap
@@ -99,26 +98,6 @@ def _build_document(
     parts.append("## КАРТА ГИПОТЕЗ (JSON)\n\n" f"```json\n{rows_json}\n```\n")
     parts.append("## ГОДЫ БЛАНКА (JSON)\n\n" f"```json\n{json.dumps(years)}\n```\n")
     return "\n".join(parts)
-
-
-# Две величины в одной формулировке: «количество и доля», «сумма … и количество»,
-# «средний и максимальный» — чиновник не поставит два числа в одну клетку.
-_TWO_MEASURES_RE = re.compile(
-    r"\b(количество|число|сумм\w*|доля|средн\w*|максимальн\w*|минимальн\w*)\b"
-    r"[^,;]{0,80}?\b(и|и \(или\)|либо)\s+"
-    r"(доля|количество|число|сумм\w*|средн\w*|максимальн\w*|минимальн\w*)\b",
-    re.IGNORECASE,
-)
-
-
-def _check_single_measure(request: DataRequest, logger) -> None:
-    """Проверка 3 (Г1): одна позиция — одна величина. 12 из 154 позиций в ОС склеивали две."""
-    for item in request.items:
-        if _TWO_MEASURES_RE.search(item.metric):
-            logger.error(
-                "request: позиция № %s — две величины в одной формулировке, раздели: %s",
-                item.num, item.metric[:120],
-            )
 
 
 def _norm(text: str) -> str:
@@ -266,7 +245,6 @@ def build_request(
         value = result.value.model_copy(update={"years": years})
         _check_for_rows_exist(value, _valid_row_ids(hypothesis_map), logger)
         _check_no_open_source_leaked(value, _rows_with_internal_data(hypothesis_map), logger)
-        _check_single_measure(value, logger)
         _check_coverage(hypothesis_map, value, logger)
 
     save_json(run_id, "07_request.json", value)

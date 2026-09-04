@@ -35,6 +35,7 @@ from app.contracts import (
     RequestItem,
     RunProgress,
     Verdict,
+    SourceRef,
 )
 from app.nodes.hypotheses import _add_cost_to_meta
 from app.pipeline import run_pipeline
@@ -79,12 +80,13 @@ def _make_hypothesis_set(n: int) -> HypothesisSet:
     return HypothesisSet(
         indicator=n,
         name=f"индикатор {n}",
+        violation_kind="издержки",
         why_this_many="одна гипотеза",
         hypotheses=[
             Hypothesis(
                 hypothesis=f"гипотеза по индикатору {n}",
-                affected="субъекты МСП",
-                effect=Effect(metric="число обращений", how_to_calculate="сумма за год"),
+                grounds="основание из карточки",
+                effects=[Effect(affected="бизнес", metric="число обращений", how_to_calculate="сумма за год")],
                 data=[DataItem(metric="число заявок", source="запрос органу")],
             )
         ],
@@ -243,7 +245,8 @@ class Fakes:
                 row_id=i + 1,
                 indicators=[hset.indicator],
                 hypothesis=hset.hypotheses[0].hypothesis,
-                effect=hset.hypotheses[0].effect,
+                grounds=hset.hypotheses[0].grounds,
+                effects=hset.hypotheses[0].effects,
                 data=hset.hypotheses[0].data,
             )
             for i, hset in enumerate(hypothesis_sets)
@@ -259,7 +262,10 @@ class Fakes:
         self._record("request:start")
         self._maybe_fail("request")
         items = [
-            RequestItem(num=str(i + 1), metric=f"показатель {i + 1}", for_rows=[row.row_id])
+            RequestItem(
+                num=str(i + 1), kind="показатель по годам", metric=f"показатель {i + 1}", unit="ед.",
+                for_rows=[row.row_id], sources=[SourceRef(row_id=row.row_id, metric=row.data[0].metric)],
+            )
             for i, row in enumerate(hypothesis_map.rows)
         ]
         value = DataRequest(items=items, years=[2023, 2024, 2025])

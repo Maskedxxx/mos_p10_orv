@@ -33,8 +33,8 @@ from app.trace import load_json, run_dir, save_json
 def _hypothesis(text: str) -> Hypothesis:
     return Hypothesis(
         hypothesis=text,
-        affected="субъекты МСП",
-        effect=Effect(metric="число обращений", how_to_calculate="сумма за год"),
+        grounds="основание из карточки",
+        effects=[Effect(affected="бизнес", metric="число обращений", how_to_calculate="сумма за год")],
         data=[DataItem(metric="число заявок", source="запрос органу")],
     )
 
@@ -43,6 +43,7 @@ def _hset(indicator: int, texts: list[str]) -> HypothesisSet:
     return HypothesisSet(
         indicator=indicator,
         name=f"индикатор {indicator}",
+        violation_kind="издержки",
         why_this_many=f"выявлено {len(texts)}",
         hypotheses=[_hypothesis(t) for t in texts],
     )
@@ -79,7 +80,8 @@ def _rows_from(flat_texts: list[tuple[int, str]]) -> list[MapRow]:
             row_id=i,
             indicators=[indicator],
             hypothesis=text,
-            effect=Effect(metric="число обращений", how_to_calculate="сумма за год"),
+            grounds="основание из карточки",
+            effects=[Effect(affected="бизнес", metric="число обращений", how_to_calculate="сумма за год")],
             data=[DataItem(metric="число заявок", source="запрос органу")],
         )
         for i, (indicator, text) in enumerate(flat_texts, start=1)
@@ -169,9 +171,8 @@ def test_lost_hypothesis_is_caught_and_logged(run_id, tmp_prompt, monkeypatch):
 def test_correct_merge_does_not_log_error(run_id, tmp_prompt, monkeypatch):
     """4b. Честное слияние (с объявленным Merge) счёт сходится -> ошибки в логе нет."""
     hsets = [_hset(1, ["A", "B", "C"])]
-    merged_row = _rows_from([(1, "A и B слиты")])[0]
     ok_map = HypothesisMap(
-        rows=[merged_row, *_rows_from([(1, "C")])],
+        rows=_rows_from([(1, "A и B слиты"), (1, "C")]),   # row_id 1 и 2 — сквозная нумерация
         merges=[Merge(merged_row_ids=[1, 2], reason="одно и то же требование")],
     )
     monkeypatch.setattr(merge_module, "call", Mock(return_value=_ok_call_result(ok_map)))
@@ -255,7 +256,7 @@ def _hyp_c(text: str, clause: str | None) -> Hypothesis:
 
 def _hset_c(indicator: int, items: list[tuple[str, str | None]]) -> HypothesisSet:
     return HypothesisSet(
-        indicator=indicator, name=f"индикатор {indicator}", why_this_many="тест",
+        indicator=indicator, name=f"индикатор {indicator}", violation_kind="издержки", why_this_many="тест",
         hypotheses=[_hyp_c(t, c) for t, c in items],
     )
 
