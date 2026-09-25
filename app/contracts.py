@@ -27,7 +27,7 @@
 from __future__ import annotations
 
 import re
-from typing import Literal
+from typing import Literal, Union
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -1558,6 +1558,205 @@ class ActPassport(_Base):
         return self
 
 
+# ==== ДИАЛОГ С РЕЗУЛЬТАТОМ ПРОГОНА (план итерации 3) ====
+#
+# Оркестратор отвечает текстом и планом из ЗАКРЫТОГО списка операций; выполняет
+# план код после подтверждения пользователя (app/operations.py). Вид операции —
+# поле kind по-русски: модель читает его как инструкцию. Объединение видов —
+# обычный Union без discriminator: CLI отвергает это ключевое слово в --json-schema
+# (проверено 2026-09-25, шаг 0 плана).
+
+EditSheet = Literal["вердикт", "строка карты", "позиция запроса"]
+EditField = Literal[
+    "обоснование",                                                  # вердикт
+    "гипотеза", "основание", "показатель эффекта", "как считать", "что подтвердит",  # строка карты
+    "показатель", "пояснение", "пункт",                             # позиция запроса
+]
+_FIELDS_BY_SHEET: dict[str, set[str]] = {
+    "вердикт": {"обоснование"},
+    "строка карты": {"гипотеза", "основание", "показатель эффекта", "как считать", "что подтвердит"},
+    "позиция запроса": {"показатель", "пояснение", "пункт"},
+}
+_EFFECT_FIELDS = {"показатель эффекта", "как считать", "что подтвердит"}
+WorkVerdict = Literal["нарушен", "соблюдён", "не применимо", "нет данных"]
+
+_REASON = Field(
+    min_length=1,
+    description=(
+        "Почему эта операция — словами пользователя или эксперта, одной фразой. "
+        "Попадает в журнал изменений файла."
+    ),
+)
+
+
+class EditText(_Base):
+    """Правка формулировки без вызова агентов: новый текст пишешь ты сам."""
+
+    kind: Literal["правка текста"] = Field(description="Вид операции.")
+    sheet: EditSheet = Field(description="Где правка: вердикт, строка карты гипотез или позиция запроса.")
+    key: str = Field(min_length=1, description="Номер индикатора (1–12), строки карты или позиции запроса.")
+    field: EditField = Field(
+        description=(
+            "Какое поле. Вердикт: «обоснование». Строка карты: «гипотеза», «основание», "
+            "«показатель эффекта», «как считать», «что подтвердит». Позиция запроса: "
+            "«показатель», «пояснение», «пункт»."
+        ),
+    )
+    effect_index: int | None = Field(
+        default=None, ge=1,
+        description="Номер эффекта строки карты с 1 — только для полей эффекта, иначе пусто.",
+    )
+    new_text: str = Field(
+        min_length=1,
+        description=(
+            "Новый текст поля целиком. Правь форму, не содержание: цифры, пункты акта "
+            "и цитаты сохраняй как были, если пользователь прямо не просит их изменить."
+        ),
+    )
+    reason: str = _REASON
+
+    @model_validator(mode="after")
+    def _check_field(self) -> "EditText":
+        if self.field not in _FIELDS_BY_SHEET[self.sheet]:
+            raise ValueError(f"поле «{self.field}» не относится к листу «{self.sheet}»")
+        if (self.field in _EFFECT_FIELDS) != (self.effect_index is not None):
+            raise ValueError("effect_index указывается ровно для полей эффекта")
+        return self
+
+
+class SetVerdict(_Base):
+    """Смена вердикта по решению эксперта — без перепроверки моделью."""
+
+    kind: Literal["смена вердикта"] = Field(description="Вид операции.")
+    indicator: int = Field(ge=1, le=12, description="Номер индикатора.")
+    verdict: WorkVerdict = Field(description="Новый вердикт. «ошибка» ставит только сервис.")
+    rationale: str = Field(
+        min_length=1,
+        description="Обоснование нового вердикта — словами эксперта, без пересказа старого обоснования.",
+    )
+    missing_data: str | None = Field(
+        default=None,
+        description="Только для «нет данных»: каких сведений не хватает. Для других вердиктов пусто.",
+    )
+    reason: str = _REASON
+
+    @model_validator(mode="after")
+    def _check_missing(self) -> "SetVerdict":
+        if (self.verdict == "нет данных") != bool(self.missing_data and self.missing_data.strip()):
+            raise ValueError("missing_data заполняется ровно для вердикта «нет данных»")
+        return self
+
+
+class DeleteMapRow(_Base):
+    """Удаление строки карты гипотез по решению эксперта."""
+
+    kind: Literal["удалить строку карты"] = Field(description="Вид операции.")
+    row_id: int = Field(ge=1, description="Номер строки карты.")
+    reason: str = _REASON
+
+
+class AddMapRow(_Base):
+    """Новая строка карты по формулировке эксперта; ты оформляешь её по правилам гипотез."""
+
+    kind: Literal["добавить строку карты"] = Field(description="Вид операции.")
+    indicators: list[int] = Field(min_length=1, description="Индикаторы строки, по возрастанию, без повторов.")
+    hypothesis: str = Field(min_length=1, description="Гипотеза: что не так и к чему приводит, с масштабом.")
+    grounds: str = Field(min_length=1, description="На чём стоит: формулировка эксперта дословно.")
+    effects: list[Effect] = Field(min_length=1, description="Эффекты, по одному на группу-плательщика.")
+    data: list[DataItem] = Field(min_length=1, description="Показатели для расчёта эффектов.")
+    proof: str | None = Field(default=None, description="Дословная цитата из акта, если гипотеза стоит на пункте.")
+    clause: str | None = Field(default=None, description="Пункт акта, если есть.")
+    reason: str = _REASON
+
+
+class MergeMapRows(_Base):
+    """Склейка строк карты по решению человека: одна проблема — одна строка."""
+
+    kind: Literal["слить строки карты"] = Field(description="Вид операции.")
+    row_ids: list[int] = Field(min_length=2, description="Номера сливаемых строк; остаётся строка с меньшим номером.")
+    hypothesis: str = Field(min_length=1, description="Одна формулировка, покрывающая все сливаемые строки.")
+    reason: str = _REASON
+
+
+class DeleteRequestItem(_Base):
+    """Удаление позиции запроса по решению эксперта."""
+
+    kind: Literal["удалить позицию запроса"] = Field(description="Вид операции.")
+    num: str = Field(min_length=1, description="Номер позиции.")
+    reason: str = _REASON
+
+
+class SplitPart(_Base):
+    """Одна из позиций, на которые делится исходная."""
+
+    metric: str = Field(min_length=1, description="Формулировка для чиновника, одна величина, пункт акта в скобках.")
+    unit: Unit = Field(description="Единица измерения из закрытого списка.")
+
+
+class SplitRequestItem(_Base):
+    """Разделение позиции запроса, в которой спрятаны две величины."""
+
+    kind: Literal["разделить позицию запроса"] = Field(description="Вид операции.")
+    num: str = Field(min_length=1, description="Номер делимой позиции.")
+    parts: list[SplitPart] = Field(min_length=2, description="Новые позиции вместо исходной.")
+    reason: str = _REASON
+
+
+class RecheckIndicator(_Base):
+    """Перепроверка индикатора его агентом с уточнённой задачей — только по просьбе пользователя."""
+
+    kind: Literal["перепроверить индикатор"] = Field(description="Вид операции.")
+    indicator: int = Field(ge=1, le=12, description="Номер индикатора.")
+    clarification: str = Field(
+        min_length=1,
+        description=(
+            "Что ещё проверить и где искать. НЕ писать, какой вердикт нужен и что думает "
+            "эксперт: агент должен проверить заново, а не согласиться."
+        ),
+    )
+    reason: str = _REASON
+
+
+class BuildHypotheses(_Base):
+    """Досчёт гипотез по индикатору, чей вердикт стал «нарушен» или «нет данных»."""
+
+    kind: Literal["построить гипотезы"] = Field(description="Вид операции.")
+    indicator: int = Field(ge=1, le=12, description="Номер индикатора.")
+    clarification: str | None = Field(default=None, description="Уточнение задачи агенту гипотез, если пользователь его дал.")
+    reason: str = _REASON
+
+
+class AppendRequest(_Base):
+    """Досчёт позиций запроса под новые строки карты; оценённые позиции не трогаются."""
+
+    kind: Literal["дополнить запрос"] = Field(description="Вид операции.")
+    row_ids: list[int] = Field(min_length=1, description="Номера новых строк карты, под которые нужны позиции.")
+    reason: str = _REASON
+
+
+Operation = Union[
+    EditText, SetVerdict, DeleteMapRow, AddMapRow, MergeMapRows,
+    DeleteRequestItem, SplitRequestItem, RecheckIndicator, BuildHypotheses, AppendRequest,
+]
+
+
+class DialogTurn(_Base):
+    """Ответ оркестратора на одно сообщение пользователя."""
+
+    reply: str = Field(
+        min_length=1,
+        description=(
+            "Ответ пользователю по-русски, коротко и по существу, без технических имён "
+            "полей и файлов. Если есть план — перечисли шаги простыми словами и что "
+            "станет после каждого."
+        ),
+    )
+    plan: list[Operation] = Field(
+        default_factory=list,
+        description="Операции по порядку. Пусто, если пользователь только спрашивает.",
+    )
+
+
 # ==== СЛУЖЕБНЫЕ ====
 
 # ---- Версии диалогового режима (план итерации 3): журнал и пометки строк Excel ----
@@ -1593,6 +1792,32 @@ class Marks(BaseModel):
     stale_rows: dict[int, str] = Field(default_factory=dict, description="Строка карты → почему устарела.")
     stale_items: dict[str, str] = Field(default_factory=dict, description="Позиция запроса → почему устарела.")
 
+
+
+class Remark(BaseModel):
+    """Замечание эксперта из заполненного Excel — одна строка очереди разбора в диалоге."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    sheet: Literal["Вердикты", "Карта гипотез", "Запрос показателей"]
+    key: str                      # индикатор / № строки карты / № позиции запроса
+    title: str                    # о чём строка: индикатор, начало гипотезы, показатель
+    agree: str | None = None      # «Согласны?» — только на листе «Вердикты»
+    correct: str | None = None    # «Если нет — какой верный»
+    score: int | None = None      # «Оценка (1–5)» — на карте и в запросе
+    text: str = ""                # «Замечание»
+
+
+class VersionState(BaseModel):
+    """Состояние версий прогона в диалоговом режиме (versions/state.json)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    current: int = 0                                          # текущая версия; 0 — исходный разбор
+    next_row_id: int                                          # следующий свободный номер строки карты
+    next_item_num: int                                        # следующий свободный номер позиции запроса
+    unverified_ids: dict[int, int] = Field(default_factory=dict)  # индикатор → строка «проверка не завершена»
+    marks: Marks = Field(default_factory=Marks)
 
 class RunMeta(BaseModel):
     """Метаданные одного прогона пайплайна (для meta.json трейса)."""

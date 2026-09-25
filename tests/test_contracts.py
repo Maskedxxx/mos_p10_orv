@@ -17,6 +17,7 @@ from app.contracts import (
     Buckets,
     DataItem,
     DataRequest,
+    DialogTurn,
     Effect,
     Hypothesis,
     HypothesisMap,
@@ -219,7 +220,7 @@ def test_model_json_schema_has_additional_properties_false(model_cls):
 FIELD_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_.-]{1,64}$")
 
 # Корневые модели-артефакты: обход по их полям должен рекурсивно достать все 12 моделей
-ROOT_MODELS_FOR_FIELD_NAME_CHECK = [Verdict, Buckets, HypothesisSet, HypothesisMap, DataRequest, ActPassport, RunMeta]
+ROOT_MODELS_FOR_FIELD_NAME_CHECK = [Verdict, Buckets, HypothesisSet, HypothesisMap, DataRequest, ActPassport, RunMeta, DialogTurn]
 
 
 def _extract_nested_models(annotation) -> list[type[BaseModel]]:
@@ -255,7 +256,8 @@ def test_all_field_names_across_all_models_are_latin():
     # Защита от того, что рекурсия случайно не дошла до части моделей
     # (13: + PairDecision — решение по кандидату на слияние, узел [5], ОС 2026-09-04;
     #  14: + SourceRef — происхождение позиции запроса, узел [6], ОС 2026-09-04)
-    assert len(all_models) == 39   # v2: + ActPassport с 24 вложенными, + PairDecision, + SourceRef
+    assert len(all_models) == 51   # v2: + ActPassport с 24 вложенными, + PairDecision, + SourceRef;
+    # итерация 3: + DialogTurn, 10 операций диалога и SplitPart
 
     for model_cls in all_models:
         for field_name in model_cls.model_fields:
@@ -268,7 +270,7 @@ def test_all_field_names_across_all_models_are_latin():
 
 # Контракты, которые уходят модели как --json-schema: описание поля = мини-промпт к нему.
 # Verdict сюда не входит намеренно: его поля описаны в промптах индикаторов текстом.
-OUTPUT_CONTRACT_ROOTS = [HypothesisSet, HypothesisMap, DataRequest, ActPassport]
+OUTPUT_CONTRACT_ROOTS = [HypothesisSet, HypothesisMap, DataRequest, ActPassport, DialogTurn]
 
 
 def test_every_output_contract_field_has_description():
