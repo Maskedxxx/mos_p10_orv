@@ -132,6 +132,7 @@ def _build_cmd(
     allowed_tools: list[str],
     resume_session_id: str | None,
     max_budget_usd: float | None,
+    model: str = MODEL,
 ) -> list[str]:
     """
     Собрать argv для вызова `claude -p` (список аргументов, не строка через shell).
@@ -149,7 +150,7 @@ def _build_cmd(
         "--tools", ",".join(allowed_tools),         # доступны ровно инструменты узла
         "--allowedTools", " ".join(allowed_tools),  # и они же одобрены без запроса
         *_ISOLATION_FLAGS,
-        "--model", MODEL,
+        "--model", model,
         "--effort", EFFORT,
     ]
     if max_budget_usd is not None:
@@ -296,6 +297,7 @@ def call(
     max_attempts: int = 3,
     timeout_s: int = 900,
     max_budget_usd: float | None = None,
+    model: str = MODEL,
 ) -> CallResult[ModelT]:
     """
     Вызвать `claude -p` с ретраями и вернуть провалидированный ответ.
@@ -335,7 +337,7 @@ def call(
     for attempt in range(1, max_attempts + 1):
         attempts_made = attempt
 
-        cmd = _build_cmd(message, schema_json, allowed_tools, resume_session_id, max_budget_usd)
+        cmd = _build_cmd(message, schema_json, allowed_tools, resume_session_id, max_budget_usd, model)
         outcome = _run_attempt(cmd, document, send_document, timeout_s, run_id, trace_name)
 
         session_id = outcome.session_id or session_id

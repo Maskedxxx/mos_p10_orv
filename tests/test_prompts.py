@@ -22,15 +22,16 @@ from app.config import (
     PROMPT_HYPOTHESES_VIOLATED,
     PROMPT_MERGE,
     PROMPT_PASSPORT,
+    PROMPT_DIALOG,
     PROMPT_REQUEST,
     PROMPTS_DIR,
     all_indicators,
     prompt_path,
 )
-from app.contracts import ActPassport, DataRequest, HypothesisMap, HypothesisSet
+from app.contracts import ActPassport, DataRequest, DialogTurn, HypothesisMap, HypothesisSet
 
 INDICATOR_PROMPTS = [prompt_path(ind.number) for ind in all_indicators()]
-NODE_PROMPTS = [PROMPT_HYPOTHESES_VIOLATED, PROMPT_HYPOTHESES_NO_DATA, PROMPT_MERGE, PROMPT_REQUEST]
+NODE_PROMPTS = [PROMPT_HYPOTHESES_VIOLATED, PROMPT_HYPOTHESES_NO_DATA, PROMPT_MERGE, PROMPT_REQUEST, PROMPT_DIALOG]
 PASSPORT_ROOTS = "requisites|status|addressee|nature|requirements|procedure|documents|deadlines|references|allocation|control"
 KEY_RE = re.compile(r"\b(?:" + PASSPORT_ROOTS + r")(?:\.[a-z_]+)+")
 VALUE_RE = re.compile(r"(?:" + PASSPORT_ROOTS + r")(?:\.[a-z_]+)+\s*=\s*«([^»]+)»")
@@ -83,7 +84,7 @@ def test_prompts_dir_has_exactly_the_expected_files():
     """17 промптов: паспорт + 12 индикаторов + 04a, 04b, 05, 06. Саммари больше нет."""
     names = sorted(p.name for p in PROMPTS_DIR.glob("*.md"))
     expected = sorted(
-        ["01_passport.md", "04a_hypotheses.md", "04b_hypotheses.md", "05_merge.md", "06_request.md"]
+        ["01_passport.md", "04a_hypotheses.md", "04b_hypotheses.md", "05_merge.md", "06_request.md", "07_dialog.md"]
         + [f"02_indicator_{n:02d}.md" for n in range(1, 13)]
     )
     assert names == expected
@@ -132,7 +133,8 @@ def _example_json(text: str, start_marker: str, end_marker: str) -> dict:
     (PROMPT_HYPOTHESES_NO_DATA, HypothesisSet, '{\n  "indicator": 10', "\n\nПоле where"),
     (PROMPT_MERGE, HypothesisMap, '{\n  "rows"', "\n\nПоле decisions"),
     (PROMPT_REQUEST, DataRequest, '{\n  "items"', "\n\nПоле years"),
-], ids=["04a", "04b", "05", "06"])
+    (PROMPT_DIALOG, DialogTurn, '{\n  "reply"', "\n\nПоле plan"),
+], ids=["04a", "04b", "05", "06", "07"])
 def test_example_in_prompt_validates_against_contract(path, model_cls, start, end):
     """Образец ответа в промпте обязан проходить контракт узла — иначе он учит
     модель невалидному ответу, который runner отвергнет."""

@@ -579,3 +579,11 @@ def test_model_is_sonnet_medium():
 
     assert MODEL == "sonnet"
     assert EFFORT == "medium"
+
+
+def test_build_cmd_model_override():
+    """Модель вызова задаётся параметром (оркестратор диалога — DIALOG_MODEL), по умолчанию — MODEL."""
+    from app.config import MODEL
+    assert _build_cmd("т", "{}", [], None, None)[_build_cmd("т", "{}", [], None, None).index("--model") + 1] == MODEL
+    cmd = _build_cmd("т", "{}", [], None, None, model="opus")
+    assert cmd[cmd.index("--model") + 1] == "opus"
