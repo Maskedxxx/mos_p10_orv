@@ -155,3 +155,10 @@ def test_no_prompt_mentions_summary_as_input():
     for path in INDICATOR_PROMPTS + NODE_PROMPTS:
         text = _read(path).lower()
         assert "саммари" not in text, path.name
+
+
+def test_request_prompt_knows_existing_blank_block():
+    """Промпт 06 описывает блок текущего бланка ровно под тем заголовком, что шлёт код (шаг 1.4)."""
+    from app.nodes.request import EXISTING_BLANK_HEADER
+    text = (PROMPTS_DIR / "06_request.md").read_text(encoding="utf-8")
+    assert EXISTING_BLANK_HEADER.removeprefix("## ") in text

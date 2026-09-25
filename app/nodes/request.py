@@ -48,6 +48,10 @@ from app.nodes.hypotheses import _add_cost_to_meta
 from app.runner import call
 from app.trace import save_json
 
+# Заголовок блока текущего бланка в режиме дополнения (план итерации 3, шаг 1.4).
+# Этот же текст описан в промпте 06_request.md — сверяет tests/test_prompts.py.
+EXISTING_BLANK_HEADER = "## УЖЕ В БЛАНКЕ (JSON)"
+
 
 def _request_years(effective_year: int | None, end_year: int | None = None) -> list[int]:
     """
@@ -72,6 +76,7 @@ def _build_document(
     years: list[int],
     document_md: str | None = None,
     passport: dict | None = None,
+    existing: DataRequest | None = None,
 ) -> str:
     """
     Собрать документ для stdin: текст акта, паспорт, карта гипотез, годы бланка —
@@ -95,6 +100,14 @@ def _build_document(
             "## ПАСПОРТ АКТА\n\n"
             f"```json\n{json.dumps(passport, ensure_ascii=False, indent=2)}\n```\n"
         )
+    if existing is not None:
+        # Режим дополнения: модель видит уже составленный бланк, чтобы не повторять
+        # его позиции; в карте при этом только новые строки
+        blank = [
+            {"num": it.num, "kind": it.kind, "metric": it.metric, "unit": it.unit, "clause": it.clause}
+            for it in existing.items
+        ]
+        parts.append(f"{EXISTING_BLANK_HEADER}\n\n```json\n{json.dumps(blank, ensure_ascii=False, indent=2)}\n```\n")
     parts.append("## КАРТА ГИПОТЕЗ (JSON)\n\n" f"```json\n{rows_json}\n```\n")
     parts.append("## ГОДЫ БЛАНКА (JSON)\n\n" f"```json\n{json.dumps(years)}\n```\n")
     return "\n".join(parts)
@@ -190,6 +203,14 @@ def _check_no_open_source_leaked(
             )
 
 
+def _append(existing: DataRequest, new: DataRequest) -> DataRequest:
+    """Дописать новые позиции после последнего номера бланка; существующие не трогаются."""
+    start = max((int(it.num) for it in existing.items), default=0) + 1
+    renumbered = [it.model_copy(update={"num": str(start + i)}) for i, it in enumerate(new.items)]
+    why_dropped = "\n".join(s for s in (existing.why_dropped, new.why_dropped) if s)
+    return DataRequest(items=existing.items + renumbered, years=existing.years, why_dropped=why_dropped)
+
+
 def build_request(
     hypothesis_map: HypothesisMap,
     run_id: str,
@@ -199,9 +220,19 @@ def build_request(
     effective_year: int | None = None,
     timeout_s: int = 900,
     max_budget_usd: float | None = None,
+    existing: DataRequest | None = None,
+    trace_prefix: str = "",
+    save: bool = True,
 ) -> DataRequest:
     """
     Узел [6] — собрать запрос показателей одним вызовом модели по готовой карте.
+
+    Режим дополнения (диалог, план итерации 3, шаг 1.4): existing — текущий бланк,
+    hypothesis_map — ТОЛЬКО новые строки карты. Модель составляет позиции под них,
+    код нумерует их после последнего номера бланка, годы берутся из бланка,
+    существующие позиции не меняются; при сбое модели бланк возвращается как был.
+    trace_prefix и save — как у узлов вердиктов и гипотез: своя папка сырых ответов,
+    кандидат без записи 07_request.json.
 
     Провал вызова возвращает пустой DataRequest с годами по умолчанию (см.
     docstring модуля), успешный ответ проходит две проверки-предупреждения,
@@ -210,25 +241,27 @@ def build_request(
     07_request.json. Стоимость прибавляется к уже записанной в meta.json.
     """
     logger = get_run_logger(run_id).getChild("07_request")
-    years = _request_years(effective_year)
+    # Годы дополняемого бланка не пересчитываются от сегодняшней даты — они уже в нём
+    years = existing.years if existing is not None else _request_years(effective_year)
 
     if not hypothesis_map.rows:
-        # Карта пуста (все индикаторы соблюдены/не применимы) — запрашивать
-        # нечего, вызывать модель незачем, это честный пустой результат.
-        logger.info("request: карта гипотез пуста, вызов модели пропущен")
-        value = DataRequest(items=[], years=years)
-        save_json(run_id, "07_request.json", value)
+        # Карта пуста (все индикаторы соблюдены/не применимы) либо новых строк нет —
+        # запрашивать нечего, вызывать модель незачем, это честный результат.
+        logger.info("request: строк карты нет, вызов модели пропущен")
+        value = existing if existing is not None else DataRequest(items=[], years=years)
+        if save:
+            save_json(run_id, "07_request.json", value)
         return value
 
     instruction = PROMPT_REQUEST.read_text(encoding="utf-8")
-    document = _build_document(hypothesis_map, years, document_md, passport)
+    document = _build_document(hypothesis_map, years, document_md, passport, existing)
 
     result = call(
         instruction,
         document,
         RequestOutput,   # строгая нумерация — в ответе модели (контракт, шаг 1.3)
         run_id=run_id,
-        trace_name="07_request.raw.json",
+        trace_name=f"{trace_prefix}07_request.raw.json",
         allowed_tools=ALLOWED_TOOLS_TEXT,
         timeout_s=timeout_s,
         max_budget_usd=max_budget_usd,
@@ -236,18 +269,21 @@ def build_request(
 
     if not result.ok or result.value is None:
         logger.warning(
-            "request: вызов модели провалился (%s) — пустой запрос, годы по умолчанию",
-            result.error,
+            "request: вызов модели провалился (%s) — %s",
+            result.error, "бланк без изменений" if existing is not None else "пустой запрос, годы по умолчанию",
         )
-        value = DataRequest(items=[], years=years)
+        value = existing if existing is not None else DataRequest(items=[], years=years)
     else:
         # Годы — только от кода: модель их переписывает из входа, но решает не она
         value = result.value.model_copy(update={"years": years})
         _check_for_rows_exist(value, _valid_row_ids(hypothesis_map), logger)
         _check_no_open_source_leaked(value, _rows_with_internal_data(hypothesis_map), logger)
         _check_coverage(hypothesis_map, value, logger)
+        if existing is not None:
+            value = _append(existing, value)
 
-    save_json(run_id, "07_request.json", value)
+    if save:
+        save_json(run_id, "07_request.json", value)
     _add_cost_to_meta(run_id, result.cost_usd)
 
     logger.info(

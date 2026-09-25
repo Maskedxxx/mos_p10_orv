@@ -311,3 +311,100 @@ def test_result_years_taken_from_code_not_model(run_id, tmp_prompt, monkeypatch)
     monkeypatch.setattr(request_module, "call", Mock(return_value=_ok_call_result(req)))
     value = build_request(hyp_map, run_id, effective_year=2025)
     assert value.years == _request_years(effective_year=2025)
+
+
+# ---- Режим дополнения (план итерации 3, шаг 1.4) ----
+# В диалоговом режиме новые строки карты получают позиции запроса, а позиции,
+# которые эксперт уже оценил, не трогаются: узлу передают только новые строки
+# и текущий бланк (existing), модель видит бланк отдельным блоком и составляет
+# позиции только под новые строки, код нумерует их после последнего номера.
+
+
+def _existing_request() -> DataRequest:
+    """Бланк версии с дыркой после удаления позиции № 3."""
+    return DataRequest(
+        items=[
+            _item("1", "количество заявок (п. 2.1)", [1], [(1, "показатель 1")], unit="ед."),
+            _item("2", "количество отказов (п. 2.15)", [2], [(2, "показатель 2")], unit="ед."),
+            _item("4", "перечень договоров (п. 3.1)", [4], [(4, "показатель 4")],
+                  kind="перечень или реестр"),
+        ],
+        years=[2023, 2024, 2025],
+        why_dropped="строка 2, «позиция органа» — не показатель",
+    )
+
+
+def test_append_numbers_after_last_and_keeps_existing(run_id, tmp_prompt, monkeypatch):
+    """Новые позиции получают номера после последнего, существующие не меняются, годы — из бланка."""
+    existing = _existing_request()
+    model_answer = DataRequest(
+        items=[_item("1", "количество проверок (п. 4.1)", [7], [(7, "показатель 7")], unit="ед.")],
+        years=[2025], why_dropped="строка 7, «показатель 7а» — покрыт позицией № 1",
+    )
+    monkeypatch.setattr(request_module, "call", Mock(return_value=_ok_call_result(model_answer)))
+
+    result = build_request(_map([_row(7)]), run_id, existing=existing)
+
+    assert [it.num for it in result.items] == ["1", "2", "4", "5"]
+    assert result.items[:3] == existing.items
+    assert result.items[3].metric == "количество проверок (п. 4.1)"
+    assert result.years == [2023, 2024, 2025]
+    assert "позиция органа" in result.why_dropped and "покрыт позицией № 1" in result.why_dropped
+
+
+def test_append_document_shows_existing_blank(run_id, tmp_prompt, monkeypatch):
+    """Модель видит текущий бланк отдельным блоком и только новые строки карты."""
+    existing = _existing_request()
+    seen = {}
+
+    def _effect(instruction, document, model_cls, **kwargs):
+        seen["document"] = document
+        return _ok_call_result(DataRequest(items=[], years=[2025]))
+
+    monkeypatch.setattr(request_module, "call", Mock(side_effect=_effect))
+
+    build_request(_map([_row(7)]), run_id, existing=existing)
+
+    doc = seen["document"]
+    assert request_module.EXISTING_BLANK_HEADER in doc
+    assert "количество отказов (п. 2.15)" in doc
+    assert '"row_id": 7' in doc and '"row_id": 1' not in doc
+
+
+def test_append_failure_keeps_existing_blank(run_id, tmp_prompt, monkeypatch):
+    """Сбой модели в режиме дополнения не стирает бланк."""
+    existing = _existing_request()
+    monkeypatch.setattr(request_module, "call", Mock(return_value=_failed_call_result()))
+
+    result = build_request(_map([_row(7)]), run_id, existing=existing)
+
+    assert result == existing
+
+
+def test_append_without_new_rows_skips_model(run_id, tmp_prompt, monkeypatch):
+    """Нет новых строк — модель не вызывается, бланк возвращается как был."""
+    existing = _existing_request()
+    mock_call = Mock()
+    monkeypatch.setattr(request_module, "call", mock_call)
+
+    result = build_request(_map([]), run_id, existing=existing)
+
+    assert result == existing
+    mock_call.assert_not_called()
+
+
+def test_append_trace_prefix_and_candidate_without_writing(run_id, tmp_prompt, monkeypatch):
+    """Сырые ответы — под префиксом; save=False — 07_request.json не пишется."""
+    existing = _existing_request()
+    seen = {}
+
+    def _effect(instruction, document, model_cls, **kwargs):
+        seen["trace_name"] = kwargs["trace_name"]
+        return _ok_call_result(DataRequest(items=[], years=[2025]))
+
+    monkeypatch.setattr(request_module, "call", Mock(side_effect=_effect))
+
+    build_request(_map([_row(7)]), run_id, existing=existing, trace_prefix="dialog/v4/", save=False)
+
+    assert seen["trace_name"] == "dialog/v4/07_request.raw.json"
+    assert not (run_dir(run_id) / "07_request.json").exists()
