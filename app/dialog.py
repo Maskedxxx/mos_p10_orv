@@ -21,12 +21,13 @@ from dataclasses import dataclass, field
 
 from app import versions
 from app.config import ALLOWED_TOOLS_TEXT, DIALOG_MODEL, PROMPT_DIALOG
-from app.contracts import DialogTurn, Operation
+from app.contracts import DialogTurn, Operation, Remark
 from app.nodes.hypotheses import _add_cost_to_meta
 from app.runner import call
-from app.trace import run_dir
+from app.trace import run_dir, save_bytes
 
 CHAT = "dialog/chat.jsonl"
+REMARKS = "dialog/remarks.json"   # очередь замечаний из файла эксперта
 HISTORY_MESSAGES = 16       # сколько последних реплик чата уходит модели
 _ROLES = ("пользователь", "ассистент", "сервис")
 
@@ -108,3 +109,31 @@ def turn(run_id: str, message: str, *, timeout_s: int = 900) -> TurnResult:
     append_chat(run_id, "ассистент", value.reply, plan=[op.model_dump(mode="json") for op in value.plan],
                 cost_usd=round(result.cost_usd, 4))
     return TurnResult(reply=value.reply, plan=list(value.plan), cost_usd=result.cost_usd)
+
+
+def save_remarks(run_id: str, file_name: str, remarks: list[Remark]) -> None:
+    """Очередь замечаний из файла эксперта; новый файл заменяет прежнюю очередь."""
+    data = {"file": file_name, "next": 0, "remarks": [r.model_dump(mode="json") for r in remarks]}
+    save_bytes(run_id, REMARKS, json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"))
+
+
+def _load_remarks(run_id: str) -> dict | None:
+    path = run_dir(run_id) / REMARKS
+    return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
+
+
+def remarks_progress(run_id: str) -> tuple[int, int] | None:
+    """(сколько замечаний уже ушло в диалог, сколько всего); None — файла эксперта не было."""
+    data = _load_remarks(run_id)
+    return None if data is None else (data["next"], len(data["remarks"]))
+
+
+def next_remark(run_id: str) -> Remark | None:
+    """Взять следующее замечание и сдвинуть очередь; None — очередь разобрана."""
+    data = _load_remarks(run_id)
+    if data is None or data["next"] >= len(data["remarks"]):
+        return None
+    remark = Remark.model_validate(data["remarks"][data["next"]])
+    data["next"] += 1
+    save_bytes(run_id, REMARKS, json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"))
+    return remark

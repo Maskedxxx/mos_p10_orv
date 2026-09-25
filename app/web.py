@@ -34,6 +34,14 @@
 семь минут, поэтому исполняется в отдельном потоке через nicegui.run.io_bound:
 событийный цикл остаётся свободным и страница не встаёт.
 
+ДИАЛОГ С РЕЗУЛЬТАТОМ (итерация 3). Под карточкой готового прогона — панель
+«Работа с результатом»: чат с помощником (app/dialog.py), план из закрытого списка
+операций с кнопками «Применить» / «Отменить», «было — стало» для шагов с агентом
+(«Принять» / «Отклонить»), версии файла со скачиванием и возвратом, очередь
+замечаний из заполненного экспертом Excel (app/feedback.py). Выполняет план
+app/operations.py; каждое изменение — новая версия (app/versions.py). Панель, как
+и граф, перечитывает диск по таймеру; правит одно окно, остальные — только смотрят.
+
 ИМЯ АКТА. Загруженный файл ложится в папку прогона под служебным именем
 00_input.docx, и именно его видит оркестратор — в progress.json попадает
 «00_input.docx». Оригинальное имя сохраняет trace.new_run() в meta.json, оттуда
@@ -44,6 +52,8 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import html
+import json
 import math
 import time
 from collections.abc import Callable
@@ -54,6 +64,7 @@ from typing import Literal
 
 from fastapi import Request
 from fastapi.responses import RedirectResponse
+from pydantic import TypeAdapter
 from nicegui import app as nicegui_app
 from nicegui import run as nicegui_run
 from nicegui import ui
@@ -62,9 +73,11 @@ from nicegui.storage import Storage
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.responses import Response
 
-from app import config, trace
+from app import config, dialog, feedback, operations, trace, versions
 from app.config import ACCEPTED_EXTENSIONS, all_indicators
-from app.contracts import NodeState, NodeStatus, RunMeta, RunProgress, RunStatus
+from app.contracts import (
+    Buckets, DataRequest, HypothesisMap, Marks, NodeState, NodeStatus, Operation, RunMeta, RunProgress, RunStatus,
+)
 from app.logger import get_run_logger
 from app.pipeline import PROGRESS_FILE, run_pipeline
 
@@ -397,6 +410,168 @@ class RunQueue:
 
 # Единственная очередь сервиса: одна на процесс, общая для всех вкладок
 QUEUE = RunQueue()
+
+
+# ======================================================================
+# Логика: диалог с результатом прогона (итерация 3)
+# ======================================================================
+
+# Как часто панель диалога перечитывает чат и версии с диска — второе окно видит то же
+DIALOG_POLL_S = 2.0
+
+# Сколько окно держит замок правки без продления: окно, пропавшее без отключения
+# (сон ноутбука, обрыв сети), через это время отдаёт правку другому окну
+DIALOG_LOCK_TTL_S = 15.0
+
+DIALOG_OLD_RUN = "Диалог работает с прогонами версии 2.4 и новее — этот прогон собран по старым правилам."
+DIALOG_READ_ONLY = "Этот прогон правят в другом окне — здесь только просмотр. Правка откроется, когда то окно закроют."
+
+_OPERATION = TypeAdapter(Operation)
+
+
+def dialog_unavailable(run_id: str, progress: RunProgress | None) -> str | None:
+    """Почему диалог по прогону недоступен; None — доступен (завершён без сбоя, артефакты v2.4+)."""
+    if progress is None or progress.status != "готов":
+        return "Диалог доступен после успешного завершения прогона."
+    try:
+        trace.load_json(run_id, "06_map.json", HypothesisMap)
+        trace.load_json(run_id, "07_request.json", DataRequest)
+        trace.load_json(run_id, "04_buckets.json", Buckets)
+    except Exception:
+        return DIALOG_OLD_RUN
+    return None
+
+
+class DialogLock:
+    """
+    Замок правки прогона: правит одно окно, остальные окна того же прогона —
+    только просмотр. Окно-хозяин продлевает замок на каждом опросе; время
+    передаётся параметром, как в LoginThrottle, — чтобы тест не спал.
+    """
+
+    def __init__(self, ttl_s: float = DIALOG_LOCK_TTL_S) -> None:
+        self._ttl_s = ttl_s
+        self._held: dict[str, tuple[str, float]] = {}   # прогон → (окно, когда продлён)
+
+    def acquire(self, run_id: str, client_id: str, now: float) -> bool:
+        """Взять или продлить замок; False — прогон правит другое окно."""
+        holder = self._held.get(run_id)
+        if holder is None or holder[0] == client_id or now - holder[1] > self._ttl_s:
+            self._held[run_id] = (client_id, now)
+            return True
+        return False
+
+    def release(self, run_id: str, client_id: str) -> None:
+        """Снять замок при закрытии окна — только свой."""
+        if self._held.get(run_id, ("", 0.0))[0] == client_id:
+            del self._held[run_id]
+
+
+DIALOG_LOCK = DialogLock()
+
+
+def op_title(op: Operation) -> str:
+    """Шаг плана человеческими словами — для карточки плана."""
+    kind = op.kind
+    if kind == "правка текста":
+        where = {"вердикт": f"Вердикты, индикатор {op.key}", "строка карты": f"строка карты {op.key}",
+                 "позиция запроса": f"позиция запроса {op.key}"}[op.sheet]
+        effect = f", эффект {op.effect_index}" if op.effect_index else ""
+        return f"Поправить текст — {where}, поле «{op.field}»{effect}: «{shorten(op.new_text, 400)}»"
+    if kind == "смена вердикта":
+        return f"Сменить вердикт индикатора {op.indicator} на «{op.verdict}»: {shorten(op.rationale, 300)}"
+    if kind == "удалить строку карты":
+        return f"Удалить строку карты {op.row_id}"
+    if kind == "добавить строку карты":
+        indicators = ", ".join(map(str, op.indicators))
+        return f"Добавить строку карты (индикаторы {indicators}): «{shorten(op.hypothesis, 300)}»"
+    if kind == "слить строки карты":
+        rows = ", ".join(map(str, op.row_ids))
+        return f"Слить строки карты {rows} в одну: «{shorten(op.hypothesis, 300)}»"
+    if kind == "удалить позицию запроса":
+        return f"Удалить позицию запроса {op.num}"
+    if kind == "разделить позицию запроса":
+        parts = "; ".join(f"«{part.metric}», {part.unit}" for part in op.parts)
+        return f"Разделить позицию запроса {op.num} на {len(op.parts)}: {parts}"
+    if kind == "перепроверить индикатор":
+        return f"Перепроверить индикатор {op.indicator} его агентом. Уточнение задачи: {shorten(op.clarification, 300)}"
+    if kind == "построить гипотезы":
+        return f"Построить гипотезы по индикатору {op.indicator} агентом гипотез"
+    return f"Дополнить запрос под строки карты {', '.join(map(str, op.row_ids))} агентом запроса"
+
+
+def _raw_cost(run_id: str, relname: str) -> float | None:
+    """Стоимость вызова из его сырого ответа (последняя запись CLI — итог с total_cost_usd)."""
+    try:
+        data = json.loads((trace.run_dir(run_id) / relname).read_text(encoding="utf-8"))
+        return float((data[-1] if isinstance(data, list) else data)["total_cost_usd"])
+    except Exception:
+        return None
+
+
+def estimate_cost(run_id: str, op: Operation) -> float | None:
+    """
+    Цена платного шага до запуска — сколько тот же агент стоил в исходном прогоне
+    этого акта. None — шаг без агента или сырого ответа нет (цена будет после выполнения).
+    """
+    if op.kind == "перепроверить индикатор":
+        return _raw_cost(run_id, f"03_verdicts/{op.indicator:02d}.raw.json")
+    if op.kind == "построить гипотезы":
+        folder = trace.run_dir(run_id) / "05_hypotheses"
+        costs = [c for p in sorted(folder.glob("[0-9][0-9].raw.json"))
+                 if (c := _raw_cost(run_id, f"05_hypotheses/{p.name}")) is not None]
+        return sum(costs) / len(costs) if costs else None
+    if op.kind == "дополнить запрос":
+        return _raw_cost(run_id, "07_request.raw.json")
+    return None
+
+
+def cost_note(op: Operation, cost: float | None) -> str:
+    """Подпись цены у шага плана."""
+    if not operations.is_model_op(op):
+        return "без агента · бесплатно"
+    return "агент · цена — после выполнения" if cost is None else f"агент · ≈ {format_cost(cost)}"
+
+
+def pending_plan(chat: list[dict]) -> list[Operation]:
+    """План последнего ответа помощника, если после него ничего не было, — он ждёт решения."""
+    if not chat or chat[-1]["role"] != "ассистент":
+        return []
+    return [_OPERATION.validate_python(p) for p in chat[-1].get("plan") or []]
+
+
+def stale_notes(before: Marks, after: Marks) -> list[str]:
+    """Что шаг пометил «устарело» — только новые пометки, по листам."""
+    notes = []
+    for label, old, new in (("Вердикты, инд.", before.stale_verdicts, after.stale_verdicts),
+                            ("строка карты", before.stale_rows, after.stale_rows),
+                            ("позиция запроса", before.stale_items, after.stale_items)):
+        notes += [f"{label} {key}: {why}" for key, why in new.items() if old.get(key) != why]
+    return notes
+
+
+def step_text(result: operations.StepResult) -> str:
+    """Итог шага для чата: версия, что изменилось, «было — стало»."""
+    change = result.change
+    head = f"Версия {result.version}. {change.target} — {change.action}"
+    if change.before is None and change.after is None:
+        return head
+    before, after = change.before or "—", change.after or "—"
+    if len(before) + len(after) <= 80:
+        return f"{head}: «{before}» → «{after}»"
+    return f"{head}\nБыло: {shorten(before, 800)}\nСтало: {shorten(after, 1500)}"
+
+
+def version_rows(run_id: str) -> list[tuple[int, str]]:
+    """Версии файла от новой к исходной: номер и что в ней изменилось. Пусто — диалога ещё не было."""
+    state = versions.load_state(run_id)
+    if state is None:
+        return []
+    changes: dict[int, list[str]] = {}
+    for entry in versions.read_journal(run_id):
+        changes.setdefault(entry.version, []).append(f"{entry.at[11:16]} · {entry.target} — {entry.action}")
+    rows = [(n, "; ".join(changes.get(n, []))) for n in range(state.current, 0, -1)]
+    return rows + [(0, "исходный разбор сервиса")]
 
 
 # ======================================================================
@@ -802,7 +977,28 @@ class _RunView:
     # ---- результат ----
 
     def _show_result(self, progress: RunProgress) -> None:
-        """Экран результата: сводка прогона и кнопка скачивания Excel."""
+        """
+        Экран результата: карточка сводки и скачивания, под ней — диалог с результатом
+        (итерация 3). Карточка перерисовывается после каждой новой версии файла.
+        """
+        with self._result:
+            self._card_box = ui.column().classes("w-full")
+        self._draw_result(progress)
+        reason = dialog_unavailable(self._run_id, progress)
+        with self._result:
+            if reason is None:
+                _DialogView(self._run_id, on_version=self._refresh_result)
+            elif progress.status == "готов":
+                ui.label(reason).classes("text-sm text-gray-600")
+
+    def _refresh_result(self) -> None:
+        """Новая версия файла: сводка и кнопка скачивания — по текущей версии."""
+        progress = read_progress(self._run_id)
+        if progress is not None:
+            self._draw_result(progress)
+
+    def _draw_result(self, progress: RunProgress) -> None:
+        """Карточка результата: сводка прогона и кнопка скачивания Excel текущей версии."""
         started = parse_moment(progress.started_at)
         finished = parse_moment(progress.finished_at)
         elapsed = (finished - started).total_seconds() if started and finished else 0.0
@@ -810,7 +1006,8 @@ class _RunView:
         act = read_act_filename(self._run_id, progress)
         is_ok = progress.status == "готов"
 
-        with self._result, ui.card().classes("w-full p-0"):
+        self._card_box.clear()
+        with self._card_box, ui.card().classes("w-full p-0"):
             with ui.row().classes("w-full items-center flex-nowrap gap-3 p-5"):
                 if is_ok:
                     ui.icon("check_circle", color="positive").classes("text-2xl")
@@ -846,15 +1043,337 @@ class _RunView:
                     ).classes("text-sm text-gray-700")
 
                 if excel is not None:
+                    state = versions.load_state(self._run_id)
+                    version = state.current if state is not None else None
                     ui.button(
-                        "Скачать Excel",
+                        "Скачать Excel" + (f" · версия {version}" if version else ""),
                         icon="download",
-                        on_click=lambda: ui.download.file(excel, download_filename(act)),
+                        on_click=lambda: ui.download.file(excel, download_filename(act, version)),
                     ).props("unelevated")
                 else:
                     ui.label("Файл Excel не собран — скачивать нечего.").classes(
                         "text-sm text-gray-600"
                     )
+
+
+class _DialogView:
+    """
+    Панель «Работа с результатом» (итерация 3): чат с помощником, план с
+    подтверждением, «было — стало» для шагов с агентом, версии файла, очередь
+    замечаний эксперта.
+
+    Источник правды — диск, как у графа: чат — dialog/chat.jsonl, версии —
+    versions/. Панель перечитывает их по таймеру, поэтому второе окно того же
+    прогона видит всё то же, но правит только одно окно (DIALOG_LOCK). Долгие
+    вызовы (ход помощника, шаг с агентом) идут в потоке через nicegui.run.io_bound —
+    страница не встаёт.
+    """
+
+    def __init__(self, run_id: str, on_version: Callable[[], None]) -> None:
+        self._run_id = run_id
+        self._on_version = on_version
+        self._client_id = ui.context.client.id
+        self._editable: bool | None = None
+        self._busy = False
+        self._session_cost = 0.0
+        self._shown_chat = -1      # сколько реплик отрисовано
+        self._shown_version = -1   # какая версия отрисована в списке версий
+        self._decision: asyncio.Future | None = None   # ждёт «Принять» / «Отклонить»
+
+        with ui.card().classes("w-full p-0"):
+            with ui.row().classes("w-full items-center flex-nowrap gap-3 px-5 py-4"):
+                ui.icon("forum", color="primary").classes("text-2xl")
+                ui.label("Работа с результатом").classes("text-lg font-medium")
+                ui.space()
+                self._status = ui.label("").classes("text-sm text-gray-600 text-right")
+            ui.separator()
+            with ui.column().classes("w-full p-5 gap-3"):
+                ui.label(
+                    "Спросите, почему такой вердикт или откуда гипотеза; попросите поправить текст; "
+                    "передайте решение эксперта или загрузите его заполненный файл. Каждое изменение — "
+                    "новая версия Excel, исходная остаётся."
+                ).classes("text-sm text-gray-700")
+                self._lock_note = ui.label("").classes("text-sm text-amber-800")
+                self._scroll = ui.scroll_area().classes("w-full h-96 border rounded")
+                with self._scroll:
+                    self._chat = ui.column().classes("w-full gap-1 p-2")
+                self._pending = ui.column().classes("w-full gap-2")
+                with ui.row().classes("items-center flex-nowrap gap-2") as self._busy_row:
+                    ui.spinner(size="sm", color="primary")
+                    self._busy_label = ui.label("").classes("text-sm text-gray-700")
+                self._busy_row.set_visibility(False)
+                with ui.row().classes("w-full items-end flex-nowrap gap-2"):
+                    self._input = (
+                        ui.textarea(placeholder="Например: «Почему индикатор 3 нарушен?» или "
+                                                "«Эксперт считает, что строка карты 2 лишняя». Ctrl+Enter — отправить")
+                        .props("outlined autogrow")
+                        .classes("flex-grow")
+                    )
+                    self._send = ui.button(icon="send", on_click=self._on_send).props("unelevated")
+                with ui.row().classes("w-full items-center gap-3"):
+                    # Сам загрузчик спрятан — файл выбирается кнопкой, так панель не распухает
+                    self._upload = (
+                        ui.upload(on_upload=self._on_expert_file, auto_upload=True, max_files=1,
+                                  max_file_size=MAX_UPLOAD_BYTES)
+                        .props('accept=".xlsx"')
+                        .classes("hidden")
+                    )
+                    self._upload_button = ui.button(
+                        "Загрузить файл эксперта", icon="upload_file",
+                        on_click=lambda: self._upload.run_method("pickFiles"),
+                    ).props("outline")
+                    self._next = ui.button("", icon="skip_next", on_click=self._on_next_remark).props("outline")
+            ui.separator()
+            with ui.expansion("Версии файла", icon="history").classes("w-full"):
+                self._versions = ui.column().classes("w-full gap-2 px-2 pb-3")
+
+        self._input.on("keydown.ctrl.enter", self._on_send)
+        client = ui.context.client
+        client.on_disconnect(lambda: DIALOG_LOCK.release(self._run_id, self._client_id))
+        client.on_delete(lambda: self._resolve(False))   # окно закрыли, не решив — кандидат не записан
+        ui.timer(DIALOG_POLL_S, self._tick)
+        self._tick()
+
+    # ---- опрос диска ----
+
+    def _tick(self) -> None:
+        """Продлить замок, перечитать чат и версии, обновить кнопки."""
+        editable = DIALOG_LOCK.acquire(self._run_id, self._client_id, time.monotonic())
+        if editable != self._editable:
+            self._editable = editable
+            _RunView._set_text(self._lock_note, "" if editable else DIALOG_READ_ONLY)
+            self._shown_chat = self._shown_version = -1   # кнопки плана и версий — только у правящего окна
+        chat = dialog.read_chat(self._run_id)
+        if len(chat) != self._shown_chat:
+            self._shown_chat = len(chat)
+            self._render_chat(chat)
+            self._render_pending(chat)
+        state = versions.load_state(self._run_id)
+        current = state.current if state is not None else 0
+        if current != self._shown_version:
+            self._shown_version = current
+            self._render_versions()
+        self._render_controls(current)
+
+    def _render_controls(self, current: int) -> None:
+        active = bool(self._editable) and not self._busy
+        for element in (self._input, self._send, self._upload_button, self._next):
+            element.set_enabled(active)
+        progress = dialog.remarks_progress(self._run_id)
+        left = progress is not None and progress[0] < progress[1]
+        self._next.set_visibility(left)
+        if left:
+            _RunView._set_text(self._next, f"Следующее замечание эксперта ({progress[0] + 1} из {progress[1]})")
+        status = f"версия {current} · в этом окне потрачено {format_cost(self._session_cost)}"
+        _RunView._set_text(self._status, status)
+
+    def _render_chat(self, chat: list[dict]) -> None:
+        self._chat.clear()
+        with self._chat:
+            if not chat:
+                ui.label("Здесь будет переписка с помощником.").classes("text-sm text-gray-500 p-2")
+            for message in chat:
+                if message["role"] == "сервис":
+                    ui.label(message["text"]).classes(
+                        "w-full text-xs text-gray-700 whitespace-pre-line px-3 py-2 bg-gray-100 rounded"
+                    )
+                    continue
+                mine = message["role"] == "пользователь"
+                stamp = message.get("at", "")[11:16]
+                if message.get("cost_usd"):
+                    stamp += f" · {format_cost(message['cost_usd'])}"
+                ui.chat_message(
+                    text=html.escape(message["text"]).replace("\n", "<br>"), text_html=True,
+                    name="Вы" if mine else "Помощник", sent=mine, stamp=stamp,
+                ).classes("w-full")
+        self._scroll.scroll_to(percent=1.0)
+
+    def _render_pending(self, chat: list[dict]) -> None:
+        """Карточка плана последнего ответа помощника: шаги, цена, «Применить» / «Отменить»."""
+        self._pending.clear()
+        plan = [] if self._busy else pending_plan(chat)
+        if not plan:
+            return
+        costs = [estimate_cost(self._run_id, op) for op in plan]
+        with self._pending, ui.card().classes("w-full p-4 gap-2 border-l-4 border-blue-400"):
+            ui.label(f"План: {len(plan)} {plural(len(plan), 'шаг', 'шага', 'шагов')}").classes("font-medium")
+            for number, (op, cost) in enumerate(zip(plan, costs), 1):
+                with ui.row().classes("w-full flex-nowrap items-start gap-3"):
+                    ui.label(f"{number}. {op_title(op)}").classes("text-sm flex-grow whitespace-pre-line")
+                    ui.label(cost_note(op, cost)).classes("text-xs text-gray-600 whitespace-nowrap")
+            paid = [c for op, c in zip(plan, costs) if operations.is_model_op(op) and c is not None]
+            if paid:
+                ui.label(f"Платные шаги — около {format_cost(sum(paid))}; «было — стало» покажу до записи.").classes(
+                    "text-xs text-gray-600"
+                )
+            if self._editable:
+                with ui.row().classes("gap-2"):
+                    ui.button("Применить", icon="check", on_click=lambda: self._apply_plan(plan)).props("unelevated")
+                    ui.button("Отменить", on_click=self._cancel_plan).props("flat")
+
+    def _render_versions(self) -> None:
+        self._versions.clear()
+        act = read_act_filename(self._run_id)
+        rows = version_rows(self._run_id)
+        with self._versions:
+            if not rows:
+                ui.label("Изменений ещё не было — файл в исходной версии.").classes("text-sm text-gray-600")
+                return
+            current = rows[0][0]
+            for n, what in rows:
+                path = trace.run_dir(self._run_id) / versions.VERSIONS / f"v{n}" / EXCEL_FILE
+                with ui.row().classes("w-full items-start flex-nowrap gap-3"):
+                    ui.label(f"v{n}" + (" · текущая" if n == current else "")).classes(
+                        "text-sm font-medium w-28 shrink-0"
+                    )
+                    ui.label(what).classes("text-sm text-gray-700 flex-grow")
+                    ui.button(
+                        icon="download", on_click=lambda p=path, n=n: ui.download.file(p, download_filename(act, n))
+                    ).props("flat dense").tooltip("Скачать эту версию")
+                    if n != current and self._editable:
+                        ui.button("Вернуть", on_click=lambda n=n: self._rollback(n)).props("flat dense").tooltip(
+                            "Сделать новую версию с содержимым этой — ничего не стирается"
+                        )
+
+    # ---- действия ----
+
+    def _set_busy(self, text: str | None) -> None:
+        self._busy = text is not None
+        self._busy_row.set_visibility(self._busy)
+        _RunView._set_text(self._busy_label, text or "")
+        self._shown_chat = -1   # перерисовать чат и карточку плана на следующем опросе
+        self._tick()
+
+    def _resolve(self, accepted: bool) -> None:
+        if self._decision is not None and not self._decision.done():
+            self._decision.set_result(accepted)
+
+    async def _turn(self, text: str) -> None:
+        """Ход помощника: ответ и, может быть, план — всё пишется в чат."""
+        if pending_plan(dialog.read_chat(self._run_id)):
+            dialog.append_chat(self._run_id, "сервис", "План выше не применён.")
+        self._set_busy("Помощник думает… обычно 10–30 секунд")
+        try:
+            result = await nicegui_run.io_bound(dialog.turn, self._run_id, text)
+            self._session_cost += result.cost_usd
+        except Exception as error:   # сбой вне вызова модели (диск, чтение артефактов) — в чат, страница живёт
+            dialog.append_chat(self._run_id, "сервис", f"Сбой хода помощника: {error}")
+        finally:
+            self._set_busy(None)
+
+    async def _on_send(self) -> None:
+        text = (self._input.value or "").strip()
+        if not text or self._busy or not self._editable:
+            return
+        self._input.set_value("")
+        await self._turn(text)
+
+    async def _on_next_remark(self) -> None:
+        if self._busy or not self._editable:
+            return
+        remark = dialog.next_remark(self._run_id)
+        if remark is not None:
+            await self._turn(feedback.remark_message(remark))
+
+    async def _on_expert_file(self, event: UploadEventArguments) -> None:
+        """Файл эксперта: замечания — в очередь, согласия и оценки без текста — сводкой в чат."""
+        name = Path(event.file.name).name
+        data = await event.file.read()
+        self._upload.reset()
+        if not name.lower().endswith(".xlsx"):
+            ui.notify("Нужен заполненный экспертом Excel этого прогона (.xlsx)", type="warning")
+            return
+        relname = f"dialog/expert/{name}"
+        trace.save_bytes(self._run_id, relname, data)
+        try:
+            remarks = feedback.read_remarks(trace.run_dir(self._run_id) / relname)
+        except Exception as error:
+            ui.notify(f"Файл не разобран: {error}", type="negative")
+            return
+        queued = [r for r in remarks if feedback.is_queued(r)]
+        dialog.save_remarks(self._run_id, name, queued)
+        n = len(queued)
+        text = (f"Загружен файл эксперта «{name}»: в очереди {n} {plural(n, 'замечание', 'замечания', 'замечаний')} "
+                "(несогласия и замечания с текстом). Разбор по одному — кнопка «Следующее замечание эксперта».")
+        summary = feedback.summary(remarks)
+        dialog.append_chat(self._run_id, "сервис", text + (f"\n{summary}" if summary else ""))
+        self._tick()
+
+    def _cancel_plan(self) -> None:
+        dialog.append_chat(self._run_id, "сервис", "План отменён — файл не изменён.")
+        self._tick()
+
+    async def _decide(self, title: str, candidate: operations.Candidate) -> bool:
+        """Показать «было — стало» результата агента и дождаться «Принять» / «Отклонить»."""
+        self._decision = asyncio.get_running_loop().create_future()
+        self._pending.clear()
+        with self._pending, ui.card().classes("w-full p-4 gap-2 border-l-4 border-amber-400"):
+            ui.label(title).classes("font-medium")
+            ui.label(
+                f"Агент отработал, стоимость {format_cost(candidate.cost_usd)}. В файл запишется только после «Принять»."
+            ).classes("text-xs text-gray-600")
+            with ui.row().classes("w-full flex-nowrap gap-4 items-start"):
+                for caption, text in (("Было", candidate.before), ("Стало", candidate.after)):
+                    with ui.column().classes("w-1/2 gap-1"):
+                        ui.label(caption).classes("text-xs uppercase text-gray-500")
+                        ui.label(text).classes("text-sm whitespace-pre-line")
+            with ui.row().classes("gap-2"):
+                ui.button("Принять", icon="check", on_click=lambda: self._resolve(True)).props("unelevated")
+                ui.button("Отклонить", on_click=lambda: self._resolve(False)).props("flat")
+        try:
+            return await self._decision
+        finally:
+            self._decision = None
+            self._pending.clear()
+
+    async def _apply_plan(self, plan: list[Operation]) -> None:
+        """Шаги плана по одному: результат каждого — в чат; сбой останавливает остальные."""
+        if self._busy or not self._editable:
+            return
+        rid, total = self._run_id, len(plan)
+        dialog.append_chat(rid, "сервис", f"Применяю план: {total} {plural(total, 'шаг', 'шага', 'шагов')}.")
+        for number, op in enumerate(plan, 1):
+            title = f"Шаг {number} из {total}: {op_title(op)}"
+            slow = " — агент работает, это может занять несколько минут" if operations.is_model_op(op) else ""
+            self._set_busy(shorten(title, 160) + slow)
+            before = versions.load_state(rid)
+            try:
+                result = await nicegui_run.io_bound(operations.run_step, rid, op)
+                if result.candidate is not None:
+                    self._session_cost += result.cost_usd
+                    self._set_busy(None)
+                    self._busy = True   # ввод закрыт, пока пользователь решает
+                    self._render_controls(self._shown_version)
+                    accepted = await self._decide(title, result.candidate)
+                    if not accepted:
+                        dialog.append_chat(rid, "сервис", f"Шаг {number} отклонён — файл не изменён.",
+                                           cost_usd=round(result.cost_usd, 4))
+                        continue
+                    self._set_busy("Записываю…")
+                    result = await nicegui_run.io_bound(operations.accept, rid, result.candidate)
+            except Exception as error:   # OperationError — понятная причина; остальное — сбой, корень уже откатан
+                why = str(error) if isinstance(error, operations.OperationError) else f"сбой: {error}"
+                dialog.append_chat(rid, "сервис", f"Шаг {number} не выполнен — {why}. Остальные шаги плана отменены.")
+                break
+            notes = stale_notes(before.marks if before is not None else Marks(), versions.load_state(rid).marks)
+            text = step_text(result) + ("\nУстарело: " + "; ".join(notes) if notes else "")
+            dialog.append_chat(rid, "сервис", text, version=result.version, cost_usd=round(result.cost_usd, 4))
+            self._on_version()
+        self._set_busy(None)
+
+    async def _rollback(self, n: int) -> None:
+        """Вернуть версию n — новой версией, ничего не стирая."""
+        if self._busy or not self._editable:
+            return
+        self._set_busy(f"Возвращаю версию {n}…")
+        try:
+            result = await nicegui_run.io_bound(operations.rollback, self._run_id, n)
+            dialog.append_chat(self._run_id, "сервис", step_text(result), version=result.version)
+            self._on_version()
+        except Exception as error:
+            dialog.append_chat(self._run_id, "сервис", f"Вернуть версию {n} не получилось: {error}")
+        finally:
+            self._set_busy(None)
 
 
 @ui.page(LOGIN_PATH)

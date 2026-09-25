@@ -27,7 +27,7 @@ from pathlib import Path
 import pytest
 
 from app import config, trace, web
-from app.contracts import NodeState, RunProgress, RunSummary
+from app.contracts import NodeState, RunMeta, RunProgress, RunSummary
 
 # ---- вспомогательное ----
 
@@ -764,3 +764,103 @@ def test_download_filename_with_version():
     """Версия диалога — в имени файла, чтобы в Загрузках не копились одинаковые имена (шаг 1.5)."""
     assert web.download_filename("Приказ МАДИ.pdf", version=3) == "Приказ МАДИ — карта гипотез, версия 3.xlsx"
     assert web.download_filename("Приказ МАДИ.pdf") == "Приказ МАДИ — карта гипотез.xlsx"
+
+
+
+# ======================================================================
+# Диалог с результатом прогона (итерация 3, шаг 6) — логика панели
+# ======================================================================
+
+from app.contracts import (  # noqa: E402
+    AppendRequest, BuildHypotheses, DeleteMapRow, EditText, Marks, RecheckIndicator, SetVerdict,
+)
+from app.operations import Change, StepResult  # noqa: E402
+
+
+def test_dialog_lock_one_editor_until_release_or_timeout():
+    lock = web.DialogLock(ttl_s=10)
+    assert lock.acquire("r", "a", now=0)
+    assert not lock.acquire("r", "b", now=5)
+    assert lock.acquire("r", "a", now=8)        # окно-хозяин продлевает
+    assert not lock.acquire("r", "b", now=15)
+    assert lock.acquire("r", "b", now=19)       # хозяин пропал дольше ttl — правка переходит
+    lock.release("r", "a")                      # чужой замок не снимается
+    assert not lock.acquire("r", "a", now=20)
+    lock.release("r", "b")
+    assert lock.acquire("r", "a", now=21)
+    assert lock.acquire("другой", "b", now=21)  # замок — на прогон, не на сервис
+
+
+def test_op_title_is_human_readable():
+    t = web.op_title(SetVerdict(kind="смена вердикта", indicator=7, verdict="нарушен", rationale="15 форм", reason="э"))
+    assert t == "Сменить вердикт индикатора 7 на «нарушен»: 15 форм"
+    t = web.op_title(EditText(kind="правка текста", sheet="строка карты", key="3", field="гипотеза",
+                              new_text="коротко", reason="вода"))
+    assert t == "Поправить текст — строка карты 3, поле «гипотеза»: «коротко»"
+    assert web.op_title(DeleteMapRow(kind="удалить строку карты", row_id=4, reason="x")) == "Удалить строку карты 4"
+    assert "агентом запроса" in web.op_title(AppendRequest(kind="дополнить запрос", row_ids=[8, 9], reason="x"))
+
+
+def test_estimate_cost_from_raw_traces_of_the_run(tmp_runs_dir):
+    rid = "run_cost"
+    trace.save_bytes(rid, "03_verdicts/03.raw.json", json.dumps([{"type": "x"}, {"total_cost_usd": 2.2}]).encode())
+    trace.save_bytes(rid, "05_hypotheses/06.raw.json", json.dumps([{"total_cost_usd": 0.3}]).encode())
+    trace.save_bytes(rid, "05_hypotheses/09.raw.json", json.dumps([{"total_cost_usd": 0.5}]).encode())
+    recheck = RecheckIndicator(kind="перепроверить индикатор", indicator=3, clarification="c", reason="r")
+    assert web.estimate_cost(rid, recheck) == pytest.approx(2.2)
+    assert web.estimate_cost(rid, BuildHypotheses(kind="построить гипотезы", indicator=7, reason="r")) == pytest.approx(0.4)
+    append = AppendRequest(kind="дополнить запрос", row_ids=[8], reason="r")
+    assert web.estimate_cost(rid, append) is None                     # сырого ответа нет — цена после выполнения
+    assert web.cost_note(append, None) == "агент · цена — после выполнения"
+    assert web.cost_note(recheck, 2.2) == "агент · ≈ $2.20"
+    free = DeleteMapRow(kind="удалить строку карты", row_id=1, reason="r")
+    assert web.estimate_cost(rid, free) is None and web.cost_note(free, None) == "без агента · бесплатно"
+
+
+def test_pending_plan_only_right_after_assistant():
+    op = SetVerdict(kind="смена вердикта", indicator=7, verdict="нарушен", rationale="15 форм", reason="э")
+    chat = [{"role": "пользователь", "text": "?"}, {"role": "ассистент", "text": "сменю", "plan": [op.model_dump(mode="json")]}]
+    assert web.pending_plan(chat) == [op]
+    assert web.pending_plan(chat + [{"role": "сервис", "text": "План отменён"}]) == []
+    assert web.pending_plan([{"role": "ассистент", "text": "ответ", "plan": []}]) == []
+
+
+def test_stale_notes_show_only_new_marks():
+    before = Marks(stale_rows={1: "старое"})
+    after = Marks(stale_rows={1: "старое", 2: "вердикт инд. 7 изменён"}, stale_verdicts={7: "гипотез нет"})
+    assert web.stale_notes(before, after) == ["Вердикты, инд. 7: гипотез нет", "строка карты 2: вердикт инд. 7 изменён"]
+
+
+def test_step_text_short_and_long():
+    short = StepResult(version=3, change=Change("Вердикты, инд. 7", "вердикт изменён", "соблюдён", "нарушен"))
+    assert web.step_text(short) == "Версия 3. Вердикты, инд. 7 — вердикт изменён: «соблюдён» → «нарушен»"
+    long = StepResult(version=4, change=Change("Карта гипотез, стр. 1", "текст поправлен", "а" * 90, "б" * 90))
+    assert web.step_text(long).splitlines()[1:] == ["Было: " + "а" * 90, "Стало: " + "б" * 90]
+
+
+def test_dialog_unavailable_for_unfinished_and_old_runs(tmp_runs_dir):
+    from test_versions import _write_run
+    rid = "20260925_120000_dddddd"
+    _write_run(rid)
+    ready = RunProgress.model_validate({"run_id": rid, "act_filename": "a.docx", "status": "готов",
+                                        "started_at": "2026-09-25T12:00:00", "nodes": []})
+    assert web.dialog_unavailable(rid, ready) is None
+    assert "после успешного" in web.dialog_unavailable(rid, ready.model_copy(update={"status": "сбой"}))
+    (trace.run_dir(rid) / "06_map.json").write_text('{"rows": [{"row_id": 1}]}', encoding="utf-8")
+    assert web.dialog_unavailable(rid, ready) == web.DIALOG_OLD_RUN
+
+
+def test_version_rows_newest_first(tmp_runs_dir):
+    from app.operations import run_step
+    from test_versions import _write_run
+    rid = "20260925_120000_eeeeee"
+    _write_run(rid)
+    trace.save_json(rid, "meta.json", RunMeta(run_id=rid, act_filename="a.docx", started_at="2026-09-25T12:00:00",
+                                              finished_at="2026-09-25T12:10:00", status="finished"))
+    (trace.run_dir(rid) / "01_document.md").write_text("акт", encoding="utf-8")
+    assert web.version_rows(rid) == []
+    run_step(rid, EditText(kind="правка текста", sheet="строка карты", key="1", field="гипотеза", new_text="к", reason="в"))
+    rows = web.version_rows(rid)
+    assert [n for n, _ in rows] == [1, 0]
+    assert rows[0][1].endswith("Карта гипотез, стр. 1 — переформулировано поле «гипотеза»")
+    assert rows[1][1] == "исходный разбор сервиса"

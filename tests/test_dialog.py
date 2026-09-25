@@ -75,3 +75,14 @@ def test_turn_failure_gives_readable_reply_without_plan(rid, monkeypatch):
     monkeypatch.setattr(dialog_module, "call", Mock(return_value=failed))
     res = dialog_module.turn(rid, "Что с индикатором 3?")
     assert res.plan == [] and "не получилось" in res.reply.lower()
+
+
+def test_remarks_queue_one_by_one(rid):
+    from app.contracts import Remark
+    rs = [Remark(sheet="Вердикты", key="1", title="т", agree="нет"), Remark(sheet="Карта гипотез", key="2", title="г", text="x")]
+    assert dialog_module.remarks_progress(rid) is None
+    dialog_module.save_remarks(rid, "эксперт.xlsx", rs)
+    assert dialog_module.remarks_progress(rid) == (0, 2)
+    assert dialog_module.next_remark(rid) == rs[0]
+    assert dialog_module.next_remark(rid) == rs[1]
+    assert dialog_module.next_remark(rid) is None and dialog_module.remarks_progress(rid) == (2, 2)
