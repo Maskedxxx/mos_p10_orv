@@ -542,6 +542,37 @@ def test_model_and_effort_present_on_resume_retry():
     assert cmd[cmd.index("--effort") + 1] == EFFORT
 
 
+# Изоляция вызова. Проверено 2026-09-25 (план итерации 3, шаг 0): с одним
+# --allowedTools агенту сервиса доступны 75 инструментов, включая Bash, Write,
+# Edit и 49 инструментов Gmail / Google Drive / Claude Docs, а Bash выполняется
+# без запроса разрешения — ~/.claude/settings.local.json спарка разрешает его
+# везде, а --allowedTools набор не ограничивает, только одобряет. В каждый вызов
+# подмешивался и личный ~/.claude/CLAUDE.md владельца.
+# ----------------------------------------------------------------------
+
+
+def test_tools_restricted_to_node_list():
+    """--tools = ровно инструменты узла: пусто для текстовых, два для поисковых."""
+    cmd = _build_cmd("текст", "{}", [], None, None)
+    assert "--tools" in cmd and cmd[cmd.index("--tools") + 1] == ""
+
+    cmd = _build_cmd("текст", "{}", ["WebSearch", "WebFetch"], None, None)
+    assert cmd[cmd.index("--tools") + 1] == "WebSearch,WebFetch"
+    assert cmd[cmd.index("--allowedTools") + 1] == "WebSearch WebFetch"
+
+
+def test_isolation_flags_in_every_call():
+    """MCP-серверы, CLAUDE.md и запросы разрешений отключены в каждом вызове, и на ретрае тоже."""
+    for cmd in (
+        _build_cmd("текст", "{}", [], None, None),
+        _build_cmd("исправь", "{}", ["WebSearch"], "sess-1", None),
+        _build_cmd("текст", None, [], None, 1.0),
+    ):
+        assert "--strict-mcp-config" in cmd
+        assert "--safe-mode" in cmd
+        assert cmd[cmd.index("--permission-mode") + 1] == "dontAsk"
+
+
 def test_model_is_sonnet_medium():
     """Согласовано с владельцем 2026-08-25: sonnet, medium."""
     from app.config import EFFORT, MODEL

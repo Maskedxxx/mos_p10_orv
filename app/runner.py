@@ -110,6 +110,22 @@ class _AttemptOutcome:
     duration_s: float
 
 
+# Изоляция каждого вызова модели от окружения машины. Проверено 2026-09-25
+# (план итерации 3, шаг 0): без этих флагов агенту сервиса были доступны
+# 75 инструментов — Bash, Write, Edit и 49 инструментов Gmail / Google Drive /
+# Claude Docs, Bash выполнялся без запроса разрешения (~/.claude/settings.local.json
+# спарка разрешает его везде; --allowedTools набор не ограничивает, только
+# одобряет), в каждый вызов подмешивался личный ~/.claude/CLAUDE.md.
+#   --strict-mcp-config       без --mcp-config — ни одного MCP-сервера;
+#   --safe-mode               без CLAUDE.md, навыков, плагинов, хуков; настройки
+#                             машины (переменные прокси) и вход по подписке остаются;
+#   --permission-mode dontAsk всё, что не одобрено заранее, запрещается, а не ждёт ответа.
+# Набор инструментов задаёт --tools в _build_cmd — ровно allowed_tools узла.
+# --bare и --setting-sources не подходят: первый не читает подписку, второй
+# отключает настройки с переменными прокси, без которых модель недоступна.
+_ISOLATION_FLAGS = ["--strict-mcp-config", "--safe-mode", "--permission-mode", "dontAsk"]
+
+
 def _build_cmd(
     message: str,
     schema_json: str | None,
@@ -130,7 +146,9 @@ def _build_cmd(
         cmd += ["--json-schema", schema_json]
     cmd += [
         "--output-format", "json",
-        "--allowedTools", " ".join(allowed_tools),
+        "--tools", ",".join(allowed_tools),         # доступны ровно инструменты узла
+        "--allowedTools", " ".join(allowed_tools),  # и они же одобрены без запроса
+        *_ISOLATION_FLAGS,
         "--model", MODEL,
         "--effort", EFFORT,
     ]
