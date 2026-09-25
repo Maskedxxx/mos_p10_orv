@@ -26,7 +26,7 @@ from app.config import get_indicator
 from app.contracts import RunMeta, Verdict
 from app.nodes.verdicts import run_verdicts
 from app.runner import CallResult
-from app.trace import load_json, run_dir, save_json
+from app.trace import load_json, run_dir, save_json, update_meta
 
 _TRACE_N_RE = re.compile(r"(\d{2})\.raw\.json$")
 
@@ -254,6 +254,29 @@ def test_total_cost_written_to_meta(run_id, tmp_prompts_dir, monkeypatch):
 
     meta = load_json(run_id, "meta.json", RunMeta)
     assert meta.cost_usd == pytest.approx(1.20)  # 12 * 0.10
+
+
+def test_cost_added_to_existing_meta_not_overwritten(run_id, tmp_prompts_dir, monkeypatch):
+    """9а. Стоимость вердиктов ПРИБАВЛЯЕТСЯ к уже записанной в meta.json.
+
+    До вердиктов в meta уже лежит стоимость паспорта. Раньше узел писал
+    cost_usd = стоимость вердиктов и затирал её: на прогоне МАДИ
+    20260908_092522_d7a6ac из итога пропали ровно 0,83 паспорта (проверено
+    2026-09-25 по сырым ответам). В диалоге перезапуск одного индикатора
+    затёр бы так стоимость всего прогона.
+    """
+    update_meta(run_id, cost_usd=0.83)
+
+    def _effect(instruction, document, model_cls, **kwargs):
+        n = _n_from_trace_name(kwargs["trace_name"])
+        return _ok_call_result(n, cost_usd=0.10)
+
+    monkeypatch.setattr(verdicts_module, "call", Mock(side_effect=_effect))
+
+    run_verdicts("текст", run_id)
+
+    meta = load_json(run_id, "meta.json", RunMeta)
+    assert meta.cost_usd == pytest.approx(0.83 + 1.20)
 
 
 def test_selective_indicators_only_runs_requested(run_id, tmp_prompts_dir, monkeypatch):

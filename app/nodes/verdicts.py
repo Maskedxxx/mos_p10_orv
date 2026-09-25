@@ -40,7 +40,8 @@ from app.config import (
 from app.contracts import ActPassport, Verdict
 from app.logger import get_run_logger
 from app.runner import call
-from app.trace import save_json, update_meta
+from app.nodes.hypotheses import _add_cost_to_meta
+from app.trace import save_json
 
 # Длина, до которой обрезается текст ошибки в rationale вердикта "ошибка"
 _ERROR_RATIONALE_LIMIT = 2000
@@ -154,7 +155,7 @@ def run_verdicts(
     По умолчанию None — без колбэка поведение узла не меняется ни в чём.
 
     Требует, чтобы meta.json прогона уже существовал (создаётся trace.new_run()
-    выше по пайплайну) — суммарная стоимость дописывается в него через update_meta.
+    выше по пайплайну) — суммарная стоимость ПРИБАВЛЯЕТСЯ к записанной (_add_cost_to_meta).
     """
     nums = indicators if indicators is not None else [ind.number for ind in all_indicators()]
     logger = get_run_logger(run_id).getChild("03_verdicts")
@@ -199,6 +200,8 @@ def run_verdicts(
         counts.get("нарушен", 0), counts.get("соблюдён", 0), counts.get("не применимо", 0),
         counts.get("нет данных", 0), counts.get("ошибка", 0), cost_total, duration_total,
     )
-    update_meta(run_id, cost_usd=cost_total)
+    # Прибавляем, а не перезаписываем: в meta уже лежит стоимость паспорта, а в диалоге —
+    # всего прогона (раньше здесь было update_meta(cost_usd=...), паспорт терялся).
+    _add_cost_to_meta(run_id, cost_total)
 
     return ordered
