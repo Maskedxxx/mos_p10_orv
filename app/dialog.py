@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import datetime
 import json
+import os
+import time
 from dataclasses import dataclass, field
 
 from app import versions
@@ -28,6 +30,9 @@ from app.trace import run_dir, save_bytes
 
 CHAT = "dialog/chat.jsonl"
 REMARKS = "dialog/remarks.json"   # очередь замечаний из файла эксперта
+STATUS = "dialog/status.json"     # что идёт по прогону прямо сейчас; нет файла — ничего
+# Процесс сервиса, записавший состояние: состояние от прежнего процесса — действие прервано перезапуском
+SERVER_ID = f"{os.getpid()}-{int(time.time())}"
 HISTORY_MESSAGES = 16       # сколько последних реплик чата уходит модели
 _ROLES = ("пользователь", "ассистент", "сервис")
 
@@ -103,7 +108,7 @@ def turn(run_id: str, message: str, *, timeout_s: int = 900) -> TurnResult:
     _add_cost_to_meta(run_id, result.cost_usd)
     if not result.ok or result.value is None:
         reply = f"Не получилось ответить: {result.error or 'неизвестная ошибка'}. Попробуйте ещё раз."
-        append_chat(run_id, "ассистент", reply, cost_usd=round(result.cost_usd, 4))
+        append_chat(run_id, "ассистент", reply, cost_usd=round(result.cost_usd, 4), mark="сбой")
         return TurnResult(reply=reply, cost_usd=result.cost_usd)
     value = result.value
     append_chat(run_id, "ассистент", value.reply, plan=[op.model_dump(mode="json") for op in value.plan],
@@ -137,3 +142,22 @@ def next_remark(run_id: str) -> Remark | None:
     data["next"] += 1
     save_bytes(run_id, REMARKS, json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"))
     return remark
+
+
+def set_status(run_id: str, state: str, title: str, detail: str) -> None:
+    """Что идёт по прогону: «думает» (ход помощника), «шаг» (шаг плана, возврат версии), «решение» (ждёт человека)."""
+    data = {"state": state, "title": title, "detail": detail,
+            "since": datetime.datetime.now().isoformat(timespec="seconds"), "server": SERVER_ID}
+    save_bytes(run_id, STATUS, json.dumps(data, ensure_ascii=False).encode("utf-8"))
+
+
+def read_status(run_id: str) -> dict | None:
+    path = run_dir(run_id) / STATUS
+    try:
+        return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
+    except (OSError, ValueError):   # файл пишется атомарно, но страница не должна падать из-за него
+        return None
+
+
+def clear_status(run_id: str) -> None:
+    (run_dir(run_id) / STATUS).unlink(missing_ok=True)

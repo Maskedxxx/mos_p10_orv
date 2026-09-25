@@ -75,6 +75,7 @@ def test_turn_failure_gives_readable_reply_without_plan(rid, monkeypatch):
     monkeypatch.setattr(dialog_module, "call", Mock(return_value=failed))
     res = dialog_module.turn(rid, "Что с индикатором 3?")
     assert res.plan == [] and "не получилось" in res.reply.lower()
+    assert dialog_module.read_chat(rid)[-1]["mark"] == "сбой"
 
 
 def test_remarks_queue_one_by_one(rid):
@@ -86,3 +87,12 @@ def test_remarks_queue_one_by_one(rid):
     assert dialog_module.next_remark(rid) == rs[0]
     assert dialog_module.next_remark(rid) == rs[1]
     assert dialog_module.next_remark(rid) is None and dialog_module.remarks_progress(rid) == (2, 2)
+
+
+def test_status_file_set_read_clear(rid):
+    assert dialog_module.read_status(rid) is None
+    dialog_module.set_status(rid, "шаг", "Выполняю шаг 1 из 1", "обычно несколько секунд")
+    st = dialog_module.read_status(rid)
+    assert st["state"] == "шаг" and st["server"] == dialog_module.SERVER_ID and st["since"]
+    dialog_module.clear_status(rid)
+    assert dialog_module.read_status(rid) is None

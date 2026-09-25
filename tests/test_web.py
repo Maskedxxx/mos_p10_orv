@@ -864,3 +864,114 @@ def test_version_rows_newest_first(tmp_runs_dir):
     assert [n for n, _ in rows] == [1, 0]
     assert rows[0][1].endswith("Карта гипотез, стр. 1 — переформулировано поле «гипотеза»")
     assert rows[1][1] == "исходный разбор сервиса"
+
+
+
+# ---- Состояния панели: что идёт, что ждёт человека, чем кончилось ----
+
+def _now():
+    from datetime import datetime
+    return datetime(2026, 9, 25, 13, 0, 30)
+
+
+def test_panel_state_idle_work_wait_error_view():
+    from app import dialog
+    ps = web.panel_state([], None, True, 2, _now())
+    assert (ps.tone, ps.title) == ("готово", "Готово") and "версия 2" in ps.detail
+    status = {"state": "думает", "title": "Помощник думает…", "detail": "обычно 10–40 сек",
+              "since": "2026-09-25T13:00:18", "server": dialog.SERVER_ID}
+    ps = web.panel_state([], status, True, 2, _now())
+    assert (ps.tone, ps.title, ps.detail) == ("работа", "Помощник думает…", "12 сек · обычно 10–40 сек")
+    waiting = {**status, "state": "решение", "title": "Ждёт вашего решения", "detail": "проверьте «было — стало»"}
+    ps = web.panel_state([], waiting, True, 2, _now())
+    assert (ps.tone, ps.detail) == ("решение", "проверьте «было — стало»")
+    ps = web.panel_state([], {**status, "server": "прежний процесс"}, True, 2, _now())
+    assert (ps.tone, ps.title) == ("сбой", "Действие прервано")
+    op = DeleteMapRow(kind="удалить строку карты", row_id=4, reason="x").model_dump(mode="json")
+    ps = web.panel_state([{"role": "ассистент", "text": "удалю", "plan": [op]}], None, True, 2, _now())
+    assert (ps.tone, ps.title) == ("решение", "Ждёт вашего решения")
+    partial = {"role": "сервис", "text": "План применён частично: 1 из 2 шагов\nещё", "mark": "частично"}
+    ps = web.panel_state([partial], None, True, 3, _now())
+    assert (ps.tone, ps.title) == ("сбой", "План применён частично: 1 из 2 шагов")
+    assert web.panel_state([], None, False, 2, _now()).tone == "просмотр"
+    assert web.panel_state([], status, False, 2, _now()).tone == "работа"   # чужое действие видно и в окне просмотра
+
+
+def test_plan_summary_texts():
+    assert web.plan_summary(2, 2, 0, None, None, 3) == (
+        "Готово: план применён (2 из 2 шагов). Файл — версия 3, скачать можно кнопкой вверху.", "готово")
+    text, mark = web.plan_summary(3, 2, 1, None, None, 5)
+    assert mark == "готово" and "(2 из 3 шагов, отклонено 1)" in text
+    assert web.plan_summary(1, 0, 1, None, None, 2) == ("План завершён без изменений — файл остался в версии 2.", "отменено")
+    assert web.plan_summary(2, 1, 0, 2, "диск", 4) == (
+        "План применён частично: 1 из 2 шагов, файл — версия 4. Шаг 2 не выполнен — диск.", "частично")
+    assert web.plan_summary(2, 0, 0, 1, "строки 9 нет", 4) == (
+        "План не применён: шаг 1 не выполнен — строки 9 нет. Файл не изменён (версия 4).", "сбой")
+
+
+def _wait(predicate):
+    async def waiter():
+        for _ in range(300):
+            if predicate():
+                return
+            await asyncio.sleep(0.01)
+        raise AssertionError("не дождались")
+    return waiter()
+
+
+def test_dialog_jobs_plan_waits_for_decision_on_server(tmp_runs_dir, monkeypatch):
+    from app import dialog
+    from app.operations import Candidate
+    from test_versions import _write_run
+    rid = "20260925_130000_ffffff"
+    _write_run(rid)
+    edit = EditText(kind="правка текста", sheet="строка карты", key="1", field="гипотеза", new_text="к", reason="в")
+    recheck = RecheckIndicator(kind="перепроверить индикатор", indicator=3, clarification="c", reason="r")
+    cand = Candidate(recheck, None, "соблюдён — старое", "нарушен — новое", 1.5)
+    monkeypatch.setattr(web.operations, "run_step", lambda run_id, op: (
+        StepResult(version=None, candidate=cand, cost_usd=1.5) if op is recheck
+        else StepResult(version=1, change=Change("Карта гипотез, стр. 1", "переформулировано", "а", "к"))))
+    monkeypatch.setattr(web.operations, "accept", lambda run_id, c: StepResult(
+        version=2, change=Change("Вердикты, инд. 3", "перепроверен", "соблюдён", "нарушен"), cost_usd=1.5))
+
+    async def scenario():
+        jobs = web.DialogJobs()
+        assert jobs.start(rid, jobs.apply_plan(rid, [edit, recheck]))
+        await _wait(lambda: jobs.waiting(rid) is not None)
+        title, shown = jobs.waiting(rid)
+        assert shown is cand and title.startswith("Шаг 2 из 2")
+        assert dialog.read_status(rid)["state"] == "решение"
+        assert not jobs.start(rid, jobs.turn(rid, "ещё"))   # по прогону уже идёт действие
+        jobs.decide(rid, True)
+        await _wait(lambda: not jobs.busy(rid))
+
+    asyncio.run(scenario())
+    chat = dialog.read_chat(rid)
+    assert [m.get("mark") for m in chat] == [None, "шаг", "шаг", "готово"]
+    assert chat[-1]["text"].startswith("Готово: план применён (2 из 2 шагов)")
+    assert web.dialog_spent(chat) == pytest.approx(1.5)
+    assert dialog.read_status(rid) is None
+
+
+def test_dialog_jobs_failure_stops_plan_with_reason(tmp_runs_dir, monkeypatch):
+    from app import dialog
+    from test_versions import _write_run
+    rid = "20260925_130000_gggggg"
+    _write_run(rid)
+    edit = EditText(kind="правка текста", sheet="строка карты", key="9", field="гипотеза", new_text="к", reason="в")
+
+    def boom(run_id, op):
+        raise web.operations.OperationError("строки 9 нет")
+
+    monkeypatch.setattr(web.operations, "run_step", boom)
+
+    async def scenario():
+        jobs = web.DialogJobs()
+        jobs.start(rid, jobs.apply_plan(rid, [edit, edit]))
+        await _wait(lambda: not jobs.busy(rid))
+
+    asyncio.run(scenario())
+    chat = dialog.read_chat(rid)
+    assert [m.get("mark") for m in chat] == [None, "сбой"]
+    assert chat[-1]["text"] == "План не применён: шаг 1 не выполнен — строки 9 нет. Файл не изменён (версия 0)."
+    assert dialog.read_status(rid) is None
