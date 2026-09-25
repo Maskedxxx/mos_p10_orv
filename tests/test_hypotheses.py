@@ -350,6 +350,38 @@ def test_both_branches_concurrent_dont_lose_cost(tmp_runs_dir, tmp_prompts, monk
     assert meta.cost_usd == pytest.approx(1.0 + 0.30 + 0.20)
 
 
+def test_hypotheses_extra_instruction_prefix_and_no_save(run_id, tmp_prompts, monkeypatch):
+    """Диалог (шаг 1.2): уточнение блоком в конце промпта, трасса под префиксом, без записи при save=False."""
+    violated_path, _ = tmp_prompts
+    mock_call = Mock(side_effect=_default_side_effect)
+    monkeypatch.setattr(hyp_module, "call", mock_call)
+
+    sets = run_hypotheses_violated(
+        _buckets_violated([7]), "текст", run_id,
+        extra_instruction="Учти пятнадцать форм отчётности.", trace_prefix="dialog/v3/", save=False,
+    )
+
+    instruction = mock_call.call_args_list[0].args[0]
+    assert instruction.startswith(violated_path.read_text(encoding="utf-8"))
+    assert "<уточнение_задачи>" in instruction and "Учти пятнадцать форм отчётности." in instruction
+    assert mock_call.call_args_list[0].kwargs["trace_name"] == "dialog/v3/05_hypotheses/07.raw.json"
+    assert [s.indicator for s in sets] == [7]
+    assert not (run_dir(run_id) / "05_hypotheses" / "07.json").exists()
+
+
+def test_hypotheses_defaults_unchanged(run_id, tmp_prompts, monkeypatch):
+    """Без новых параметров промпт побайтно прежний, трасса и запись — как раньше."""
+    violated_path, _ = tmp_prompts
+    mock_call = Mock(side_effect=_default_side_effect)
+    monkeypatch.setattr(hyp_module, "call", mock_call)
+
+    run_hypotheses_violated(_buckets_violated([7]), "текст", run_id)
+
+    assert mock_call.call_args_list[0].args[0] == violated_path.read_text(encoding="utf-8")
+    assert mock_call.call_args_list[0].kwargs["trace_name"] == "05_hypotheses/07.raw.json"
+    assert (run_dir(run_id) / "05_hypotheses" / "07.json").exists()
+
+
 def test_no_data_skips_text_family_indicators(run_id, tmp_prompts, monkeypatch):
     """Б1 (ОС 2026-09-04). «Нет данных» у индикаторов 1-6 — незавершённая проверка
     по тексту или правовой базе, а не пробел в практике: узел [4б] для них

@@ -40,7 +40,7 @@ from app.config import (
 from app.contracts import ActPassport, Verdict
 from app.logger import get_run_logger
 from app.runner import call
-from app.nodes.hypotheses import _add_cost_to_meta
+from app.nodes.hypotheses import _add_cost_to_meta, append_task_clarification
 from app.trace import save_json
 
 # Длина, до которой обрезается текст ошибки в rationale вердикта "ошибка"
@@ -75,6 +75,8 @@ def _run_one_indicator(
     run_id: str,
     timeout_s: int,
     max_budget_usd: float | None,
+    extra_instruction: str | None = None,
+    trace_prefix: str = "",
 ) -> tuple[int, Verdict, float]:
     """
     Прогнать одного агента-индикатора. Никогда не бросает исключение наружу — любой
@@ -91,7 +93,7 @@ def _run_one_indicator(
         indicator = get_indicator(n)
         name_fallback = indicator.name
 
-        instruction = prompt_path(n).read_text(encoding="utf-8")
+        instruction = append_task_clarification(prompt_path(n).read_text(encoding="utf-8"), extra_instruction)
         document = _build_document(document_md, passport_block_text)
         allowed_tools = ALLOWED_TOOLS_TEXT if indicator.route == "текст" else ALLOWED_TOOLS_WEB
 
@@ -100,7 +102,7 @@ def _run_one_indicator(
             document,
             Verdict,
             run_id=run_id,
-            trace_name=f"03_verdicts/{n:02d}.raw.json",
+            trace_name=f"{trace_prefix}03_verdicts/{n:02d}.raw.json",
             allowed_tools=allowed_tools,
             timeout_s=timeout_s,
             max_budget_usd=max_budget_usd,
@@ -137,6 +139,9 @@ def run_verdicts(
     timeout_s: int = 900,
     max_budget_usd: float | None = None,
     on_verdict: Callable[[Verdict], None] | None = None,
+    extra_instruction: str | None = None,
+    trace_prefix: str = "",
+    save: bool = True,
 ) -> list[Verdict]:
     """
     Параллельно прогнать агентов-индикаторов и собрать их вердикты (узел [2]).
@@ -153,6 +158,11 @@ def run_verdicts(
     индикатора, до барьера (см. цикл ниже). Нужен оркестратору, чтобы страница
     прогона показывала "7 из 12 готово", а не ждала все двенадцать пять минут.
     По умолчанию None — без колбэка поведение узла не меняется ни в чём.
+
+    extra_instruction, trace_prefix, save — для перепроверки из диалогового режима
+    (план итерации 3, шаг 1.2): уточнение задачи к промпту, отдельная папка сырых
+    ответов, возврат кандидата без записи 03_verdicts/NN.json (запись после
+    «Принять»). Стоимость учитывается в meta всегда.
 
     Требует, чтобы meta.json прогона уже существовал (создаётся trace.new_run()
     выше по пайплайну) — суммарная стоимость ПРИБАВЛЯЕТСЯ к записанной (_add_cost_to_meta).
@@ -173,6 +183,7 @@ def run_verdicts(
         futures = [
             executor.submit(
                 _run_one_indicator, n, document_md, block, run_id, timeout_s, max_budget_usd,
+                extra_instruction, trace_prefix,
             )
             for n in nums
         ]
@@ -180,7 +191,8 @@ def run_verdicts(
             n, verdict, cost = future.result()
             verdicts_by_n[n] = verdict
             cost_total += cost
-            save_json(run_id, f"03_verdicts/{n:02d}.json", verdict)
+            if save:
+                save_json(run_id, f"03_verdicts/{n:02d}.json", verdict)
             # Событие готовности индикатора — по ходу, ДО барьера. Сбой колбэка
             # (например, ошибка записи файла прогресса на стороне оркестратора)
             # не должен ронять пятиминутный узел: ловим и идём дальше.

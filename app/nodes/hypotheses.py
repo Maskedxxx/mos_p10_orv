@@ -63,6 +63,26 @@ _ERROR_TEXT_LIMIT = 2000
 _meta_lock = threading.Lock()
 
 
+def append_task_clarification(instruction: str, extra_instruction: str | None) -> str:
+    """
+    Дописать к промпту узла уточнение задачи от пользователя (диалоговый режим,
+    план итерации 3, шаг 1.2). Без уточнения промпт возвращается побайтно прежним.
+
+    Уточнение говорит, ЧТО ещё проверить и ГДЕ искать, но не какой вывод нужен:
+    это правило промпта оркестратора, а текст уточнения пользователь видит
+    в плане до подтверждения.
+    """
+    if not extra_instruction:
+        return instruction
+    return (
+        f"{instruction}\n\n<уточнение_задачи>\n"
+        "Пользователь уточнил объём проверки. Выполни инструкцию выше полностью "
+        "и дополнительно учти уточнение. Оно говорит, что проверить и где искать, "
+        "а не к какому выводу прийти.\n\n"
+        f"{extra_instruction.strip()}\n</уточнение_задачи>\n"
+    )
+
+
 def _add_cost_to_meta(run_id: str, cost_delta: float) -> None:
     """
     Прибавить стоимость вызовов узла к уже записанной в meta.json, не затирая её.
@@ -110,6 +130,7 @@ def _run_one_hypothesis(
     instruction: str,
     timeout_s: int,
     max_budget_usd: float | None,
+    trace_prefix: str = "",
 ) -> tuple[int, HypothesisSet, float, bool]:
     """
     Прогнать одного агента-гипотезу по одному вердикту. Никогда не бросает
@@ -131,7 +152,7 @@ def _run_one_hypothesis(
             document,
             HypothesisSet,
             run_id=run_id,
-            trace_name=f"05_hypotheses/{n:02d}.raw.json",
+            trace_name=f"{trace_prefix}05_hypotheses/{n:02d}.raw.json",
             allowed_tools=ALLOWED_TOOLS_TEXT,
             timeout_s=timeout_s,
             max_budget_usd=max_budget_usd,
@@ -160,10 +181,20 @@ def _run_hypotheses(
     max_workers: int,
     timeout_s: int,
     max_budget_usd: float | None,
+    extra_instruction: str | None = None,
+    trace_prefix: str = "",
+    save: bool = True,
 ) -> list[HypothesisSet]:
-    """Общая механика узлов [4а]/[4б]: параллельный прогон по своей куче вердиктов."""
+    """
+    Общая механика узлов [4а]/[4б]: параллельный прогон по своей куче вердиктов.
+
+    extra_instruction, trace_prefix, save — для перезапуска из диалогового режима:
+    уточнение задачи к промпту, отдельная папка сырых ответов, возврат кандидата
+    без записи 05_hypotheses/NN.json (запись после «Принять»). Стоимость
+    учитывается в meta всегда.
+    """
     logger = get_run_logger(run_id).getChild(f"05_hypotheses_{branch_label}")
-    instruction = prompt_file.read_text(encoding="utf-8")
+    instruction = append_task_clarification(prompt_file.read_text(encoding="utf-8"), extra_instruction)
 
     started = time.monotonic()
     sets_by_n: dict[int, HypothesisSet] = {}
@@ -174,7 +205,7 @@ def _run_hypotheses(
         futures = [
             executor.submit(
                 _run_one_hypothesis, verdict, document_md, passport_block_text, run_id, instruction,
-                timeout_s, max_budget_usd,
+                timeout_s, max_budget_usd, trace_prefix,
             )
             for verdict in verdicts
         ]
@@ -184,7 +215,8 @@ def _run_hypotheses(
             cost_total += cost
             if not ok:
                 failed_count += 1
-            save_json(run_id, f"05_hypotheses/{n:02d}.json", hset)
+            if save:
+                save_json(run_id, f"05_hypotheses/{n:02d}.json", hset)
 
     ordered = [sets_by_n[n] for n in sorted(sets_by_n)]
     duration_total = time.monotonic() - started
@@ -209,6 +241,9 @@ def run_hypotheses_violated(
     max_workers: int = 12,
     timeout_s: int = 900,
     max_budget_usd: float | None = None,
+    extra_instruction: str | None = None,
+    trace_prefix: str = "",
+    save: bool = True,
 ) -> list[HypothesisSet]:
     """
     Узел [4а] — гипотезы из нарушений: один вызов модели на каждый вердикт
@@ -228,7 +263,7 @@ def run_hypotheses_violated(
 
     return _run_hypotheses(
         buckets.violated, document_md, passport_block(passport), run_id, PROMPT_HYPOTHESES_VIOLATED, "violated",
-        max_workers, timeout_s, max_budget_usd,
+        max_workers, timeout_s, max_budget_usd, extra_instruction, trace_prefix, save,
     )
 
 
@@ -241,6 +276,9 @@ def run_hypotheses_no_data(
     max_workers: int = 12,
     timeout_s: int = 900,
     max_budget_usd: float | None = None,
+    extra_instruction: str | None = None,
+    trace_prefix: str = "",
+    save: bool = True,
 ) -> list[HypothesisSet]:
     """
     Узел [4б] — гипотезы из пробелов в данных: один вызов модели на каждый
@@ -266,5 +304,5 @@ def run_hypotheses_no_data(
         )
     return _run_hypotheses(
         practice, document_md, passport_block(passport), run_id, PROMPT_HYPOTHESES_NO_DATA, "no_data",
-        max_workers, timeout_s, max_budget_usd,
+        max_workers, timeout_s, max_budget_usd, extra_instruction, trace_prefix, save,
     )

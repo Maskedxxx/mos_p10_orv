@@ -292,6 +292,52 @@ def test_selective_indicators_only_runs_requested(run_id, tmp_prompts_dir, monke
     assert mock_call.call_count == 2
 
 
+# Перезапуск из диалогового режима (план итерации 3, шаг 1.2): уточнение задачи
+# дописывается блоком в конец промпта, сырые ответы — в свою папку, кандидат
+# можно получить без записи чистого JSON (запись только после «Принять»).
+# ----------------------------------------------------------------------
+
+
+def test_extra_instruction_appended_as_block(run_id, tmp_prompts_dir, monkeypatch):
+    """Уточнение задачи уходит в модель блоком после промпта; без него промпт побайтно прежний."""
+    mock_call = Mock(side_effect=_default_side_effect)
+    monkeypatch.setattr(verdicts_module, "call", mock_call)
+
+    run_verdicts("текст", run_id, indicators=[3])
+    plain = mock_call.call_args_list[0].args[0]
+    assert plain == (tmp_prompts_dir / "02_indicator_03.md").read_text(encoding="utf-8")
+
+    run_verdicts("текст", run_id, indicators=[3], extra_instruction="Проверь все приказы Минтранса.")
+    extended = mock_call.call_args_list[1].args[0]
+    assert extended.startswith(plain)
+    assert "<уточнение_задачи>" in extended and "Проверь все приказы Минтранса." in extended
+    assert extended.rstrip().endswith("</уточнение_задачи>")
+
+
+def test_trace_prefix_moves_raw_trace(run_id, tmp_prompts_dir, monkeypatch):
+    """Сырые ответы перезапуска уходят под префикс, а не рядом с сырыми прогона."""
+    mock_call = Mock(side_effect=_default_side_effect)
+    monkeypatch.setattr(verdicts_module, "call", mock_call)
+
+    run_verdicts("текст", run_id, indicators=[6], trace_prefix="dialog/v2/")
+
+    assert mock_call.call_args_list[0].kwargs["trace_name"] == "dialog/v2/03_verdicts/06.raw.json"
+
+
+def test_save_false_returns_candidate_without_writing(run_id, tmp_prompts_dir, monkeypatch):
+    """save=False: вердикт возвращается, чистый JSON не пишется, стоимость учитывается."""
+    def _effect(instruction, document, model_cls, **kwargs):
+        return _ok_call_result(_n_from_trace_name(kwargs["trace_name"]), cost_usd=0.10)
+
+    monkeypatch.setattr(verdicts_module, "call", Mock(side_effect=_effect))
+
+    result = run_verdicts("текст", run_id, indicators=[6], save=False)
+
+    assert [v.indicator for v in result] == [6]
+    assert not (run_dir(run_id) / "03_verdicts" / "06.json").exists()
+    assert load_json(run_id, "meta.json", RunMeta).cost_usd == pytest.approx(0.10)
+
+
 def test_real_parallelism_faster_than_sum_of_delays(run_id, tmp_prompts_dir, monkeypatch):
     """11. Параллельность реальная: пять задач с искусственной задержкой 0.3с
     каждая отрабатывают заметно быстрее суммы задержек (1.5с)."""
