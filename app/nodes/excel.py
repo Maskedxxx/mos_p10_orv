@@ -60,7 +60,9 @@ from openpyxl.worksheet.datavalidation import DataValidation
 from openpyxl.worksheet.worksheet import Worksheet
 
 from app.config import REQUEST_YEARS_DEPTH, all_indicators, get_indicator
-from app.contracts import ActPassport, Buckets, DataItem, DataRequest, Effect, HypothesisMap, RequestItem, Verdict
+from app.contracts import (
+    ActPassport, Buckets, DataItem, DataRequest, Effect, HypothesisMap, JournalEntry, Marks, RequestItem, Verdict,
+)
 from app.logger import get_run_logger
 from app.trace import run_dir
 
@@ -83,6 +85,8 @@ _SHEET_VERDICTS = "Вердикты"   # пул 3 (письмо заказчик
                                # ВСЕ индикаторы, не только соблюдённые; имя — из письма.
                                # История: «Проверенные индикаторы» → «Нарушений не найдено» (7.1)
 _SHEET_FAILED = "Ошибки прогона"
+_SHEET_JOURNAL = "Журнал изменений"   # только в версиях диалогового режима (план итерации 3, шаг 1.5)
+_MARKS_HEADER = "Изменения"           # колонка пометок строк — тоже только в версиях
 
 
 def compute_years(num_years: int = 4, end_year: int | None = None) -> list[int]:
@@ -374,6 +378,45 @@ def _append_expert_columns(ws: Worksheet, header_row: int, names: list[str], wid
             ws.add_data_validation(dv)
 
 
+def _append_marks_column(ws: Worksheet, header_row: int, key_of, edited, stale: dict) -> None:
+    """
+    Колонка «Изменения» — только в версиях диалогового режима (план итерации 3,
+    шаг 1.5): «правлено человеком» и «устарело: почему» у своей строки. Ставится
+    перед оранжевыми колонками эксперта. key_of превращает значение первой
+    колонки строки в ключ пометки; строки без ключа (разрезы, заголовок перечней)
+    остаются пустыми — пометка принадлежит строке-родителю.
+    """
+    col = ws.max_column + 1
+    head = ws.cell(row=header_row, column=col, value=_MARKS_HEADER)
+    head.font, head.fill, head.alignment, head.border = _HEADER_FONT, _HEADER_FILL, _CENTER, _BORDER
+    ws.column_dimensions[head.column_letter].width = 30
+    for r in range(header_row + 1, ws.max_row + 1):
+        key = key_of(ws.cell(row=r, column=1).value)
+        parts = []
+        if key is not None and key in edited:
+            parts.append("правлено человеком")
+        if key is not None and key in stale:
+            parts.append(f"устарело: {stale[key]}")
+        c = ws.cell(row=r, column=col, value="; ".join(parts) or None)
+        c.font, c.alignment, c.border = _BODY_FONT, _WRAP_TOP, _BORDER
+
+
+def _row_key(value) -> int | None:
+    """Ключ строки карты — её номер (число в первой колонке)."""
+    return value if isinstance(value, int) else None
+
+
+def _item_key(value) -> str | None:
+    """Ключ позиции запроса — её номер; разрезы «1.1» и заголовок перечней ключа не имеют."""
+    return value if isinstance(value, str) and value.isdigit() else None
+
+
+def _indicator_key(value) -> int | None:
+    """Ключ строки листа «Вердикты» — номер индикатора из «7. название»."""
+    head = str(value).split(".")[0] if value else ""
+    return int(head) if head.isdigit() else None
+
+
 _EXPERT_SCORE_COLUMNS = (["Оценка (1–5)", "Замечание"], [12, 40])
 _EXPERT_VERDICT_COLUMNS = (["Согласны?", "Если нет — какой верный", "Замечание"], [12, 30, 40])
 
@@ -407,26 +450,38 @@ def _unverified_verdicts(hyp_map: HypothesisMap, buckets: Buckets) -> list[Verdi
     return [v for v in buckets.no_data if v.indicator not in covered]
 
 
-def _unverified_row_ids(hyp_map: HypothesisMap, buckets: Buckets) -> dict[int, int]:
+def _unverified_row_ids(
+    hyp_map: HypothesisMap, buckets: Buckets, fixed: dict[int, int] | None = None,
+) -> dict[int, int]:
     """
     Номер строки карты для каждого вердикта «проверка не завершена»: индикатор →
-    row_id. Нумерация продолжает строки карты. Считается здесь один раз, чтобы
-    карта и лист «Вердикты» ссылались на одно и то же число (пул 3, п. 4).
+    row_id. Считается в build_excel один раз, чтобы карта и лист «Вердикты»
+    ссылались на одно и то же число (пул 3, п. 4).
+
+    fixed — номера, закреплённые версиями диалогового режима (план итерации 3,
+    шаг 1.5): без них «максимум + 1» сдвигается после удаления строки карты.
+    Индикаторам без закреплённого номера достаются следующие свободные.
     """
-    next_id = max((row.row_id for row in hyp_map.rows), default=0) + 1
-    return {
-        v.indicator: next_id + i
-        for i, v in enumerate(_unverified_verdicts(hyp_map, buckets))
-    }
+    fixed = fixed or {}
+    next_id = max([row.row_id for row in hyp_map.rows] + list(fixed.values()), default=0) + 1
+    ids: dict[int, int] = {}
+    for v in _unverified_verdicts(hyp_map, buckets):
+        if v.indicator in fixed:
+            ids[v.indicator] = fixed[v.indicator]
+        else:
+            ids[v.indicator] = next_id
+            next_id += 1
+    return ids
 
 
-def _append_unverified_rows(ws: Worksheet, hyp_map: HypothesisMap, buckets: Buckets) -> None:
+def _append_unverified_rows(
+    ws: Worksheet, hyp_map: HypothesisMap, buckets: Buckets, row_ids: dict[int, int],
+) -> None:
     """
     Дописать в карту строки «проверка не завершена» — по одной на вердикт из
     _unverified_verdicts. Нумерация продолжает строки карты; в запрос органу
     такие строки не идут — дочитывает аналитик по правовой базе.
     """
-    row_ids = _unverified_row_ids(hyp_map, buckets)
     for v in _unverified_verdicts(hyp_map, buckets):
         ws.append([
             row_ids[v.indicator],
@@ -444,7 +499,10 @@ _MONTHS_RU = ("января", "февраля", "марта", "апреля", "�
               "июля", "августа", "сентября", "октября", "ноября", "декабря")
 
 
-def _render_howto_sheet(wb: Workbook, passport: ActPassport | None) -> None:
+def _render_howto_sheet(
+    wb: Workbook, passport: ActPassport | None,
+    analyzed_at: datetime.datetime | None = None, version: int | None = None,
+) -> None:
     """
     Лист «Как заполнять» — первый в книге, инструкция эксперту по образцу шаблона
     обратной связи, который до пула 3 собирался отдельно от пайплайна (файлы
@@ -459,8 +517,9 @@ def _render_howto_sheet(wb: Workbook, passport: ActPassport | None) -> None:
     ws.title = _SHEET_HOWTO
     ws.column_dimensions["A"].width = 34
     ws.column_dimensions["B"].width = 80
-    now = datetime.datetime.now()
-    rendered = f"{now.day} {_MONTHS_RU[now.month - 1]} {now.year}, {now:%H:%M}"
+    # В версии диалога «Разобран» — дата исходного разбора, а не момент пересборки
+    moment = analyzed_at or datetime.datetime.now()
+    rendered = f"{moment.day} {_MONTHS_RU[moment.month - 1]} {moment.year}, {moment:%H:%M}"
     act = _passport_header_line(passport) or "—"
     rules = [
         f"Пройдите три листа: «{_SHEET_MAP}», «{_SHEET_REQUEST}», «{_SHEET_VERDICTS}».",
@@ -478,6 +537,8 @@ def _render_howto_sheet(wb: Workbook, passport: ActPassport | None) -> None:
         ("Заполнено сервисом", None, "section"),
         ("Акт", act, "row"),
         ("Разобран", rendered, "row"),
+    ] + ([("Версия файла", f"{version} — после правок в диалоге; исходный разбор сервиса — версия 0", "row")]
+         if version else []) + [
         (None, None, "blank"),
         ("Заполните вы", None, "section"),
         ("ФИО", None, "orange"),
@@ -500,6 +561,7 @@ def _render_howto_sheet(wb: Workbook, passport: ActPassport | None) -> None:
 def _render_map_sheet(
     wb: Workbook, hyp_map: HypothesisMap, row_to_nums: dict[int, list[str]],
     passport: ActPassport | None, buckets: Buckets, caption: str,
+    unverified_ids: dict[int, int], marks: Marks | None = None,
 ) -> None:
     """
     Лист «Карта гипотез»: опциональная шапка-реквизиты (одна строка) + 5 колонок.
@@ -535,8 +597,10 @@ def _render_map_sheet(
             ),
         ])
 
-    _append_unverified_rows(ws, hyp_map, buckets)   # «нет данных» без гипотез — тоже в карту
+    _append_unverified_rows(ws, hyp_map, buckets, unverified_ids)   # «нет данных» без гипотез — тоже в карту
     _format_map_sheet(ws, header_row)
+    if marks is not None:
+        _append_marks_column(ws, header_row, _row_key, marks.edited_rows, marks.stale_rows)
     _append_expert_columns(ws, header_row, *_EXPERT_SCORE_COLUMNS)
 
 
@@ -599,7 +663,7 @@ def _request_metric_label(item: RequestItem) -> str:
 
 def _render_request_sheet(
     wb: Workbook, request: DataRequest, years: list[int], hyp_map: HypothesisMap,
-    caption: str,
+    caption: str, marks: Marks | None = None,
 ) -> None:
     """
     Лист «Запрос показателей»: № | Показатель | три года (пустые клетки).
@@ -643,6 +707,8 @@ def _render_request_sheet(
             _append_item(item, dash_years)
 
     _format_request_sheet(ws, header_row)
+    if marks is not None:
+        _append_marks_column(ws, header_row, _item_key, marks.edited_items, marks.stale_items)
     _append_expert_columns(ws, header_row, *_EXPERT_SCORE_COLUMNS)
 
 
@@ -682,7 +748,10 @@ def _where_details(v: Verdict, hyp_map: HypothesisMap, unverified_ids: dict[int,
     return "—"
 
 
-def _render_verdicts_sheet(wb: Workbook, buckets: Buckets, hyp_map: HypothesisMap, caption: str) -> None:
+def _render_verdicts_sheet(
+    wb: Workbook, buckets: Buckets, hyp_map: HypothesisMap, caption: str,
+    unverified_ids: dict[int, int], marks: Marks | None = None,
+) -> None:
     """
     Лист «Вердикты»: все вердикты четырёх куч по возрастанию номера индикатора.
 
@@ -695,7 +764,6 @@ def _render_verdicts_sheet(wb: Workbook, buckets: Buckets, hyp_map: HypothesisMa
     _render_caption(ws, caption)
     header_row = ws.max_row + 1
     ws.append(["Индикатор", "Вердикт", "Обоснование", "На чём основано", "Где подробнее"])
-    unverified_ids = _unverified_row_ids(hyp_map, buckets)
     everything = buckets.violated + buckets.no_data + buckets.checked + buckets.failed
     for v in sorted(everything, key=lambda v: v.indicator):
         # «Обоснование» — текст вердикта, «На чём основано» — цитата и адреса;
@@ -706,6 +774,8 @@ def _render_verdicts_sheet(wb: Workbook, buckets: Buckets, hyp_map: HypothesisMa
             _where_details(v, hyp_map, unverified_ids),
         ])
     _format_listing_sheet(ws, {"A": 34, "B": 16, "C": 60, "D": 52, "E": 30}, header_row)
+    if marks is not None:
+        _append_marks_column(ws, header_row, _indicator_key, marks.edited_verdicts, marks.stale_verdicts)
     _append_expert_columns(ws, header_row, *_EXPERT_VERDICT_COLUMNS)
 
 
@@ -726,23 +796,52 @@ def _render_failed_sheet(wb: Workbook, failed: list[Verdict], caption: str) -> N
     _format_listing_sheet(ws, {"A": 34, "B": 60, "C": 10}, header_row)
 
 
+def _render_journal_sheet(wb: Workbook, journal: list[JournalEntry]) -> None:
+    """Лист «Журнал изменений» — последний; по строке на применённое изменение (план итерации 3, шаг 1.5)."""
+    ws = wb.create_sheet(_SHEET_JOURNAL)
+    _render_caption(ws, "Изменения после исходного разбора сервиса (версия 0) — по строке на каждое применённое изменение.")
+    header_row = ws.max_row + 1
+    ws.append(["Версия", "Когда", "Что сделано", "Где", "Было", "Стало", "Почему", "Как", "Стоимость, $"])
+    for e in journal:
+        ws.append([e.version, e.at, e.action, e.target, e.before or "—", e.after or "—",
+                   e.reason or "—", e.kind, round(e.cost_usd, 2)])
+    _format_listing_sheet(
+        ws, {"A": 9, "B": 18, "C": 36, "D": 26, "E": 40, "F": 40, "G": 40, "H": 18, "I": 12}, header_row,
+    )
+
+
 def build_excel(
     hypothesis_map: HypothesisMap,
     request: DataRequest,
     buckets: Buckets,
     passport: ActPassport | None,
     run_id: str,
+    *,
+    version: int | None = None,
+    journal: list[JournalEntry] | None = None,
+    marks: Marks | None = None,
+    unverified_ids: dict[int, int] | None = None,
+    analyzed_at: datetime.datetime | None = None,
 ) -> Path:
     """
     Узел [7] — собрать единый .xlsx из готовых карты, запроса и куч вердиктов.
 
     Модель не используется. Сохраняет книгу как 08_result.xlsx в папке прогона
-    и возвращает путь к файлу. Годы запроса считаются детерминированно через
-    compute_years(REQUEST_YEARS_DEPTH), а не берутся из ответа модели узла [6].
+    и возвращает путь к файлу.
+
+    Годы колонок бланка — из самого бланка: с v2.3 их пишет код узла [6] от даты
+    вступления акта в силу (Г5), модель их не выбирает. До 2026-09-25 здесь
+    заново считалось окно от сегодняшней даты, и у акта в силе с 2025 года
+    в Excel были пустые колонки 2023 и 2024. compute_years — запасной путь для
+    бланка без годов.
+
+    version, journal, marks, unverified_ids, analyzed_at — для версий диалогового
+    режима (план итерации 3, шаг 1.5); без них книга прежняя.
     """
     logger = get_run_logger(run_id).getChild("08_excel")
 
-    years = compute_years(num_years=REQUEST_YEARS_DEPTH)
+    years = request.years or compute_years(num_years=REQUEST_YEARS_DEPTH)
+    unverified = _unverified_row_ids(hypothesis_map, buckets, unverified_ids)
     row_to_nums = _row_to_request_nums(request)
 
     # Числитель подписей считается по факту прогона, знаменатель — из конфига:
@@ -752,30 +851,35 @@ def build_excel(
     map_indicators |= {v.indicator for v in _unverified_verdicts(hypothesis_map, buckets)}
 
     wb = Workbook()
-    _render_howto_sheet(wb, passport)          # первый лист — инструкция эксперту
+    _render_howto_sheet(wb, passport, analyzed_at, version)   # первый лист — инструкция эксперту
     _render_map_sheet(
         wb, hypothesis_map, row_to_nums, passport, buckets,
         f"Индикаторы, по которым найдено нарушение или не хватило данных — "
         f"{len(map_indicators)} из {total}. По каждому построена гипотеза: "
         f"что не так, чем мерить эффект, какие данные нужны — либо отмечено, "
         f"что проверка не завершена.",
+        unverified, marks,
     )
     _render_request_sheet(
         wb, request, years, hypothesis_map,
         "Данные, которых нет в открытом доступе. Заполняет орган-разработчик, "
         "три последних завершённых года.",
+        marks,
     )
     n_verdicts = sum(len(b) for b in (buckets.violated, buckets.no_data, buckets.checked, buckets.failed))
     _render_verdicts_sheet(
         wb, buckets, hypothesis_map,
         f"Все индикаторы с вердиктами — {n_verdicts} из {total}. По нарушенным и «нет данных» "
         f"подробности на листе «{_SHEET_MAP}», по сбоям — на листе «{_SHEET_FAILED}».",
+        unverified, marks,
     )
     _render_failed_sheet(
         wb, buckets.failed,
         f"Индикаторы, проверка которых не завершилась. "
         f"Пусто — значит все {total} отработали.",
     )
+    if journal is not None:
+        _render_journal_sheet(wb, journal)
 
     out_path = run_dir(run_id) / "08_result.xlsx"
     out_path.parent.mkdir(parents=True, exist_ok=True)  # папка прогона может ещё не существовать

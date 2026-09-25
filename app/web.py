@@ -211,17 +211,20 @@ def read_act_filename(run_id: str, progress: RunProgress | None = None) -> str:
         return progress.act_filename if progress is not None else run_id
 
 
-def download_filename(act_filename: str) -> str:
+def download_filename(act_filename: str, version: int | None = None) -> str:
     """
     Имя, под которым Excel уезжает аналитику в «Загрузки»: собрано из имени акта,
     чтобы после десяти прогонов там не лежало десять файлов result.xlsx.
+    Версия диалогового режима — в имени (план итерации 3, шаг 1.5): иначе в «Загрузках»
+    копятся файлы с одинаковым именем и разным содержимым.
     """
     stem = Path(act_filename).name.strip()
     for ext in ACCEPTED_EXTENSIONS:
         if stem.lower().endswith(ext):
             stem = stem[: -len(ext)].strip()
             break
-    return f"{stem} — карта гипотез.xlsx" if stem else "карта гипотез.xlsx"
+    suffix = f", версия {version}" if version else ""
+    return f"{stem} — карта гипотез{suffix}.xlsx" if stem else f"карта гипотез{suffix}.xlsx"
 
 
 def excel_file(run_id: str, progress: RunProgress | None) -> Path | None:

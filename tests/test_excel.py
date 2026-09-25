@@ -21,7 +21,9 @@ from app.contracts import (
     DataRequest,
     Effect,
     HypothesisMap,
+    JournalEntry,
     MapRow,
+    Marks,
     RequestItem,
     SourceRef,
     Verdict,
@@ -78,7 +80,7 @@ def _map() -> HypothesisMap:
 
 def _request() -> DataRequest:
     """Запрос: показатель «1» с двумя разрезами (для строки 1), показатель «2» без
-    разрезов (для строки 2). years намеренно 4 — узел их игнорирует, считает сам."""
+    разрезов (для строки 2). years намеренно 4 — Excel выводит ровно годы бланка."""
     return DataRequest(
         items=[
             RequestItem(
@@ -277,7 +279,10 @@ def test_verdicts_sheet_unverified_points_to_same_row_as_map(tmp_runs_dir):
     )
 
 
-def test_request_sheet_has_three_year_columns_not_four(tmp_runs_dir):
+def test_request_sheet_years_come_from_request(tmp_runs_dir):
+    """Колонки годов = годы бланка. С v2.3 их пишет код узла запроса от даты вступления
+    акта в силу (Г5), а Excel до 2026-09-25 считал три года от сегодняшней даты заново:
+    у 1112-ПП (в силе с 21.08.2025) бланк [2025], а в Excel были колонки 2023–2025."""
     path = build_excel(_map(), _request(), _buckets(with_failed=False), _passport(), "run_f")
     ws = load_workbook(path)["Запрос показателей"]
     hdr = _find_header_row(ws, "Показатель")
@@ -286,7 +291,16 @@ def test_request_sheet_has_three_year_columns_not_four(tmp_runs_dir):
     # колонки годов ищем по виду заголовка, а не по позиции: между «Показателем»
     # и годами могут появиться колонки связи с картой
     years = [h for h in header if h and str(h).isdigit() and len(str(h)) == 4]
-    assert len(years) == 3
+    assert years == ["2020", "2021", "2022", "2023"]
+
+
+def test_request_sheet_single_year_for_recent_act(tmp_runs_dir):
+    """Акт в силе с 2025 года — в Excel одна колонка 2025, без пустых 2023 и 2024."""
+    req = _request().model_copy(update={"years": [2025]})
+    path = build_excel(_map(), req, _buckets(with_failed=False), _passport(), "run_f1")
+    ws = load_workbook(path)["Запрос показателей"]
+    header = [c.value for c in ws[_find_header_row(ws, "Показатель")]]
+    assert [h for h in header if h and str(h).isdigit()] == ["2025"]
 
 
 def test_breakdown_rendered_as_subrows(tmp_runs_dir):
@@ -1063,3 +1077,86 @@ def test_basis_cell_carries_grounds_from_verdict(tmp_runs_dir):
     cell = _basis_cell(path)
     assert cell.startswith("Норма акта, п. 5.1.4:")
     assert cell.endswith("Основание из вердикта:\nоснование 1")
+
+
+# ---- Excel для версий диалогового режима (план итерации 3, шаг 1.5) ----
+# Без новых параметров книга прежняя; с ними — номер версии, журнал изменений,
+# колонка «Изменения» (правлено человеком / устарело) и закреплённые номера
+# строк «проверка не завершена».
+
+
+def _journal() -> list[JournalEntry]:
+    return [
+        JournalEntry(version=1, at="2026-09-26T10:00:00", kind="решение эксперта", target="Вердикты, инд. 3",
+                     action="вердикт изменён", before="соблюдён", after="нарушен",
+                     reason="эксперт: пятнадцать форм избыточны"),
+        JournalEntry(version=2, at="2026-09-26T10:05:00", kind="правка", target="Карта гипотез, стр. 2",
+                     action="переформулирована гипотеза", before="гипотеза 2", after="гипотеза 2, короче",
+                     reason="убрать воду", cost_usd=0.12),
+    ]
+
+
+def test_default_book_unchanged_by_version_features(tmp_runs_dir):
+    """Без параметров версий: пять листов, колонки «Изменения» нет, строки «Версия файла» нет."""
+    wb = load_workbook(build_excel(_map(), _request(), _buckets(with_failed=True), _passport(), "run_v0"))
+    assert wb.sheetnames == ["Как заполнять", "Карта гипотез", "Запрос показателей", "Вердикты", "Ошибки прогона"]
+    for sheet, anchor in (("Карта гипотез", "Индикаторы"), ("Запрос показателей", "Показатель"), ("Вердикты", "Вердикт")):
+        ws = wb[sheet]
+        assert "Изменения" not in [c.value for c in ws[_find_header_row(ws, anchor)]]
+    assert "Версия файла" not in [c.value for c in wb["Как заполнять"]["A"]]
+
+
+def test_version_row_and_original_analysis_date(tmp_runs_dir):
+    """Номер версии и дата исходного разбора (а не момент пересборки) — на листе «Как заполнять»."""
+    import datetime
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), _passport(), "run_v2",
+                       version=2, analyzed_at=datetime.datetime(2026, 9, 7, 15, 17))
+    ws = load_workbook(path)["Как заполнять"]
+    rows = {r[0].value: r[1].value for r in ws.iter_rows(max_col=2) if r[0].value}
+    assert rows["Разобран"] == "7 сентября 2026, 15:17"
+    assert rows["Версия файла"].startswith("2")
+
+
+def test_journal_sheet_lists_changes(tmp_runs_dir):
+    """Лист «Журнал изменений» — последний, по строке на изменение."""
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), _passport(), "run_v3",
+                       version=2, journal=_journal())
+    wb = load_workbook(path)
+    assert wb.sheetnames[-1] == "Журнал изменений"
+    ws = wb["Журнал изменений"]
+    hdr = _find_header_row(ws, "Что сделано")
+    body = [r for r in ws.iter_rows(min_row=hdr + 1, values_only=True) if any(r)]
+    assert len(body) == 2
+    assert body[0][_col(ws, hdr, "Где") - 1] == "Вердикты, инд. 3"
+    assert body[1][_col(ws, hdr, "Почему") - 1] == "убрать воду"
+
+
+def test_marks_column_on_three_sheets(tmp_runs_dir):
+    """Колонка «Изменения» — перед оранжевыми колонками, пометка у нужной строки."""
+    marks = Marks(edited_verdicts=[3], stale_rows={2: "вердикт инд. 3 изменён — пересчитать"},
+                  stale_items={"1": "строка карты 1 изменена"})
+    wb = load_workbook(build_excel(_map(), _request(), _buckets(with_failed=False), _passport(), "run_v4",
+                                   version=1, marks=marks))
+    ws = wb["Вердикты"]; hdr = _find_header_row(ws, "Вердикт")
+    names = [c.value for c in ws[hdr]]
+    assert names.index("Изменения") < names.index("Согласны?")
+    assert ws.cell(row=_rows_by_indicator(ws, hdr)[3], column=_col(ws, hdr, "Изменения")).value == "правлено человеком"
+    ws = wb["Карта гипотез"]; hdr = _find_header_row(ws, "Индикаторы")
+    by_id = {ws.cell(row=r, column=1).value: r for r in range(hdr + 1, ws.max_row + 1)}
+    assert "устарело" in ws.cell(row=by_id[2], column=_col(ws, hdr, "Изменения")).value
+    assert not ws.cell(row=by_id[1], column=_col(ws, hdr, "Изменения")).value
+    ws = wb["Запрос показателей"]; hdr = _find_header_row(ws, "Показатель")
+    by_num = {ws.cell(row=r, column=1).value: r for r in range(hdr + 1, ws.max_row + 1)}
+    assert "устарело" in ws.cell(row=by_num["1"], column=_col(ws, hdr, "Изменения")).value
+    assert not ws.cell(row=by_num["1.1"], column=_col(ws, hdr, "Изменения")).value   # разрез — без пометки
+
+
+def test_fixed_unverified_ids_on_map_and_verdicts(tmp_runs_dir):
+    """Закреплённый номер строки «проверка не завершена» — один и тот же на карте и в «Где подробнее»."""
+    wb = load_workbook(build_excel(_map(), _request(), _buckets_with_unverified(), _passport(), "run_v5",
+                                   unverified_ids={4: 9}))
+    ws = wb["Карта гипотез"]; hdr = _find_header_row(ws, "Индикаторы")
+    assert 9 in [ws.cell(row=r, column=1).value for r in range(hdr + 1, ws.max_row + 1)]
+    ws = wb["Вердикты"]; hdr = _find_header_row(ws, "Вердикт")
+    where = ws.cell(row=_rows_by_indicator(ws, hdr)[4], column=_col(ws, hdr, "Где подробнее")).value
+    assert where == "Карта гипотез, стр. 9 — проверка не завершена"

@@ -1560,6 +1560,40 @@ class ActPassport(_Base):
 
 # ==== СЛУЖЕБНЫЕ ====
 
+# ---- Версии диалогового режима (план итерации 3): журнал и пометки строк Excel ----
+
+JournalKind = Literal["правка", "решение эксперта", "перепроверка", "досчёт", "откат"]
+
+
+class JournalEntry(BaseModel):
+    """Строка журнала изменений прогона: одна на каждое применённое изменение."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    version: int = Field(ge=1, description="Номер версии, которую создало это изменение.")
+    at: str = Field(min_length=1, description="Когда применено, время в ISO-формате.")
+    kind: JournalKind = Field(description="Класс изменения.")
+    target: str = Field(min_length=1, description="Где: лист и строка, например «Вердикты, инд. 7».")
+    action: str = Field(min_length=1, description="Что сделано, одной фразой.")
+    before: str | None = Field(default=None, description="Было — коротко; пусто, если строка добавлена.")
+    after: str | None = Field(default=None, description="Стало — коротко; пусто, если строка удалена.")
+    reason: str = Field(default="", description="Почему — словами пользователя или эксперта.")
+    cost_usd: float = Field(default=0.0, ge=0, description="Стоимость вызовов модели для этого изменения.")
+
+
+class Marks(BaseModel):
+    """Пометки строк Excel в версиях: что правил человек, что устарело после изменения и почему."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    edited_verdicts: list[int] = Field(default_factory=list, description="Индикаторы, вердикт которых правил человек.")
+    edited_rows: list[int] = Field(default_factory=list, description="Номера строк карты, которые правил человек.")
+    edited_items: list[str] = Field(default_factory=list, description="Номера позиций запроса, которые правил человек.")
+    stale_verdicts: dict[int, str] = Field(default_factory=dict, description="Индикатор → почему вердикт устарел.")
+    stale_rows: dict[int, str] = Field(default_factory=dict, description="Строка карты → почему устарела.")
+    stale_items: dict[str, str] = Field(default_factory=dict, description="Позиция запроса → почему устарела.")
+
+
 class RunMeta(BaseModel):
     """Метаданные одного прогона пайплайна (для meta.json трейса)."""
 

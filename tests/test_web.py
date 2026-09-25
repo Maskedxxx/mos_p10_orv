@@ -758,3 +758,9 @@ def test_download_filename_strips_any_accepted_extension():
     """Имя для «Загрузок» собирается без расширения исходника, каким бы оно ни было."""
     for name in ("Постановление 410-ПП.pdf", "Постановление 410-ПП.docx", "Постановление 410-ПП.doc"):
         assert web.download_filename(name) == "Постановление 410-ПП — карта гипотез.xlsx"
+
+
+def test_download_filename_with_version():
+    """Версия диалога — в имени файла, чтобы в Загрузках не копились одинаковые имена (шаг 1.5)."""
+    assert web.download_filename("Приказ МАДИ.pdf", version=3) == "Приказ МАДИ — карта гипотез, версия 3.xlsx"
+    assert web.download_filename("Приказ МАДИ.pdf") == "Приказ МАДИ — карта гипотез.xlsx"
