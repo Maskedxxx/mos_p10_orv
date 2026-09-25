@@ -936,7 +936,7 @@ def test_dialog_jobs_plan_waits_for_decision_on_server(tmp_runs_dir, monkeypatch
 
     async def scenario():
         jobs = web.DialogJobs()
-        assert jobs.start(rid, jobs.apply_plan(rid, [edit, recheck]))
+        assert jobs.start(rid, jobs.apply_plan(rid, [edit, recheck], session="s-aaaaaa"))
         await _wait(lambda: jobs.waiting(rid) is not None)
         title, shown = jobs.waiting(rid)
         assert shown is cand and title.startswith("Шаг 2 из 2")
@@ -948,6 +948,7 @@ def test_dialog_jobs_plan_waits_for_decision_on_server(tmp_runs_dir, monkeypatch
     asyncio.run(scenario())
     chat = dialog.read_chat(rid)
     assert [m.get("mark") for m in chat] == [None, "шаг", "шаг", "готово"]
+    assert {m.get("session") for m in chat} == {"s-aaaaaa"}   # кто применял план — у каждой строки
     assert chat[-1]["text"].startswith("Готово: план применён (2 из 2 шагов)")
     assert web.dialog_spent(chat) == pytest.approx(1.5)
     assert dialog.read_status(rid) is None

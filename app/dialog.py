@@ -54,6 +54,7 @@ def read_chat(run_id: str) -> list[dict]:
 def append_chat(run_id: str, role: str, text: str, **extra) -> dict:
     """Дописать реплику в чат прогона: пользователь, ассистент или сервис (что применено, что отклонено)."""
     assert role in _ROLES, role
+    extra = {k: v for k, v in extra.items() if v is not None}   # пустые поля (нет сессии, нет цены) не пишутся
     entry = {"at": datetime.datetime.now().isoformat(timespec="seconds"), "role": role, "text": text, **extra}
     path = run_dir(run_id) / CHAT
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -88,13 +89,13 @@ def build_document(run_id: str, message: str, history: list[dict]) -> str:
     return "\n".join(parts)
 
 
-def turn(run_id: str, message: str, *, timeout_s: int = 900) -> TurnResult:
-    """Ответить на сообщение пользователя: текст и план. Реплики и стоимость — в чат и meta."""
+def turn(run_id: str, message: str, *, session: str | None = None, timeout_s: int = 900) -> TurnResult:
+    """Ответить на сообщение пользователя: текст и план. Реплики и стоимость — в чат и meta; session — чья реплика."""
     versions.recover(run_id)
     versions.ensure_v0(run_id)
     history = read_chat(run_id)[-HISTORY_MESSAGES:]
     n = len(read_chat(run_id)) + 1
-    append_chat(run_id, "пользователь", message)
+    append_chat(run_id, "пользователь", message, session=session)
     result = call(
         PROMPT_DIALOG.read_text(encoding="utf-8"),
         build_document(run_id, message, history),

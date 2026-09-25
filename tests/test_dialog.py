@@ -96,3 +96,10 @@ def test_status_file_set_read_clear(rid):
     assert st["state"] == "шаг" and st["server"] == dialog_module.SERVER_ID and st["since"]
     dialog_module.clear_status(rid)
     assert dialog_module.read_status(rid) is None
+
+
+def test_turn_marks_user_message_with_session(rid, monkeypatch):
+    monkeypatch.setattr(dialog_module, "call", Mock(return_value=_ok(DialogTurn(reply="Ответ."))))
+    dialog_module.turn(rid, "Вопрос", session="s-7f3a91")
+    user, assistant = dialog_module.read_chat(rid)
+    assert user["session"] == "s-7f3a91" and "session" not in assistant

@@ -67,3 +67,28 @@ def test_get_run_logger_thread_safe_under_concurrency(tmp_runs_dir):
     log_path = tmp_runs_dir / run_id / "run.log"
     lines = log_path.read_text(encoding="utf-8").splitlines()
     assert len(lines) == n_threads * lines_per_thread
+
+
+
+def test_service_log_to_file_with_rotation(tmp_path):
+    """Лог сервиса — в файл: сообщения приложения и предупреждения NiceGUI; служебный шум NiceGUI — нет."""
+    import logging
+    from logging.handlers import RotatingFileHandler
+
+    from app.logger import app_logger, attach_service_log
+
+    path = tmp_path / "logs" / "service.log"
+    handler = attach_service_log(path)
+    try:
+        assert isinstance(handler, RotatingFileHandler)
+        app_logger.info("сервис запущен: порт 8031")
+        logging.getLogger("nicegui").info("служебный шум")
+        logging.getLogger("nicegui").warning("ошибка обработчика")
+        handler.flush()
+        text = path.read_text(encoding="utf-8")
+        assert "сервис запущен: порт 8031" in text and "ошибка обработчика" in text
+        assert "служебный шум" not in text
+    finally:
+        app_logger.removeHandler(handler)
+        logging.getLogger("nicegui").removeHandler(handler)
+        handler.close()

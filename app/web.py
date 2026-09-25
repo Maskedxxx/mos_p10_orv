@@ -42,6 +42,13 @@
 app/operations.py; каждое изменение — новая версия (app/versions.py). Панель, как
 и граф, перечитывает диск по таймеру; правит одно окно, остальные — только смотрят.
 
+СЕССИИ И ЖУРНАЛ ДЕЙСТВИЙ. Бета: один логин на всех, поэтому люди различаются
+по сессии браузера — метке из id в cookie NiceGUI (s-7f3a91, app/actions.py). Метка
+и адрес снимаются при открытии страницы; каждое действие — вход, выход, старт
+прогона, открытие, скачивание, ход диалога, «Применить», «Принять», «Вернуть»,
+файл эксперта — одна строка var/logs/actions.jsonl, а в чате диалога метка стоит
+у реплики и у строк применённого плана. Лог сервиса — var/logs/service.log.
+
 ИМЯ АКТА. Загруженный файл ложится в папку прогона под служебным именем
 00_input.docx, и именно его видит оркестратор — в progress.json попадает
 «00_input.docx». Оригинальное имя сохраняет trace.new_run() в meta.json, оттуда
@@ -74,11 +81,12 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.responses import Response
 
 from app import config, dialog, feedback, operations, trace, versions
+from app.actions import Who, log_action, session_label
 from app.config import ACCEPTED_EXTENSIONS, all_indicators
 from app.contracts import (
     Buckets, DataRequest, HypothesisMap, Marks, NodeState, NodeStatus, Operation, RunMeta, RunProgress, RunStatus,
 )
-from app.logger import get_run_logger
+from app.logger import app_logger, attach_service_log, get_run_logger
 from app.pipeline import PROGRESS_FILE, run_pipeline
 
 # Порт страницы (свободен, проверено)
@@ -673,29 +681,30 @@ class DialogJobs:
         self._tasks[run_id] = asyncio.get_running_loop().create_task(job)
         return True
 
-    def cancel_plan(self, run_id: str) -> None:
+    def cancel_plan(self, run_id: str, session: str | None = None) -> None:
         dialog.append_chat(run_id, "сервис", f"План отменён — файл не изменён (версия {_current_version(run_id)}).",
-                           mark="отменено")
+                           mark="отменено", session=session)
 
-    async def turn(self, run_id: str, text: str) -> None:
-        """Ход помощника: ответ и, может быть, план — всё пишется в чат."""
+    async def turn(self, run_id: str, text: str, session: str | None = None) -> None:
+        """Ход помощника: ответ и, может быть, план — всё пишется в чат; session — чья реплика."""
         if pending_plan(dialog.read_chat(run_id)):
-            dialog.append_chat(run_id, "сервис", "План выше не применён.", mark="отменено")
+            dialog.append_chat(run_id, "сервис", "План выше не применён.", mark="отменено", session=session)
         dialog.set_status(run_id, "думает", "Помощник думает…", "обычно 10–40 сек")
         try:
-            await nicegui_run.io_bound(dialog.turn, run_id, text)
+            await nicegui_run.io_bound(lambda: dialog.turn(run_id, text, session=session))
         except Exception as error:   # сбой вне вызова модели (диск, артефакты) — в чат, сервис живёт
-            dialog.append_chat(run_id, "сервис", f"Сбой хода помощника: {error}", mark="сбой")
+            dialog.append_chat(run_id, "сервис", f"Сбой хода помощника: {error}", mark="сбой", session=session)
         finally:
             dialog.clear_status(run_id)
 
-    async def apply_plan(self, run_id: str, plan: list[Operation]) -> None:
-        """Шаги плана по одному; итог каждого и всего плана — в чат; сбой останавливает остальные."""
+    async def apply_plan(self, run_id: str, plan: list[Operation], session: str | None = None) -> None:
+        """Шаги плана по одному; итог каждого и всего плана — в чат с меткой сессии; сбой останавливает остальные."""
         total = len(plan)
         applied = rejected = 0
         failed: int | None = None
         why: str | None = None
-        dialog.append_chat(run_id, "сервис", f"Применяю план: {total} {plural(total, 'шаг', 'шага', 'шагов')}.")
+        dialog.append_chat(run_id, "сервис", f"Применяю план: {total} {plural(total, 'шаг', 'шага', 'шагов')}.",
+                           session=session)
         try:
             for number, op in enumerate(plan, 1):
                 title = f"Шаг {number} из {total}: {op_title(op)}"
@@ -709,7 +718,7 @@ class DialogJobs:
                         if not await self._decision(run_id, title, result.candidate):
                             rejected += 1
                             dialog.append_chat(run_id, "сервис", f"Шаг {number} отклонён — файл не изменён.",
-                                               mark="отменено", cost_usd=round(result.cost_usd, 4))
+                                               mark="отменено", cost_usd=round(result.cost_usd, 4), session=session)
                             continue
                         dialog.set_status(run_id, "шаг", f"Записываю шаг {number} из {total}", "обычно несколько секунд")
                         result = await nicegui_run.io_bound(operations.accept, run_id, result.candidate)
@@ -722,11 +731,11 @@ class DialogJobs:
                                     after.marks if after is not None else Marks())
                 text = step_text(result) + ("\nУстарело: " + "; ".join(notes) if notes else "")
                 dialog.append_chat(run_id, "сервис", text, mark="шаг", version=result.version,
-                                   cost_usd=round(result.cost_usd, 4))
+                                   cost_usd=round(result.cost_usd, 4), session=session)
         finally:
             dialog.clear_status(run_id)
         text, mark = plan_summary(total, applied, rejected, failed, why, _current_version(run_id))
-        dialog.append_chat(run_id, "сервис", text, mark=mark)
+        dialog.append_chat(run_id, "сервис", text, mark=mark, session=session)
 
     async def _decision(self, run_id: str, title: str, candidate: operations.Candidate) -> bool:
         """Ждать «Принять» / «Отклонить» по результату агента."""
@@ -739,14 +748,16 @@ class DialogJobs:
         finally:
             self._waiting.pop(run_id, None)
 
-    async def rollback(self, run_id: str, n: int) -> None:
+    async def rollback(self, run_id: str, n: int, session: str | None = None) -> None:
         """Вернуть версию n — новой версией, ничего не стирая."""
         dialog.set_status(run_id, "шаг", f"Возвращаю версию {n}", "обычно несколько секунд")
         try:
             result = await nicegui_run.io_bound(operations.rollback, run_id, n)
-            dialog.append_chat(run_id, "сервис", f"Готово: {step_text(result)}", mark="готово", version=result.version)
+            dialog.append_chat(run_id, "сервис", f"Готово: {step_text(result)}", mark="готово", version=result.version,
+                               session=session)
         except Exception as error:
-            dialog.append_chat(run_id, "сервис", f"Вернуть версию {n} не получилось: {error}", mark="сбой")
+            dialog.append_chat(run_id, "сервис", f"Вернуть версию {n} не получилось: {error}", mark="сбой",
+                               session=session)
         finally:
             dialog.clear_status(run_id)
 
@@ -952,13 +963,28 @@ _SUMMARY_COUNTERS: tuple[tuple[str, str], ...] = (
 )
 
 
-def _logout() -> None:
+def _who(request: Request) -> Who:
+    """Кто открыл страницу: метка сессии браузера (id из cookie NiceGUI) и адрес — снимаются при открытии."""
+    return Who(session=session_label(nicegui_app.storage.browser.get("id")),
+               address=request.client.host if request.client is not None else None,
+               forwarded=request.headers.get("x-forwarded-for"))
+
+
+def _download(who: Who, run_id: str, path: Path, act: str, version: int | None) -> None:
+    """Скачивание Excel — с записью в журнал действий."""
+    name = download_filename(act, version)
+    log_action(who, "скачивание Excel", run_id, version=version or 0, file=name)
+    ui.download.file(path, name)
+
+
+def _logout(who: Who) -> None:
     """Выход: сессия чистится целиком, дальше — только через страницу входа."""
+    log_action(who, "выход")
     nicegui_app.storage.user.clear()
     ui.navigate.to(LOGIN_PATH)
 
 
-def _layout() -> None:
+def _layout(who: Who) -> None:
     """Общая шапка сервиса: название, переходы между экранами и выход."""
     ui.page_title("Платформа ОРВ · П-10")
     with ui.header().classes("items-center justify-between px-6 py-3"):
@@ -966,7 +992,7 @@ def _layout() -> None:
         with ui.row().classes("gap-6 items-center"):
             ui.link("Новый прогон", "/").classes("text-white no-underline")
             ui.link("История", "/history").classes("text-white no-underline")
-            ui.button("Выйти", on_click=_logout).props("flat dense color=white")
+            ui.button("Выйти", on_click=lambda: _logout(who)).props("flat dense color=white")
 
 
 def _status_icon(status: NodeStatus) -> None:
@@ -1001,8 +1027,9 @@ class _RunView:
     «br:<ветка>» для ветки гипотез.
     """
 
-    def __init__(self, run_id: str) -> None:
+    def __init__(self, run_id: str, who: Who) -> None:
         self._run_id = run_id
+        self._who = who
         self._built = False
         self._finished = False
         self._shown: dict[str, NodeStatus] = {}  # последнее отрисованное состояние
@@ -1166,7 +1193,7 @@ class _RunView:
         reason = dialog_unavailable(self._run_id, progress)
         with self._result:
             if reason is None:
-                _DialogView(self._run_id, on_version=self._refresh_result)
+                _DialogView(self._run_id, on_version=self._refresh_result, who=self._who)
             elif progress.status == "готов":
                 ui.label(reason).classes("text-sm text-gray-600")
 
@@ -1227,7 +1254,7 @@ class _RunView:
                     ui.button(
                         "Скачать Excel" + (f" · версия {version}" if version else ""),
                         icon="download",
-                        on_click=lambda: ui.download.file(excel, download_filename(act, version)),
+                        on_click=lambda: _download(self._who, self._run_id, excel, act, version),
                     ).props("unelevated")
                 else:
                     ui.label("Файл Excel не собран — скачивать нечего.").classes(
@@ -1265,12 +1292,14 @@ class _DialogView:
     }
     _STATE_ROW = "w-full items-center flex-nowrap gap-3 px-4 py-3 rounded"
 
-    def __init__(self, run_id: str, on_version: Callable[[], None]) -> None:
+    def __init__(self, run_id: str, on_version: Callable[[], None], who: Who) -> None:
         self._run_id = run_id
         self._on_version = on_version
+        self._who = who                              # сессия браузера — в журнал действий и строки чата
         self._client = ui.context.client
         self._client_id = self._client.id
         self._editable: bool | None = None
+        self._disconnected = False                  # окно было подключено и отключилось (закрыто, перезагружается)
         self._shown_chat = -1                       # сколько реплик отрисовано
         self._shown_tone: tuple | None = None       # (тон, заголовок) строки состояния
         self._shown_pending: tuple | None = None    # от чего зависит карточка плана или решения
@@ -1328,17 +1357,24 @@ class _DialogView:
                 self._versions = ui.column().classes("w-full gap-2 px-2 pb-3")
 
         self._input.on("keydown.ctrl.enter", self._on_send)
-        self._client.on_disconnect(lambda: DIALOG_LOCK.release(self._run_id, self._client_id))
+        self._client.on_connect(lambda: setattr(self, "_disconnected", False))
+        self._client.on_disconnect(self._on_disconnect)
         ui.timer(DIALOG_POLL_S, self._tick)
         self._tick()
+
+    def _on_disconnect(self) -> None:
+        self._disconnected = True
+        DIALOG_LOCK.release(self._run_id, self._client_id)
 
     # ---- опрос диска ----
 
     def _tick(self) -> None:
         """Продлить замок и перерисовать то, что изменилось: чат, строку состояния, карточку, версии."""
-        if not self._client.has_socket_connection:
+        if self._disconnected:
             # Окно закрыто или перезагружается: NiceGUI держит его ещё несколько секунд, и без этой
-            # проверки его таймер снова занял бы правку — новое окно ждало бы, пока замок истечёт
+            # проверки его таймер снова занял бы правку — новое окно ждало бы, пока замок истечёт.
+            # Флаг, а не has_socket_connection: при открытии страницы сокета ещё нет, а правка
+            # нужна сразу — иначе первая секунда кнопок молча не работает
             return
         rid = self._run_id
         self._editable = DIALOG_LOCK.acquire(rid, self._client_id, time.monotonic())
@@ -1401,10 +1437,14 @@ class _DialogView:
                     weight = " font-medium" if message.get("mark") in ("готово", "частично", "сбой") else ""
                     with ui.row().classes("w-full items-start flex-nowrap gap-2 px-3 py-2 bg-gray-100 rounded"):
                         ui.icon(icon, color=color).classes("text-lg")
-                        ui.label(message["text"]).classes(f"text-sm text-gray-800 whitespace-pre-line{weight}")
+                        ui.label(message["text"]).classes(f"text-sm text-gray-800 whitespace-pre-line flex-grow{weight}")
+                        if message.get("session"):
+                            ui.label(message["session"]).classes("text-xs text-gray-500 whitespace-nowrap")
                     continue
                 mine = message["role"] == "пользователь"
                 stamp = message.get("at", "")[11:16]
+                if message.get("session"):
+                    stamp += f" · {message['session']}"
                 if message.get("cost_usd"):
                     stamp += f" · {format_cost(message['cost_usd'])}"
                 ui.chat_message(
@@ -1436,8 +1476,7 @@ class _DialogView:
                 )
             if self._editable:
                 with ui.row().classes("gap-2"):
-                    ui.button("Применить", icon="check",
-                              on_click=lambda: self._start(DIALOG_JOBS.apply_plan(self._run_id, plan))).props("unelevated")
+                    ui.button("Применить", icon="check", on_click=lambda: self._apply(plan)).props("unelevated")
                     ui.button("Отменить", on_click=self._on_cancel_plan).props("flat")
 
     def _render_candidate(self, title: str, candidate: operations.Candidate) -> None:
@@ -1472,12 +1511,12 @@ class _DialogView:
                     )
                     ui.label(what).classes("text-sm text-gray-700 flex-grow")
                     ui.button(
-                        icon="download", on_click=lambda p=path, n=n: ui.download.file(p, download_filename(act, n))
+                        icon="download", on_click=lambda p=path, n=n: _download(self._who, self._run_id, p, act, n)
                     ).props("flat dense").tooltip("Скачать эту версию")
                     if n != current and active:
-                        ui.button(
-                            "Вернуть", on_click=lambda n=n: self._start(DIALOG_JOBS.rollback(self._run_id, n))
-                        ).props("flat dense").tooltip("Сделать новую версию с содержимым этой — ничего не стирается")
+                        ui.button("Вернуть", on_click=lambda n=n: self._rollback(n)).props("flat dense").tooltip(
+                            "Сделать новую версию с содержимым этой — ничего не стирается"
+                        )
 
     # ---- действия (сами действия — в DIALOG_JOBS, на сервере) ----
 
@@ -1490,27 +1529,45 @@ class _DialogView:
         self._tick()
 
     def _decide(self, accepted: bool) -> None:
-        if self._editable:
+        waiting = DIALOG_JOBS.waiting(self._run_id)
+        if self._editable and waiting is not None:
+            log_action(self._who, "принять" if accepted else "отклонить", self._run_id, step=waiting[0])
             DIALOG_JOBS.decide(self._run_id, accepted)
         self._tick()
+
+    def _apply(self, plan: list[Operation]) -> None:
+        if self._editable and not DIALOG_JOBS.busy(self._run_id):
+            log_action(self._who, "применить план", self._run_id, steps=[op_title(op) for op in plan])
+        self._start(DIALOG_JOBS.apply_plan(self._run_id, plan, self._who.session))
+
+    def _rollback(self, n: int) -> None:
+        if self._editable and not DIALOG_JOBS.busy(self._run_id):
+            log_action(self._who, "вернуть версию", self._run_id, version=n)
+        self._start(DIALOG_JOBS.rollback(self._run_id, n, self._who.session))
 
     def _on_send(self) -> None:
         text = (self._input.value or "").strip()
         if not text or not self._editable or DIALOG_JOBS.busy(self._run_id):
             return
         self._input.set_value("")
-        self._start(DIALOG_JOBS.turn(self._run_id, text))
+        log_action(self._who, "сообщение помощнику", self._run_id, text=shorten(text, 500))
+        self._start(DIALOG_JOBS.turn(self._run_id, text, self._who.session))
 
     def _on_next_remark(self) -> None:
         if not self._editable or DIALOG_JOBS.busy(self._run_id):
             return
+        progress = dialog.remarks_progress(self._run_id)
         remark = dialog.next_remark(self._run_id)
         if remark is not None:
-            self._start(DIALOG_JOBS.turn(self._run_id, feedback.remark_message(remark)))
+            text = feedback.remark_message(remark)
+            log_action(self._who, "сообщение помощнику", self._run_id, text=shorten(text, 500),
+                       source=f"замечание эксперта {progress[0] + 1} из {progress[1]}")
+            self._start(DIALOG_JOBS.turn(self._run_id, text, self._who.session))
 
     def _on_cancel_plan(self) -> None:
         if self._editable and not DIALOG_JOBS.busy(self._run_id):
-            DIALOG_JOBS.cancel_plan(self._run_id)
+            log_action(self._who, "отменить план", self._run_id)
+            DIALOG_JOBS.cancel_plan(self._run_id, self._who.session)
         self._tick()
 
     async def _on_expert_file(self, event: UploadEventArguments) -> None:
@@ -1533,10 +1590,11 @@ class _DialogView:
         queued = [r for r in remarks if feedback.is_queued(r)]
         dialog.save_remarks(self._run_id, name, queued)
         n = len(queued)
+        log_action(self._who, "файл эксперта", self._run_id, file=name, queued=n)
         text = (f"Загружен файл эксперта «{name}»: в очереди {n} {plural(n, 'замечание', 'замечания', 'замечаний')} "
                 "(несогласия и замечания с текстом). Разбор по одному — кнопка «Следующее замечание эксперта».")
         summary = feedback.summary(remarks)
-        dialog.append_chat(self._run_id, "сервис", text + (f"\n{summary}" if summary else ""))
+        dialog.append_chat(self._run_id, "сервис", text + (f"\n{summary}" if summary else ""), session=self._who.session)
         self._tick()
 
 
@@ -1555,6 +1613,7 @@ def page_login(request: Request) -> Response | None:
     ui.page_title("Платформа ОРВ · П-10")
     # Адрес посетителя — ключ счётчика попыток; за прокси его может не быть вовсе
     address = request.client.host if request.client is not None else "адрес неизвестен"
+    who = _who(request)
 
     def try_login() -> None:
         """Проверить пару и, если сошлось, пустить туда, куда человек шёл."""
@@ -1562,15 +1621,18 @@ def page_login(request: Request) -> Response | None:
         waiting = LOGIN_THROTTLE.retry_after(address, now)
         if waiting > 0:
             message.set_text(throttle_message(waiting))
+            log_action(who, "неудачный вход", login=login.value or "", reason="пауза после ошибок")
             return
 
         if not check_credentials(login.value or "", password.value or ""):
             LOGIN_THROTTLE.register_failure(address, now)
+            log_action(who, "неудачный вход", login=login.value or "")
             password.set_value("")
             message.set_text(LOGIN_ERROR)
             return
 
         LOGIN_THROTTLE.register_success(address)
+        log_action(who, "вход")
         nicegui_app.storage.user[SESSION_AUTHENTICATED] = True
         ui.navigate.to(safe_referrer(nicegui_app.storage.user.pop(SESSION_REFERRER, None)))
 
@@ -1595,9 +1657,10 @@ def page_login(request: Request) -> Response | None:
 
 
 @ui.page("/")
-def page_index() -> None:
+def page_index(request: Request) -> None:
     """Экран 1 — загрузка акта и запуск прогона."""
-    _layout()
+    who = _who(request)
+    _layout(who)
     pending: dict[str, object] = {}
 
     async def handle_upload(event: UploadEventArguments) -> None:
@@ -1632,6 +1695,7 @@ def page_index() -> None:
         input_name = input_filename(name)
         trace.save_bytes(run_id, input_name, data)
         QUEUE.submit(run_id, trace.run_dir(run_id) / input_name)
+        log_action(who, "старт прогона", run_id, file=name, size=len(data))
         ui.navigate.to(f"/run/{run_id}")
 
     with ui.column().classes("w-full items-center p-8"):
@@ -1662,9 +1726,10 @@ def page_index() -> None:
 
 
 @ui.page("/run/{run_id}")
-def page_run(run_id: str) -> None:
+def page_run(run_id: str, request: Request) -> None:
     """Экран 2 — граф выполнения, он же экран 3 — результат по окончании прогона."""
-    _layout()
+    who = _who(request)
+    _layout(who)
 
     if not trace.run_dir(run_id).is_dir():
         with ui.column().classes("w-full items-center p-8"):
@@ -1673,13 +1738,14 @@ def page_run(run_id: str) -> None:
                 ui.link("Посмотреть список прогонов", "/history")
         return
 
-    _RunView(run_id)
+    log_action(who, "открытие прогона", run_id)
+    _RunView(run_id, who)
 
 
 @ui.page("/history")
-def page_history() -> None:
+def page_history(request: Request) -> None:
     """Экран 4 — последние прогоны, клик открывает результат старого прогона."""
-    _layout()
+    _layout(_who(request))
     items = list_history()
 
     with ui.column().classes("w-full items-center p-8"), ui.card().classes("w-full max-w-4xl p-0"):
@@ -1731,6 +1797,8 @@ def main() -> None:
     config.load_secrets()
     config.require_auth_settings()
     configure_storage_path()
+    attach_service_log(config.LOGS_DIR / "service.log")
+    app_logger.info("сервис запущен: порт %s", WEB_PORT)
     ui.run(
         host="0.0.0.0",
         port=WEB_PORT,

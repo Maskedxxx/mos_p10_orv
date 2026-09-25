@@ -25,6 +25,8 @@ from __future__ import annotations
 import logging
 import os
 import threading
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
 from app.config import RUNS_DIR
 
@@ -87,3 +89,20 @@ def close_run_logger(logger: logging.Logger) -> None:
     for handler in list(logger.handlers):
         handler.close()
         logger.removeHandler(handler)
+
+
+def attach_service_log(path: Path) -> RotatingFileHandler:
+    """
+    Лог сервиса в файл с ротацией (5 файлов по 5 МБ) — зовётся при старте страницы.
+
+    Пишутся общий лог приложения и предупреждения и ошибки NiceGUI (сбои обработчиков
+    страницы); служебный шум NiceGUI уровня INFO — нет. Раньше всё это уходило только
+    в перенаправленный вывод /tmp/p10web.log и терялось при перезапуске.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handler = RotatingFileHandler(path, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8")
+    handler.setFormatter(logging.Formatter(LOG_FORMAT))
+    handler.addFilter(lambda record: not record.name.startswith("nicegui") or record.levelno >= logging.WARNING)
+    app_logger.addHandler(handler)
+    logging.getLogger("nicegui").addHandler(handler)
+    return handler
