@@ -45,7 +45,7 @@ import json
 import re
 
 from app.config import ALLOWED_TOOLS_TEXT, PROMPT_MERGE
-from app.contracts import Hypothesis, HypothesisMap, HypothesisSet, MapRow
+from app.contracts import Hypothesis, HypothesisMap, HypothesisSet, MapRow, MergeOutput
 from app.logger import get_run_logger
 from app.nodes.hypotheses import _add_cost_to_meta
 from app.runner import call
@@ -240,7 +240,7 @@ def merge_map(
     result = call(
         instruction,
         document,
-        HypothesisMap,
+        MergeOutput,   # строгая нумерация — в ответе модели (контракт, шаг 1.3)
         run_id=run_id,
         trace_name="06_map.raw.json",
         allowed_tools=ALLOWED_TOOLS_TEXT,

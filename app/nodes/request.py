@@ -41,7 +41,7 @@ from __future__ import annotations
 import json
 
 from app.config import ALLOWED_TOOLS_TEXT, PROMPT_REQUEST, REQUEST_YEARS_DEPTH
-from app.contracts import DataRequest, HypothesisMap
+from app.contracts import DataRequest, HypothesisMap, RequestOutput
 from app.logger import get_run_logger
 from app.nodes.excel import compute_years
 from app.nodes.hypotheses import _add_cost_to_meta
@@ -226,7 +226,7 @@ def build_request(
     result = call(
         instruction,
         document,
-        DataRequest,
+        RequestOutput,   # строгая нумерация — в ответе модели (контракт, шаг 1.3)
         run_id=run_id,
         trace_name="07_request.raw.json",
         allowed_tools=ALLOWED_TOOLS_TEXT,

@@ -23,6 +23,7 @@ from app.contracts import (
     HypothesisSet,
     MapRow,
     Merge,
+    MergeOutput,
     RunMeta,
 )
 from app.nodes.merge import _candidate_pairs, merge_map
@@ -222,6 +223,7 @@ def test_no_tools_and_prompt_used(run_id, tmp_prompt, monkeypatch):
         seen["instruction"] = instruction
         seen["tools"] = kwargs["allowed_tools"]
         seen["trace_name"] = kwargs["trace_name"]
+        seen["model_cls"] = model_cls
         return _ok_call_result(result_map)
 
     monkeypatch.setattr(merge_module, "call", Mock(side_effect=_effect))
@@ -229,6 +231,7 @@ def test_no_tools_and_prompt_used(run_id, tmp_prompt, monkeypatch):
     merge_map(hsets, "текст акта", run_id)
 
     assert seen["tools"] == []
+    assert seen["model_cls"] is MergeOutput   # ответ модели — строгая форма (шаг 1.3)
     assert "Промпт 05_merge" in seen["instruction"]
     assert seen["trace_name"] == "06_map.raw.json"
 

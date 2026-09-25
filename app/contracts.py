@@ -16,9 +16,10 @@
 - Effect, DataItem, Hypothesis, HypothesisSet — гипотезы (узлы [4а]/[4б]):
   несколько эффектов на гипотезу, основание из карточки вердикта, род нарушения;
 - MapRow, Merge, PairDecision, HypothesisMap — карта (узел [5]): решения по
-  кандидатам на слияние;
+  кандидатам на слияние; MergeOutput — строгая форма карты для ответа модели;
 - SourceRef, RequestItem, DataRequest — запрос показателей (узел [6]): единица
-  измерения перечислением, род позиции, происхождение, пояснение;
+  измерения перечислением, род позиции, происхождение, пояснение; RequestOutput —
+  строгая форма бланка для ответа модели;
 - ActPassport и вложенные — паспорт акта (узел [1.1], вместо саммари);
 - RunMeta, NodeState, RunProgress, RunResult — служебные.
 """
@@ -525,10 +526,10 @@ class HypothesisMap(_Base):
 
     @model_validator(mode="after")
     def _check_consistency(self) -> "HypothesisMap":
-        """row_id сквозные; слияния не пересекаются; решения «слить» ↔ слияния."""
+        """row_id уникальны и по возрастанию; слияния не пересекаются; решения «слить» ↔ слияния."""
         ids = [r.row_id for r in self.rows]
-        if ids != list(range(1, len(ids) + 1)):
-            raise ValueError("row_id должны идти сквозной нумерацией с 1")
+        if ids != sorted(set(ids)):
+            raise ValueError("row_id должны быть уникальны и идти по возрастанию")
         seen: set[int] = set()
         for m in self.merges:
             overlap = seen & set(m.merged_row_ids)
@@ -543,6 +544,24 @@ class HypothesisMap(_Base):
                 raise ValueError(f"решение «слить» по паре {sorted(pair)} без соответствующего слияния")
             if not d.merge and in_merge:
                 raise ValueError(f"пара {sorted(pair)} слита, но решение по ней — «не сливать»")
+        return self
+
+
+class MergeOutput(HypothesisMap):
+    """Итоговая карта гипотез: строки, выполненные слияния, решения по кандидатам."""
+
+    # Строгая форма карты для ОТВЕТА МОДЕЛИ узла [5]: свежая карта нумеруется с 1 подряд.
+    # Хранимая карта (HypothesisMap) допускает дырки — после удаления строки в диалоговом
+    # режиме номер закреплён за строкой (план итерации 3, шаг 1.3). Проверка живёт здесь,
+    # а не в коде узла: runner.call ловит её и просит модель исправиться через --resume.
+    # Заголовок и описание те же, что у базы, — схема для модели побайтно прежняя.
+    model_config = ConfigDict(title="HypothesisMap")
+
+    @model_validator(mode="after")
+    def _check_fresh_numbering(self) -> "MergeOutput":
+        ids = [r.row_id for r in self.rows]
+        if ids != list(range(1, len(ids) + 1)):
+            raise ValueError("row_id должны идти сквозной нумерацией с 1")
         return self
 
 
@@ -739,7 +758,28 @@ class DataRequest(_Base):
 
     @model_validator(mode="after")
     def _check_request(self) -> "DataRequest":
-        """Нумерация сквозная; показатели раньше перечней; показатель карты — в одной позиции."""
+        """Номера позиций уникальны; показатель карты — в одной позиции."""
+        nums = [it.num for it in self.items]
+        if len(nums) != len(set(nums)):
+            raise ValueError("num позиций должны быть уникальны")
+        # Один показатель карты в нескольких позициях контрактом НЕ запрещается:
+        # показатель «сумма грантов и количество получателей» законно делится
+        # на две позиции с одним sources (Г1). Дубль от разделения отличает код
+        # (WARNING в request._check_coverage), решает аналитик.
+        return self
+
+
+class RequestOutput(DataRequest):
+    """Бланк запроса показателей органу-разработчику."""
+
+    # Строгая форма бланка для ОТВЕТА МОДЕЛИ узла [6]: номера «1», «2», … подряд, сначала
+    # показатели по годам, затем перечни. Хранимый бланк (DataRequest) допускает дырки
+    # и дописанные позиции — после правок в диалоговом режиме (план итерации 3, шаг 1.3);
+    # лист Excel всё равно выводит счётчики раньше перечней. Схема для модели прежняя.
+    model_config = ConfigDict(title="DataRequest")
+
+    @model_validator(mode="after")
+    def _check_fresh_numbering(self) -> "RequestOutput":
         nums = [it.num for it in self.items]
         if nums != [str(i) for i in range(1, len(nums) + 1)]:
             raise ValueError("num должны идти сквозной нумерацией «1», «2», … без пропусков")
@@ -748,10 +788,6 @@ class DataRequest(_Base):
             first_list = kinds.index("перечень или реестр")
             if any(k == "показатель по годам" for k in kinds[first_list:]):
                 raise ValueError("сначала все показатели по годам, затем перечни и реестры")
-        # Один показатель карты в нескольких позициях контрактом НЕ запрещается:
-        # показатель «сумма грантов и количество получателей» законно делится
-        # на две позиции с одним sources (Г1). Дубль от разделения отличает код
-        # (WARNING в request._check_coverage), решает аналитик.
         return self
 
 

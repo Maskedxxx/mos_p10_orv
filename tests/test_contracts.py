@@ -23,8 +23,10 @@ from app.contracts import (
     HypothesisSet,
     MapRow,
     Merge,
+    MergeOutput,
     PairDecision,
     RequestItem,
+    RequestOutput,
     RunMeta,
     SourceRef,
     Verdict,
@@ -295,17 +297,25 @@ def test_passport_schema_fits_argv_limit():
 
 def _hyp(**kw) -> dict:
     base = {"hypothesis": "h", "grounds": "g",
-            "effects": [{"affected": "бизнес", "metric": "m", "how_to_calculate": "c"}],
+            "effects": [{"affected": "бизнес", "metric": "m", "how_to_calculate": "c", "expected_trend": "рост"}],
             "data": [{"metric": "d", "source": "запрос органу"}]}
     base.update(kw)
     return base
 
 
+def test_helpers_build_valid_objects():
+    """Страж: помощники собирают валидные объекты. Иначе тесты «отвергается» проходят
+    по чужой причине — так было с v2.4 до 2026-09-25: эффект без обязательного
+    expected_trend отвергался, и шесть тестов ничего не проверяли."""
+    Hypothesis(**_hyp())
+    HypothesisMap(rows=[_row(1, [1])])
+
+
 def test_hypothesis_two_effects_same_group_rejected():
     with pytest.raises(ValidationError):
         Hypothesis(**_hyp(effects=[
-            {"affected": "бизнес", "metric": "a", "how_to_calculate": "c"},
-            {"affected": "бизнес", "metric": "b", "how_to_calculate": "c"},
+            {"affected": "бизнес", "metric": "a", "how_to_calculate": "c", "expected_trend": "рост"},
+            {"affected": "бизнес", "metric": "b", "how_to_calculate": "c", "expected_trend": "рост"},
         ]))
 
 
@@ -318,12 +328,13 @@ def test_data_item_open_requires_where_and_request_forbids_it():
 
 def _row(i: int, ind: list[int]) -> dict:
     return {"row_id": i, "indicators": ind, "hypothesis": "h", "grounds": "g",
-            "effects": [{"affected": "бизнес", "metric": "m", "how_to_calculate": "c"}],
+            "effects": [{"affected": "бизнес", "metric": "m", "how_to_calculate": "c", "expected_trend": "рост"}],
             "data": [{"metric": "d", "source": "запрос органу"}]}
 
 
 @pytest.mark.parametrize("payload", [
-    {"rows": [_row(1, [1]), _row(3, [2])]},                                                  # row_id не сквозные
+    {"rows": [_row(2, [1]), _row(1, [2])]},                                                  # row_id не по возрастанию
+    {"rows": [_row(1, [1]), _row(1, [2])]},                                                  # row_id повторяется
     {"rows": [_row(1, [1])], "decisions": [{"row_ids": [1, 2], "merge": True, "reason": "r"}]},  # «слить» без слияния
     {"rows": [_row(1, [1, 2])], "merges": [{"merged_row_ids": [1, 2], "reason": "r"}],
      "decisions": [{"row_ids": [1, 2], "merge": False, "reason": "r"}]},                    # слито при «не сливать»
@@ -357,9 +368,46 @@ def test_request_item_violations_rejected(item):
         RequestItem(**item)
 
 
+# Нумерация без «подряд» (план итерации 3, шаг 1.3): после удаления строки карты
+# или позиции запроса в версии диалога остаётся дырка — номер закреплён за строкой.
+# Строгая нумерация «с 1 подряд» — только в ответе модели (MergeOutput, RequestOutput):
+# там её ловит runner.call и просит модель исправиться через --resume.
+# ----------------------------------------------------------------------
+
+
+def test_hypothesis_map_accepts_gaps_merge_output_does_not():
+    """Карта с номерами 1, 3 — законная версия после удаления строки; от модели так нельзя."""
+    payload = {"rows": [_row(1, [1]), _row(3, [2])]}
+    assert [r.row_id for r in HypothesisMap(**payload).rows] == [1, 3]
+    with pytest.raises(ValidationError):
+        MergeOutput(**payload)
+
+
+def test_request_accepts_gaps_and_order_request_output_does_not():
+    """Бланк с номерами 1, 3 и перечнем раньше счётчика — законная версия; от модели так нельзя."""
+    items = [
+        _item(kind="перечень или реестр", unit=None, metric="перечень"),
+        _item(num="3", metric="количество", sources=[{"row_id": 1, "metric": "m2"}]),
+    ]
+    assert [it.num for it in DataRequest(items=items, years=[2025]).items] == ["1", "3"]
+    with pytest.raises(ValidationError):
+        RequestOutput(items=items, years=[2025])
+
+
+def test_request_num_duplicates_rejected():
+    with pytest.raises(ValidationError):
+        DataRequest(items=[_item(), _item(metric="другое", sources=[{"row_id": 1, "metric": "m2"}])], years=[2025])
+
+
+def test_strict_output_schemas_identical_to_base():
+    """Модель видит ту же схему, что и раньше: строгость только в проверке, не в промпте."""
+    assert MergeOutput.model_json_schema() == HypothesisMap.model_json_schema()
+    assert RequestOutput.model_json_schema() == DataRequest.model_json_schema()
+
+
 def test_request_lists_must_follow_counters():
     with pytest.raises(ValidationError):
-        DataRequest(items=[
+        RequestOutput(items=[
             _item(kind="перечень или реестр", unit=None, metric="перечень"),
             _item(num="2", metric="количество", sources=[{"row_id": 1, "metric": "m2"}]),
         ], years=[2025])

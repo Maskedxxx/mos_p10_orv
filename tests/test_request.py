@@ -14,7 +14,7 @@ from unittest.mock import Mock
 import pytest
 
 import app.nodes.request as request_module
-from app.contracts import DataItem, DataRequest, Effect, HypothesisMap, MapRow, RequestItem, RunMeta, SourceRef
+from app.contracts import DataItem, DataRequest, Effect, HypothesisMap, MapRow, RequestItem, RequestOutput, RunMeta, SourceRef
 from app.nodes.request import _request_years, build_request
 from app.runner import CallResult
 from app.trace import load_json, run_dir, save_json
@@ -182,6 +182,7 @@ def test_no_tools_and_prompt_and_trace_name(run_id, tmp_prompt, monkeypatch):
         seen["tools"] = kwargs["allowed_tools"]
         seen["trace_name"] = kwargs["trace_name"]
         seen["document"] = document
+        seen["model_cls"] = model_cls
         return _ok_call_result(req)
 
     monkeypatch.setattr(request_module, "call", Mock(side_effect=_effect))
@@ -189,6 +190,7 @@ def test_no_tools_and_prompt_and_trace_name(run_id, tmp_prompt, monkeypatch):
     build_request(hyp_map, run_id)
 
     assert seen["tools"] == []
+    assert seen["model_cls"] is RequestOutput   # ответ модели — строгая форма (шаг 1.3)
     assert "Промпт 06_request" in seen["instruction"]
     assert seen["trace_name"] == "07_request.json".replace(".json", ".raw.json")
     assert "## КАРТА ГИПОТЕЗ (JSON)" in seen["document"]
