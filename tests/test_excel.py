@@ -28,6 +28,7 @@ from app.contracts import (
     SourceRef,
     Verdict,
 )
+from app.feedback import _col, _find_header_row
 from app.nodes.excel import build_excel, compute_years
 from app.contracts import ActPassport
 from app.trace import run_dir
@@ -139,29 +140,6 @@ def _passport() -> ActPassport:
                        "authority": "Департамент средств массовой информации и рекламы города Москвы",
                        "title": "Об утверждении Порядка организации торгов"}
     return ActPassport(**d)
-
-
-def _find_header_row(ws, anchor: str = "Индикаторы") -> int:
-    """
-    Найти строку шапки листа по известному заголовку в любой колонке.
-
-    Привязываться к координатам нельзя: строка шапки едет вниз (строка
-    реквизитов акта, подпись листа), а колонки едут вправо (добавляется «№»).
-    Ищем сам заголовок.
-    """
-    for i in range(1, ws.max_row + 1):
-        for c in ws[i]:
-            if c.value == anchor:
-                return i
-    raise AssertionError(f"строка шапки с заголовком «{anchor}» не найдена")
-
-
-def _col(ws, header_row: int, name: str) -> int:
-    """Номер колонки по тексту её заголовка в строке шапки."""
-    for c in ws[header_row]:
-        if c.value == name:
-            return c.column
-    raise AssertionError(f"колонка «{name}» не найдена в строке {header_row}")
 
 
 def test_opens_with_openpyxl_and_five_sheets(tmp_runs_dir):
