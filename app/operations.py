@@ -417,7 +417,15 @@ _MODEL_OPS: dict[str, tuple[Callable, Callable]] = {
     "дополнить запрос": (_prepare_request, _accept_request),
 }
 _JOURNAL_KIND = {"правка текста": "правка", "перепроверить индикатор": "перепроверка",
-                 "построить гипотезы": "досчёт", "дополнить запрос": "досчёт"}
+                 "построить гипотезы": "досчёт", "дополнить запрос": "досчёт", "откат": "откат"}
+
+
+@dataclass
+class _Rollback:
+    """Откат не операция модели — кнопка страницы; для журнала нужны только вид и причина."""
+
+    reason: str
+    kind: str = "откат"
 
 
 def is_model_op(op: Operation) -> bool:
@@ -440,6 +448,25 @@ def accept(run_id: str, cand: Candidate) -> StepResult:
     ctx = _load(run_id, versions.ensure_v0(run_id))
     change = _MODEL_OPS[cand.op.kind][1](ctx, cand)
     return _commit(ctx, cand.op, change, cand.cost_usd)
+
+
+def rollback(run_id: str, n: int) -> StepResult:
+    """
+    Откат — новая версия с содержимым версии n: ничего не стирается, в журнале строка «откат».
+    Пометки — той версии; счётчики номеров не возвращаются, номера не переиспользуются.
+    """
+    versions.recover(run_id)
+    state = versions.ensure_v0(run_id)
+    if not 0 <= n < state.current:
+        raise OperationError(f"вернуться можно к версиям 0–{state.current - 1}, а не к {n}")
+    current = state.current
+    versions.restore(run_id, n)
+    ctx = _load(run_id, state)
+    old = versions.version_state(run_id, n)
+    if old is not None:
+        ctx.state.marks = old.marks.model_copy(deep=True)
+    change = Change("Весь файл", f"возврат к версии {n}", f"версия {current}", f"как в версии {n}")
+    return _commit(ctx, _Rollback(reason=f"возврат к версии {n}"), change, 0.0)
 
 
 def _commit(ctx: _Ctx, op: Operation, change: Change, cost: float) -> StepResult:

@@ -78,6 +78,7 @@ def ensure_v0(run_id: str) -> VersionState:
     )
     _snapshot(run_id, 0)
     save_json(run_id, _STATE, state)
+    save_json(run_id, f"{VERSIONS}/v0/state.json", state)   # пометки версии — для отката
     return state
 
 
@@ -95,7 +96,14 @@ def commit(run_id: str, state: VersionState, entries: list[JournalEntry]) -> Ver
             f.write(e.model_dump_json() + "\n")
     new_state = state.model_copy(update={"current": n})
     save_json(run_id, _STATE, new_state)
+    save_json(run_id, f"{VERSIONS}/v{n}/state.json", new_state)   # пометки версии — для отката
     return new_state
+
+
+def version_state(run_id: str, n: int) -> VersionState | None:
+    """Состояние на момент версии n (пометки «правлено» и «устарело» той версии)."""
+    rel = f"{VERSIONS}/v{n}/state.json"
+    return load_json(run_id, rel, VersionState) if (run_dir(run_id) / rel).is_file() else None
 
 
 def read_journal(run_id: str) -> list[JournalEntry]:

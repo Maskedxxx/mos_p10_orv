@@ -20,7 +20,7 @@ from app.contracts import (
     EditText, Effect, Hypothesis, HypothesisMap, HypothesisSet, MergeMapRows, RecheckIndicator, RequestItem, RunMeta,
     SetVerdict, SourceRef, SplitPart, SplitRequestItem, Verdict,
 )
-from app.operations import OperationError, accept, run_step
+from app.operations import OperationError, accept, rollback, run_step
 from app.trace import load_json, run_dir, save_json, update_meta
 from test_versions import _write_run
 
@@ -169,3 +169,24 @@ def test_failure_mid_commit_restores_root(rid, monkeypatch):
                                new_text="короче", reason="вода"))
     assert (run_dir(rid) / "06_map.json").read_bytes() == before
     assert versions.load_state(rid).current == 0
+
+
+def test_rollback_is_new_version_with_old_content_and_marks(rid):
+    original = _map(rid).rows[0].hypothesis
+    for text in ("короче", "ещё короче"):
+        run_step(rid, EditText(kind="правка текста", sheet="строка карты", key="1", field="гипотеза",
+                               new_text=text, reason="вода"))
+    counters = versions.load_state(rid).next_row_id, versions.load_state(rid).next_item_num
+
+    res = rollback(rid, 1)
+    assert res.version == 3 and _map(rid).rows[0].hypothesis == "короче"
+    assert versions.load_state(rid).marks.edited_rows == [1]
+
+    res = rollback(rid, 0)
+    st = versions.load_state(rid)
+    assert res.version == 4 and _map(rid).rows[0].hypothesis == original
+    assert st.marks.edited_rows == [] and (st.next_row_id, st.next_item_num) == counters
+    assert [e.kind for e in versions.read_journal(rid)][-2:] == ["откат", "откат"]
+    assert (run_dir(rid) / "versions" / "v2" / "06_map.json").exists()   # ничего не стёрто
+    with pytest.raises(OperationError):
+        rollback(rid, 4)
