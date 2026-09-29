@@ -172,6 +172,8 @@ def _fallback_map(flat: list[tuple[int, int, Hypothesis]]) -> HypothesisMap:
             data=hyp.data,
             proof=hyp.proof,
             clause=hyp.clause,
+            hypothesis_brief=hyp.hypothesis_brief,   # 2.5: выжимки для эксперта — как у гипотезы
+            grounds_brief=hyp.grounds_brief,
         )
         for row_id, indicator, hyp in flat
     ]

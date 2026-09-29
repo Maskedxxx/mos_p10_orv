@@ -50,7 +50,7 @@ from app.config import (
     PROMPT_HYPOTHESES_NO_DATA,
     PROMPT_HYPOTHESES_VIOLATED,
 )
-from app.contracts import ActPassport, Buckets, HypothesisSet, RunMeta, Verdict
+from app.contracts import ActPassport, Buckets, HypothesisSet, HypothesisSetOutput, RunMeta, Verdict
 from app.logger import get_run_logger
 from app.runner import call
 from app.trace import load_json, save_json, update_meta
@@ -150,7 +150,7 @@ def _run_one_hypothesis(
         result = call(
             instruction,
             document,
-            HypothesisSet,
+            HypothesisSetOutput,   # 2.5: выжимки для эксперта в ответе обязательны
             run_id=run_id,
             trace_name=f"{trace_prefix}05_hypotheses/{n:02d}.raw.json",
             allowed_tools=ALLOWED_TOOLS_TEXT,

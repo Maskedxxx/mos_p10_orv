@@ -473,3 +473,13 @@ def test_no_passport_block_without_passport(run_id, monkeypatch):
     monkeypatch.setattr(verdicts_module, "call", Mock(side_effect=_effect))
     run_verdicts("текст", run_id, indicators=[1])
     assert "## ПАСПОРТ АКТА" not in seen["doc"]
+
+
+
+def test_indicator_answer_uses_strict_contract_with_brief(run_id, tmp_prompts_dir, monkeypatch):
+    """2.5: агент индикатора обязан вернуть выжимку для эксперта — узел просит строгий VerdictOutput."""
+    from app.contracts import VerdictOutput
+    mock = Mock(side_effect=_default_side_effect)
+    monkeypatch.setattr(verdicts_module, "call", mock)
+    run_verdicts("текст акта", run_id, indicators=[1])
+    assert mock.call_args.args[2] is VerdictOutput

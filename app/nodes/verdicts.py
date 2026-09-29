@@ -37,7 +37,7 @@ from app.config import (
     get_indicator,
     prompt_path,
 )
-from app.contracts import ActPassport, Verdict
+from app.contracts import ActPassport, Verdict, VerdictOutput
 from app.logger import get_run_logger
 from app.runner import call
 from app.nodes.hypotheses import _add_cost_to_meta, append_task_clarification
@@ -100,7 +100,7 @@ def _run_one_indicator(
         result = call(
             instruction,
             document,
-            Verdict,
+            VerdictOutput,   # 2.5: выжимка для эксперта в ответе обязательна
             run_id=run_id,
             trace_name=f"{trace_prefix}03_verdicts/{n:02d}.raw.json",
             allowed_tools=allowed_tools,

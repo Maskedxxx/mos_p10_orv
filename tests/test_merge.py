@@ -333,3 +333,17 @@ def test_decision_for_every_candidate_no_error(run_id, tmp_prompt, monkeypatch):
     merge_map([_hset_c(10, [("A", "8")]), _hset_c(11, [("B", "7, 8")])], "текст акта", run_id)
     log_text = (run_dir(run_id) / "run.log").read_text(encoding="utf-8")
     assert "кандидат без решения" not in log_text
+
+
+
+def test_fallback_map_keeps_expert_briefs(valid_hypothesis):
+    """2.5: при сбое модели слияния строки собираются из гипотез как есть — вместе с выжимками."""
+    from app.contracts import Hypothesis
+    from app.nodes.merge import _fallback_map
+    briefs = {"hypothesis_brief": ["что не так (п. 2.1)"], "grounds_brief": ["вывод вердикта (п. 2.1)"]}
+    effect = {**valid_hypothesis["effects"][0], "how_to_calculate_brief": ["сумма за год"],
+              "expected_trend_brief": ["рост подтвердит"]}
+    hyp = Hypothesis(**{**valid_hypothesis, **briefs, "effects": [effect]})
+    row = _fallback_map([(1, 7, hyp)]).rows[0]
+    assert row.hypothesis_brief == briefs["hypothesis_brief"] and row.grounds_brief == briefs["grounds_brief"]
+    assert row.effects[0].how_to_calculate_brief == ["сумма за год"]

@@ -409,3 +409,13 @@ def test_passport_block_between_text_and_card(run_id, tmp_prompts, monkeypatch, 
     doc = seen["doc"]
     a = doc.index("## ПОЛНЫЙ ТЕКСТ АКТА"); b = doc.index("## ПАСПОРТ АКТА"); c = doc.index("## КАРТОЧКА ВЕРДИКТА (JSON)")
     assert a < b < c
+
+
+
+def test_hypotheses_answer_uses_strict_contract_with_brief(run_id, tmp_prompts, monkeypatch):
+    """2.5: агенты 4a / 4b обязаны вернуть выжимки — узел просит строгий HypothesisSetOutput."""
+    from app.contracts import HypothesisSetOutput
+    mock = Mock(side_effect=_default_side_effect)
+    monkeypatch.setattr(hyp_module, "call", mock)
+    run_hypotheses_violated(_buckets_violated([7]), "текст акта", run_id)
+    assert mock.call_args.args[2] is HypothesisSetOutput
