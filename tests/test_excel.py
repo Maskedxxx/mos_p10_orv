@@ -253,7 +253,7 @@ def test_verdicts_sheet_unverified_points_to_same_row_as_map(tmp_runs_dir):
     hdr = _find_header_row(ws, "Вердикт")
     rows = _rows_by_indicator(ws, hdr)
     assert ws.cell(row=rows[10], column=_col(ws, hdr, "Где подробнее")).value == (
-        f"Карта гипотез, стр. {row_id} — проверка не завершена"
+        f"Карта гипотез, стр. {row_id} — нужна ручная проверка"
     )
 
 
@@ -952,8 +952,9 @@ def test_map_has_unverified_row_for_no_data_without_hypotheses(tmp_runs_dir):
     num, ind, hyp, effect, data, basis = rows[2][:6]
     assert num == 3, "нумерация продолжается за строками карты"
     assert ind == "4. отсутствие дублирования требований"
-    assert "Проверка не завершена" in hyp
+    assert hyp.startswith("Нужна ручная проверка")
     assert "текст статей Закона города Москвы от 13.11.2024 № 27" in hyp, "что не проверено — из missing_data"
+    assert "не открылся" not in hyp, "2.5: весь ход проверки агента в клетку больше не идёт"
     assert "запрос органу не идёт" in data
     assert "цитата вердикта 4" in basis and "2.6" in basis
 
@@ -1137,4 +1138,57 @@ def test_fixed_unverified_ids_on_map_and_verdicts(tmp_runs_dir):
     assert 9 in [ws.cell(row=r, column=1).value for r in range(hdr + 1, ws.max_row + 1)]
     ws = wb["Вердикты"]; hdr = _find_header_row(ws, "Вердикт")
     where = ws.cell(row=_rows_by_indicator(ws, hdr)[4], column=_col(ws, hdr, "Где подробнее")).value
-    assert where == "Карта гипотез, стр. 9 — проверка не завершена"
+    assert where == "Карта гипотез, стр. 9 — нужна ручная проверка"
+
+
+
+# ---- 2.5: выжимка для эксперта — в Excel пункты, полный текст остаётся в JSON ----
+
+def _map_with_briefs() -> HypothesisMap:
+    m = _map()
+    row = m.rows[0]
+    effects = [e.model_copy(update={"how_to_calculate_brief": ["считаем за год"],
+                                    "expected_trend_brief": ["рост подтвердит"]}) for e in row.effects]
+    first = row.model_copy(update={"hypothesis_brief": ["что не так (п. 5.1.4)", "кого задевает"],
+                                   "grounds_brief": ["вывод вердикта (п. 5.1.4)"], "effects": effects})
+    return m.model_copy(update={"rows": [first] + m.rows[1:]})
+
+
+def test_map_shows_expert_briefs_as_points(tmp_runs_dir):
+    ws = load_workbook(build_excel(_map_with_briefs(), _request(), _buckets(with_failed=False), _passport(),
+                                   "run_brief"))["Карта гипотез"]
+    hdr = _find_header_row(ws)
+    cell = lambda r, name: ws.cell(row=hdr + r, column=_col(ws, hdr, name)).value   # noqa: E731
+    assert cell(1, "Гипотеза") == "• что не так (п. 5.1.4)\n• кого задевает"
+    effect = cell(1, "Эффект")
+    assert "Как считать:\n• считаем за год" in effect and "Что подтвердит гипотезу:\n• рост подтвердит" in effect
+    assert "сумма расходов" not in effect
+    basis = cell(1, "На чём основано")
+    assert "Основание из вердикта:\n• вывод вердикта (п. 5.1.4)" in basis and "основание 1" not in basis
+    assert "5.1.4" in basis, "цитата и пункт акта — без изменений"
+    assert cell(2, "Гипотеза") == "гипотеза 2", "строка без выжимки — полный текст, как до 2.5"
+
+
+def test_verdicts_sheet_shows_brief_not_full_rationale(tmp_runs_dir):
+    b = _buckets(with_failed=False)
+    first = b.violated[0].model_copy(update={"rationale_brief": ["пункт 1 (п. 9.9)", "пункт 2"]})
+    b = b.model_copy(update={"violated": [first] + b.violated[1:]})
+    ws = load_workbook(build_excel(_map(), _request(), b, _passport(), "run_vb"))["Вердикты"]
+    hdr = _find_header_row(ws, "Вердикт")
+    rows = _rows_by_indicator(ws, hdr)
+    assert ws.cell(row=rows[1], column=_col(ws, hdr, "Обоснование")).value == "• пункт 1 (п. 9.9)\n• пункт 2"
+    assert ws.cell(row=rows[8], column=_col(ws, hdr, "Обоснование")).value == "пакет избыточен"
+
+
+def test_unverified_row_shows_looked_and_not_found(tmp_runs_dir):
+    b = _buckets_with_unverified()
+    brief = ["Смотрел: текст Закона города Москвы от 13.11.2024 № 27 — КонсультантПлюс, ГАРАНТ.",
+             "Не нашёл: текст статей закона — не открылся, проверьте вручную."]
+    b = b.model_copy(update={"no_data": [v.model_copy(update={"rationale_brief": brief}) if v.indicator == 4 else v
+                                         for v in b.no_data]})
+    ws = load_workbook(build_excel(_map(), _request(), b, _passport(), "run_unv_brief"))["Карта гипотез"]
+    hdr = _find_header_row(ws)
+    rows = list(ws.iter_rows(min_row=hdr + 1, values_only=True))
+    hyp = rows[2][2]
+    assert hyp == "Нужна ручная проверка.\n\n• " + "\n• ".join(brief)
+    assert "сопоставить требования" not in hyp

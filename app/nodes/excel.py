@@ -176,6 +176,15 @@ def _row_to_request_nums(request: DataRequest) -> dict[int, list[str]]:
 _CLAUSE_PREFIX_RE = re.compile(r"^\s*(?:п\.?|пункт[а-я]*)\s*", re.IGNORECASE)
 
 
+def _points(brief: list[str] | None, full: str) -> str:
+    """
+    Текст для эксперта (2.5): выжимка пунктами, каждый с новой строки. Полный текст
+    агента остаётся в JSON прогона для анализа; в Excel он идёт, только если выжимки
+    нет — прогон до 2.5 или объект, собранный кодом без выжимки.
+    """
+    return "\n".join(f"• {p}" for p in brief) if brief else full
+
+
 def _render_basis_cell(
     proof: str | None, clause: str | None, sources: list[str], grounds: str | None = None,
 ) -> str:
@@ -295,9 +304,9 @@ def _render_effect_cell(effects: list[Effect]) -> str:
         f"Кого задевает: {e.affected}\n"
         f"Показатель:\n{e.metric}\n"
         f"\n"
-        f"Как считать:\n{e.how_to_calculate}\n"
+        f"Как считать:\n{_points(e.how_to_calculate_brief, e.how_to_calculate)}\n"
         f"\n"
-        f"Что подтвердит гипотезу:\n{e.expected_trend}"
+        f"Что подтвердит гипотезу:\n{_points(e.expected_trend_brief, e.expected_trend)}"
         for e in effects
     ]
     return "\n\n".join(blocks)
@@ -478,17 +487,20 @@ def _append_unverified_rows(
     ws: Worksheet, hyp_map: HypothesisMap, buckets: Buckets, row_ids: dict[int, int],
 ) -> None:
     """
-    Дописать в карту строки «проверка не завершена» — по одной на вердикт из
+    Дописать в карту строки «Нужна ручная проверка» — по одной на вердикт из
     _unverified_verdicts. Нумерация продолжает строки карты; в запрос органу
     такие строки не идут — дочитывает аналитик по правовой базе.
+
+    2.5: эксперты читали прежнее «Проверка не завершена» и весь ход проверки агента
+    как техническую ошибку ИИ. Теперь коротко: выжимка агента «Смотрел: … / Не нашёл: …»;
+    у прогонов до 2.5 — только чего не хватило (missing_data), без хода проверки.
     """
     for v in _unverified_verdicts(hyp_map, buckets):
+        details = _points(v.rationale_brief, f"Не удалось проверить: {v.missing_data or 'не указано'}")
         ws.append([
             row_ids[v.indicator],
             _indicators_label([v.indicator]),
-            "Проверка не завершена — не хватило текста или правовой базы.\n\n"
-            f"Что не проверено:\n{v.missing_data or 'не указано'}\n\n"
-            f"Как проверял агент:\n{v.rationale}",
+            f"Нужна ручная проверка.\n\n{details}",
             "—",
             "Дочитать самостоятельно по правовой базе. В запрос органу не идёт.",
             _render_basis_cell(v.proof, v.clause, v.sources),
@@ -586,14 +598,14 @@ def _render_map_sheet(
         ws.append([
             row.row_id,          # адрес строки: на него ссылается лист запроса
             _indicators_label(row.indicators),
-            row.hypothesis,
+            _points(row.hypothesis_brief, row.hypothesis),
             _render_effect_cell(row.effects),
             _render_map_data_cell(row.data, nums),
             _render_basis_cell(
                 row.proof or _first_verdict_proof(verdicts),
                 row.clause,                       # пункт карты вердиктом не подменяется
                 _dedup_sources(verdicts),
-                row.grounds,
+                _points(row.grounds_brief, row.grounds),
             ),
         ])
 
@@ -734,7 +746,7 @@ def _where_details(v: Verdict, hyp_map: HypothesisMap, unverified_ids: dict[int,
     Колонка «Где подробнее» листа «Вердикты»: куда идти за разбором.
 
     Нарушен и «нет данных» со строками карты — номера строк карты; «нет данных»
-    без строки — номер дописанной строки «проверка не завершена» (тот же, что
+    без строки — номер дописанной строки «Нужна ручная проверка» (тот же, что
     в карте); ошибка — лист ошибок; соблюдён и не применимо — подробностей нет,
     обоснование и цитата уже в этой строке.
     """
@@ -744,7 +756,7 @@ def _where_details(v: Verdict, hyp_map: HypothesisMap, unverified_ids: dict[int,
     if rows:
         return f"{_SHEET_MAP}, стр. {', '.join(str(r) for r in rows)}"
     if v.indicator in unverified_ids:
-        return f"{_SHEET_MAP}, стр. {unverified_ids[v.indicator]} — проверка не завершена"
+        return f"{_SHEET_MAP}, стр. {unverified_ids[v.indicator]} — нужна ручная проверка"
     return "—"
 
 
@@ -769,7 +781,7 @@ def _render_verdicts_sheet(
         # «Обоснование» — текст вердикта, «На чём основано» — цитата и адреса;
         # рендер общий с листом карты, чтобы одно и то же выглядело одинаково
         ws.append([
-            _indicator_label(v), v.verdict, v.rationale,
+            _indicator_label(v), v.verdict, _points(v.rationale_brief, v.rationale),
             _render_basis_cell(v.proof, v.clause, list(v.sources)),
             _where_details(v, hyp_map, unverified_ids),
         ])
@@ -857,7 +869,7 @@ def build_excel(
         f"Индикаторы, по которым найдено нарушение или не хватило данных — "
         f"{len(map_indicators)} из {total}. По каждому построена гипотеза: "
         f"что не так, чем мерить эффект, какие данные нужны — либо отмечено, "
-        f"что проверка не завершена.",
+        f"что нужна ручная проверка.",
         unverified, marks,
     )
     _render_request_sheet(
