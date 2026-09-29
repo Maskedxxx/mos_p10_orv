@@ -27,9 +27,9 @@
 from __future__ import annotations
 
 import re
-from typing import Literal, Union
+from typing import Annotated, Literal, Union
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 # Допустимые значения вердикта по индикатору
 VerdictValue = Literal["нарушен", "соблюдён", "не применимо", "нет данных", "ошибка"]
@@ -64,20 +64,106 @@ class _Base(BaseModel):
         return self
 
 
+# ==== ВЫЖИМКА ДЛЯ ЭКСПЕРТА (2.5) ====
+# Отзыв заказчика по второму кругу: в Excel много текста, рассуждения ИИ и технические слова
+# (ключи JSON, «паспорт»). Решение владельца 2026-09-29: полный текст агенту нужен для рассуждения
+# и нам для анализа — остаётся; рядом каждый агент пишет выжимку в отдельный ключ <поле>_brief,
+# и в Excel идёт только она. В хранимых контрактах выжимка необязательна (прогоны до 2.5
+# открываются, Excel показывает полный текст); в ответе модели — обязательна (строгие *Output).
+
+_BRIEF_BANS = (
+    "Нельзя: слово «паспорт», имена полей и ключей, латиница (кроме адресов сайтов и названий), "
+    "«я», пересказ правил проверки, ход поиска, оценка без факта."
+)
+_RATIONALE_BRIEF = (
+    "Выжимка для эксперта-юриста — в Excel на листе «Вердикты» идёт только она, полный разбор "
+    "остаётся в rationale. Список пунктов, в каждом одна мысль с фактом: пункт акта, кого касается, "
+    "число, срок, название акта или ведомства. «нарушен» и «нет данных» — 2–4 пункта: что не так "
+    "или чего не хватает, где в акте, кого задевает, почему это нарушение. «соблюдён» и «не применимо» — "
+    "1–2 пункта с пунктом акта. Если проверить не удалось (не хватило текста акта или правовой базы) — "
+    "пункты «Смотрел: …» и «Не нашёл: …» с названиями актов и источников. " + _BRIEF_BANS
+)
+_HYPOTHESIS_BRIEF = (
+    "Выжимка гипотезы для эксперта — в Excel идёт она, полный текст остаётся в hypothesis. "
+    "2–3 пункта с фактами: что не так в норме (с пунктом акта), кого задевает и в каком масштабе, "
+    "к чему ведёт. Только то, что есть в полном тексте, без новых утверждений. " + _BRIEF_BANS
+)
+_GROUNDS_BRIEF = (
+    "Выжимка основания для эксперта — в Excel идёт она, полный текст остаётся в grounds. "
+    "1–2 пункта: на каком выводе вердикта стоит гипотеза, с пунктом акта. Без новых утверждений. "
+    + _BRIEF_BANS
+)
+_HOW_BRIEF = (
+    "Выжимка метода расчёта для эксперта — в Excel идёт она, полный текст остаётся "
+    "в how_to_calculate. 1–2 пункта: что с чем сложить, разделить или сравнить и откуда "
+    "берётся каждая величина. " + _BRIEF_BANS
+)
+_TREND_BRIEF = (
+    "Выжимка ожидаемой динамики для эксперта — в Excel идёт она, полный текст остаётся "
+    "в expected_trend. Один пункт: «рост / снижение <показателя> относительно <точки отсчёта> "
+    "подтвердит гипотезу». " + _BRIEF_BANS
+)
+
+_ROW_HYPOTHESIS_BRIEF = _HYPOTHESIS_BRIEF + (
+    " Для строки без слияния — дословно из входа; для слитой — заново по итоговой формулировке."
+)
+_ROW_GROUNDS_BRIEF = _GROUNDS_BRIEF + (
+    " Для строки без слияния — дословно из входа; для слитой — пункты оснований всех исходных "
+    "гипотез без повторов, не больше четырёх."
+)
+
+# Пункт выжимки: одна мысль, не длиннее 250 знаков; пустой — нельзя
+BriefPoint = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=250)]
+
+
+def _brief(description: str):
+    """Обязательная выжимка в ответе модели: 1–4 пункта."""
+    return Field(min_length=1, max_length=4, description=description)
+
+
 class Verdict(BaseModel):
     """Вердикт по одному индикатору из 12 (узел [2] пайплайна)."""
 
     model_config = ConfigDict(extra="forbid")
 
-    indicator: int = Field(ge=1, le=12)
-    name: str
-    verdict: VerdictValue
-    rationale: str
-    missing_data: str | None = None
-    proof: str | None = None
-    clause: str | None = None
-    sources: list[str] = Field(default_factory=list)
-    attempts: int = Field(default=1, ge=1)
+    indicator: int = Field(ge=1, le=12, description="Номер индикатора из задания, 1–12.")
+    name: str = Field(description="Название индикатора, как в задании.")
+    verdict: VerdictValue = Field(
+        description=(
+            "Вердикт по индикатору: «нарушен», «соблюдён», «не применимо» или «нет данных». "
+            "«ошибка» ставит только код при сбое вызова — сам не ставь."
+        )
+    )
+    rationale: str = Field(
+        description=(
+            "Полный разбор: как проверял, что нашёл и почему такой вердикт — всё, что нужно "
+            "для анализа. В Excel не идёт: эксперт видит rationale_brief."
+        )
+    )
+    missing_data: str | None = Field(
+        default=None,
+        description=(
+            "Только при вердикте «нет данных»: каких сведений не хватило для вывода. "
+            "При других вердиктах — null."
+        ),
+    )
+    proof: str | None = Field(
+        default=None,
+        description="Дословная цитата из акта, на которой стоит вывод; null — если вывод не на тексте акта.",
+    )
+    clause: str | None = Field(default=None, description="Номер пункта акта, откуда цитата.")
+    sources: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Только адреса страниц, на которых стоит вывод, по одному на элемент. "
+            "Рассуждения о том, что не открылось и не нашлось, — в rationale."
+        ),
+    )
+    attempts: int = Field(
+        default=1, ge=1,
+        description="Служебное: сколько попыток вызова понадобилось. Заполняет код — оставь 1.",
+    )
+    rationale_brief: list[str] | None = Field(default=None, description=_RATIONALE_BRIEF)
 
     @model_validator(mode="after")
     def _check_name_rationale(self) -> "Verdict":
@@ -101,6 +187,14 @@ class Verdict(BaseModel):
                     'поле missing_data допустимо только при verdict == "нет данных"'
                 )
         return self
+
+
+class VerdictOutput(Verdict):
+    """Вердикт в ответе агента индикатора: выжимка для эксперта обязательна (2.5)."""
+
+    model_config = ConfigDict(title="Verdict")
+
+    rationale_brief: list[BriefPoint] = _brief(_RATIONALE_BRIEF)
 
 
 class Buckets(BaseModel):
@@ -174,6 +268,17 @@ class Effect(_Base):
             "наблюдаться динамика» — без направления и точки отсчёта."
         ),
     )
+    how_to_calculate_brief: list[str] | None = Field(default=None, description=_HOW_BRIEF)
+    expected_trend_brief: list[str] | None = Field(default=None, description=_TREND_BRIEF)
+
+
+class EffectOutput(Effect):
+    """Эффект в ответе модели: выжимки метода расчёта и динамики обязательны (2.5)."""
+
+    model_config = ConfigDict(title="Effect")
+
+    how_to_calculate_brief: list[BriefPoint] = _brief(_HOW_BRIEF)
+    expected_trend_brief: list[BriefPoint] = _brief(_TREND_BRIEF)
 
 
 # ---- показатель данных -------------------------------------------------
@@ -299,6 +404,8 @@ class Hypothesis(_Base):
         default=None,
         description="Номер пункта из карточки вердикта, не свой.",
     )
+    hypothesis_brief: list[str] | None = Field(default=None, description=_HYPOTHESIS_BRIEF)
+    grounds_brief: list[str] | None = Field(default=None, description=_GROUNDS_BRIEF)
 
     @model_validator(mode="after")
     def _effects_distinct_groups(self) -> "Hypothesis":
@@ -357,6 +464,26 @@ class HypothesisSet(_Base):
         if self.hypotheses and self.violation_kind is None:
             raise ValueError("violation_kind обязателен, когда есть хотя бы одна гипотеза")
         return self
+
+
+class HypothesisOutput(Hypothesis):
+    """Гипотеза в ответе модели узлов 4a / 4b: выжимки обязательны (2.5)."""
+
+    model_config = ConfigDict(title="Hypothesis")
+
+    hypothesis_brief: list[BriefPoint] = _brief(_HYPOTHESIS_BRIEF)
+    grounds_brief: list[BriefPoint] = _brief(_GROUNDS_BRIEF)
+    effects: list[EffectOutput] = Field(min_length=1, description=Hypothesis.model_fields["effects"].description)
+
+
+class HypothesisSetOutput(HypothesisSet):
+    """Набор гипотез в ответе модели узлов 4a / 4b: у каждой гипотезы выжимки (2.5)."""
+
+    model_config = ConfigDict(title="HypothesisSet")
+
+    hypotheses: list[HypothesisOutput] = Field(
+        default_factory=list, description=HypothesisSet.model_fields["hypotheses"].description,
+    )
 
 
 # ==== КАРТА ГИПОТЕЗ (узел [5]) ====
@@ -430,6 +557,8 @@ class MapRow(_Base):
             "через запятую."
         ),
     )
+    hypothesis_brief: list[str] | None = Field(default=None, description=_ROW_HYPOTHESIS_BRIEF)
+    grounds_brief: list[str] | None = Field(default=None, description=_ROW_GROUNDS_BRIEF)
 
     @model_validator(mode="after")
     def _check_row(self) -> "MapRow":
@@ -440,6 +569,22 @@ class MapRow(_Base):
         if len(groups) != len(set(groups)):
             raise ValueError(f"строка {self.row_id}: два эффекта одной группе — оставь один")
         return self
+
+
+class MapRowOutput(MapRow):
+    """Строка карты в ответе модели узла [5]: выжимки обязательны (2.5)."""
+
+    model_config = ConfigDict(title="MapRow")
+
+    hypothesis_brief: list[BriefPoint] = _brief(_ROW_HYPOTHESIS_BRIEF)
+    grounds_brief: list[BriefPoint] = _brief(_ROW_GROUNDS_BRIEF)
+    effects: list[EffectOutput] = Field(
+        min_length=1,
+        description=MapRow.model_fields["effects"].description + (
+            " Выжимки эффекта — как во входе; если в how_to_calculate оставленного эффекта вписан "
+            "второй метод расчёта, допиши его и в how_to_calculate_brief."
+        ),
+    )
 
 
 # ---- слияние и решение по кандидату --------------------------------------
@@ -554,8 +699,12 @@ class MergeOutput(HypothesisMap):
     # Хранимая карта (HypothesisMap) допускает дырки — после удаления строки в диалоговом
     # режиме номер закреплён за строкой (план итерации 3, шаг 1.3). Проверка живёт здесь,
     # а не в коде узла: runner.call ловит её и просит модель исправиться через --resume.
-    # Заголовок и описание те же, что у базы, — схема для модели побайтно прежняя.
+    # Заголовок и описание те же, что у базы; с 2.5 строки ответа — MapRowOutput: выжимки
+    # для эксперта в ответе модели обязательны (в хранимой карте — нет).
     model_config = ConfigDict(title="HypothesisMap")
+
+    # 2.5: строки ответа — со строгими выжимками для эксперта
+    rows: list[MapRowOutput] = Field(default_factory=list, description=HypothesisMap.model_fields["rows"].description)
 
     @model_validator(mode="after")
     def _check_fresh_numbering(self) -> "MergeOutput":

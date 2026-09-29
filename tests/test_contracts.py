@@ -220,7 +220,10 @@ def test_model_json_schema_has_additional_properties_false(model_cls):
 FIELD_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_.-]{1,64}$")
 
 # Корневые модели-артефакты: обход по их полям должен рекурсивно достать все 12 моделей
-ROOT_MODELS_FOR_FIELD_NAME_CHECK = [Verdict, Buckets, HypothesisSet, HypothesisMap, DataRequest, ActPassport, RunMeta, DialogTurn]
+from app.contracts import HypothesisSetOutput, MergeOutput, VerdictOutput  # noqa: E402
+
+ROOT_MODELS_FOR_FIELD_NAME_CHECK = [Verdict, Buckets, HypothesisSet, HypothesisMap, DataRequest, ActPassport, RunMeta, DialogTurn,
+                                    VerdictOutput, HypothesisSetOutput, MergeOutput]
 
 
 def _extract_nested_models(annotation) -> list[type[BaseModel]]:
@@ -256,8 +259,10 @@ def test_all_field_names_across_all_models_are_latin():
     # Защита от того, что рекурсия случайно не дошла до части моделей
     # (13: + PairDecision — решение по кандидату на слияние, узел [5], ОС 2026-09-04;
     #  14: + SourceRef — происхождение позиции запроса, узел [6], ОС 2026-09-04)
-    assert len(all_models) == 51   # v2: + ActPassport с 24 вложенными, + PairDecision, + SourceRef;
-    # итерация 3: + DialogTurn, 10 операций диалога и SplitPart
+    assert len(all_models) == 57   # v2: + ActPassport с 24 вложенными, + PairDecision, + SourceRef;
+    # итерация 3: + DialogTurn, 10 операций диалога и SplitPart;
+    # 2.5: + строгие ответы с выжимкой — VerdictOutput, HypothesisSetOutput, HypothesisOutput,
+    # EffectOutput, MergeOutput, MapRowOutput
 
     for model_cls in all_models:
         for field_name in model_cls.model_fields:
@@ -269,8 +274,8 @@ def test_all_field_names_across_all_models_are_latin():
 # ---- v2 (2026-09-04): описание у каждого поля контрактов structured output ----
 
 # Контракты, которые уходят модели как --json-schema: описание поля = мини-промпт к нему.
-# Verdict сюда не входит намеренно: его поля описаны в промптах индикаторов текстом.
-OUTPUT_CONTRACT_ROOTS = [HypothesisSet, HypothesisMap, DataRequest, ActPassport, DialogTurn]
+# 2.5: Verdict вошёл — у полей вердикта теперь описания (правило владельца «description = промпт к полю»).
+OUTPUT_CONTRACT_ROOTS = [HypothesisSet, HypothesisMap, DataRequest, ActPassport, DialogTurn, Verdict]
 
 
 def test_every_output_contract_field_has_description():
@@ -401,10 +406,20 @@ def test_request_num_duplicates_rejected():
         DataRequest(items=[_item(), _item(metric="другое", sources=[{"row_id": 1, "metric": "m2"}])], years=[2025])
 
 
-def test_strict_output_schemas_identical_to_base():
-    """Модель видит ту же схему, что и раньше: строгость только в проверке, не в промпте."""
-    assert MergeOutput.model_json_schema() == HypothesisMap.model_json_schema()
+def test_strict_output_schemas_differ_from_base_only_by_briefs():
+    """Запрос — схема побайтно прежняя (строгость только в проверке). Карта — прежние поля
+    плюс обязательные выжимки для эксперта (2.5): модель должна видеть их обязательными."""
     assert RequestOutput.model_json_schema() == DataRequest.model_json_schema()
+
+    def _def(schema, key):   # определение вложенной модели по характерному полю
+        return next(d for d in schema["$defs"].values() if key in d.get("properties", {}))
+
+    base, strict = HypothesisMap.model_json_schema(), MergeOutput.model_json_schema()
+    for key, briefs in (("row_id", {"hypothesis_brief", "grounds_brief"}),
+                        ("how_to_calculate", {"how_to_calculate_brief", "expected_trend_brief"})):
+        b, s = _def(base, key), _def(strict, key)
+        assert set(b["properties"]) == set(s["properties"])
+        assert set(s["required"]) - set(b.get("required", [])) == briefs
 
 
 def test_request_lists_must_follow_counters():
@@ -427,3 +442,80 @@ def test_passport_state_must_match_content(valid_passport):
 
 def test_passport_valid_minimal(valid_passport):
     assert ActPassport(**valid_passport).status.status == "принят"
+
+
+
+# ---- 2.5: выжимка для эксперта — отдельный ключ рядом с полным текстом ----
+# Хранимые контракты: выжимка необязательна (прогоны до 2.5 открываются).
+# Ответ модели — строгий подкласс: выжимка обязательна, 1–4 пункта, пункт ≤ 250 знаков.
+
+from app.contracts import (  # noqa: E402
+    EffectOutput, HypothesisOutput, HypothesisSetOutput, MapRowOutput, MergeOutput, VerdictOutput,
+)
+
+_B = ["пункт с фактом (п. 2.1)"]
+_EFFECT_BRIEFS = {"how_to_calculate_brief": _B, "expected_trend_brief": _B}
+
+
+def _effect_out(**kw) -> dict:
+    return {"affected": "бизнес", "metric": "m", "how_to_calculate": "c", "expected_trend": "рост", **_EFFECT_BRIEFS, **kw}
+
+
+def _hyp_out(**kw) -> dict:
+    return {**_hyp(effects=[_effect_out()]), "hypothesis_brief": _B, "grounds_brief": _B, **kw}
+
+
+def _row_out(i: int, **kw) -> dict:
+    return {**_row(i, [1]), "effects": [_effect_out()], "hypothesis_brief": _B, "grounds_brief": _B, **kw}
+
+
+def _verdict_out(**kw) -> dict:
+    return {"indicator": 1, "name": "межведомственное взаимодействие", "verdict": "соблюдён",
+            "rationale": "полный разбор", "rationale_brief": _B, **kw}
+
+
+def test_stored_contracts_accept_artifacts_without_brief():
+    """Прогоны до 2.5 без выжимки открываются: в хранимых контрактах она необязательна."""
+    assert Verdict(indicator=1, name="н", verdict="соблюдён", rationale="р").rationale_brief is None
+    h = Hypothesis(**_hyp())
+    assert h.hypothesis_brief is None and h.grounds_brief is None and h.effects[0].how_to_calculate_brief is None
+    assert HypothesisMap(rows=[_row(1, [1])]).rows[0].hypothesis_brief is None
+
+
+def test_output_helpers_build_valid_objects():
+    """Страж, как test_helpers_build_valid_objects: иначе тесты «отвергается» ниже пройдут по чужой причине."""
+    VerdictOutput(**_verdict_out())
+    HypothesisOutput(**_hyp_out())
+    HypothesisSetOutput(indicator=7, name="н", violation_kind="издержки", why_this_many="одно", hypotheses=[_hyp_out()])
+    MergeOutput(rows=[_row_out(1)])
+
+
+@pytest.mark.parametrize("build", [
+    lambda: VerdictOutput(**{k: v for k, v in _verdict_out().items() if k != "rationale_brief"}),   # нет выжимки
+    lambda: VerdictOutput(**_verdict_out(rationale_brief=[])),                                      # пустая
+    lambda: VerdictOutput(**_verdict_out(rationale_brief=["а" * 251])),                             # пункт длиннее 250
+    lambda: VerdictOutput(**_verdict_out(rationale_brief=["а"] * 5)),                               # больше 4 пунктов
+    lambda: VerdictOutput(**_verdict_out(rationale_brief=["   "])),                                 # пустой пункт
+    lambda: HypothesisOutput(**{k: v for k, v in _hyp_out().items() if k != "hypothesis_brief"}),
+    lambda: HypothesisOutput(**_hyp_out(effects=[{**_effect_out(), "expected_trend_brief": []}])),
+    lambda: HypothesisSetOutput(indicator=7, name="н", violation_kind="издержки", why_this_many="одно",
+                                hypotheses=[{k: v for k, v in _hyp_out().items() if k != "grounds_brief"}]),
+    lambda: MergeOutput(rows=[{k: v for k, v in _row_out(1).items() if k != "hypothesis_brief"}]),
+    lambda: MergeOutput(rows=[_row_out(1, effects=[{k: v for k, v in _effect_out().items() if k != "how_to_calculate_brief"}])]),
+], ids=["verdict-нет", "verdict-пусто", "verdict-длинно", "verdict-много", "verdict-пробелы", "гипотеза-нет",
+        "эффект-пусто", "набор-нет-основания", "карта-нет", "карта-эффект-нет"])
+def test_model_answer_requires_brief(build):
+    with pytest.raises(ValidationError):
+        build()
+
+
+def test_output_schema_marks_briefs_required():
+    """Модель видит выжимку обязательной — в том числе во вложенных эффектах."""
+    assert "rationale_brief" in VerdictOutput.model_json_schema()["required"]
+    defs = HypothesisSetOutput.model_json_schema()["$defs"]
+    hyp = next(d for d in defs.values() if "hypothesis_brief" in d.get("properties", {}))
+    eff = next(d for d in defs.values() if "how_to_calculate_brief" in d.get("properties", {}))
+    assert {"hypothesis_brief", "grounds_brief"} <= set(hyp["required"])
+    assert {"how_to_calculate_brief", "expected_trend_brief"} <= set(eff["required"])
+    row = next(d for d in MergeOutput.model_json_schema()["$defs"].values() if "row_id" in d.get("properties", {}))
+    assert {"hypothesis_brief", "grounds_brief"} <= set(row["required"])
