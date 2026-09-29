@@ -49,7 +49,8 @@ def test_edit_map_text_commits_version_with_journal_and_mark(rid):
     res = run_step(rid, EditText(kind="правка текста", sheet="строка карты", key="1", field="гипотеза",
                                   new_text="короче", reason="вода"))
     assert res.version == 1 and res.candidate is None
-    assert _map(rid).rows[0].hypothesis == "короче"
+    assert _map(rid).rows[0].hypothesis_brief == ["короче"]          # 2.5: правится выжимка — её видит эксперт
+    assert _map(rid).rows[0].hypothesis == load_json(rid, "versions/v0/06_map.json", HypothesisMap).rows[0].hypothesis
     assert versions.load_state(rid).marks.edited_rows == [1]
     wb = load_workbook(run_dir(rid) / "08_result.xlsx")
     assert wb.sheetnames[-1] == "Журнал изменений"
@@ -72,6 +73,7 @@ def test_set_verdict_into_work_marks_indicator_without_rows(rid):
     buckets = load_json(rid, "04_buckets.json", Buckets)
     assert 5 in [v.indicator for v in buckets.violated]
     assert load_json(rid, "03_verdicts/05.json", Verdict).rationale == "эксперт: пакет избыточен"
+    assert load_json(rid, "03_verdicts/05.json", Verdict).rationale_brief == ["эксперт: пакет избыточен"]
     marks = versions.load_state(rid).marks
     assert 5 in marks.edited_verdicts and 5 in marks.stale_verdicts
 
@@ -96,6 +98,7 @@ def test_merge_rows_rewires_request(rid):
     run_step(rid, MergeMapRows(kind="слить строки карты", row_ids=[1, 2], hypothesis="одна проблема", reason="дубль"))
     rows = _map(rid).rows
     assert [r.row_id for r in rows] == [1] and rows[0].hypothesis == "одна проблема"
+    assert rows[0].hypothesis_brief == ["одна проблема"]
     assert _req(rid).items[0].for_rows == [1]
 
 
@@ -179,14 +182,33 @@ def test_rollback_is_new_version_with_old_content_and_marks(rid):
     counters = versions.load_state(rid).next_row_id, versions.load_state(rid).next_item_num
 
     res = rollback(rid, 1)
-    assert res.version == 3 and _map(rid).rows[0].hypothesis == "короче"
+    assert res.version == 3 and _map(rid).rows[0].hypothesis_brief == ["короче"]
     assert versions.load_state(rid).marks.edited_rows == [1]
 
     res = rollback(rid, 0)
     st = versions.load_state(rid)
     assert res.version == 4 and _map(rid).rows[0].hypothesis == original
+    assert _map(rid).rows[0].hypothesis_brief is None                # как в исходной версии
     assert st.marks.edited_rows == [] and (st.next_row_id, st.next_item_num) == counters
     assert [e.kind for e in versions.read_journal(rid)][-2:] == ["откат", "откат"]
     assert (run_dir(rid) / "versions" / "v2" / "06_map.json").exists()   # ничего не стёрто
     with pytest.raises(OperationError):
         rollback(rid, 4)
+
+
+
+def test_edit_verdict_text_changes_brief_points_not_full_rationale(rid):
+    """2.5: эксперт правит то, что видит в Excel, — выжимку; полный разбор остаётся для анализа."""
+    full = load_json(rid, "03_verdicts/01.json", Verdict).rationale
+    res = run_step(rid, EditText(kind="правка текста", sheet="вердикт", key="1", field="обоснование",
+                                  new_text="• пункт один (п. 2.1)\n- пункт два\n\n", reason="коротко"))
+    v = load_json(rid, "03_verdicts/01.json", Verdict)
+    assert v.rationale_brief == ["пункт один (п. 2.1)", "пункт два"] and v.rationale == full
+    assert res.change.before == full, "выжимки не было — «было» показывает полный текст, который видел эксперт"
+
+
+def test_edit_effect_calculation_changes_its_brief(rid):
+    run_step(rid, EditText(kind="правка текста", sheet="строка карты", key="1", field="как считать", effect_index=1,
+                           new_text="число заявок × 2 часа", reason="коротко"))
+    effect = _map(rid).rows[0].effects[0]
+    assert effect.how_to_calculate_brief == ["число заявок × 2 часа"] and effect.how_to_calculate != "число заявок × 2 часа"

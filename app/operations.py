@@ -33,7 +33,7 @@ from app.contracts import (
     EditText, HypothesisMap, HypothesisSet, JournalEntry, MapRow, MergeMapRows, Operation, RecheckIndicator,
     RequestItem, RunMeta, RunProgress, SetVerdict, SplitRequestItem, Verdict, VersionState,
 )
-from app.nodes.excel import _unverified_verdicts, build_excel
+from app.nodes.excel import _points, _unverified_verdicts, build_excel
 from app.nodes.hypotheses import run_hypotheses_no_data, run_hypotheses_violated
 from app.nodes.merge import _clause_tokens, _fallback_map, _flatten_hypotheses
 from app.nodes.request import build_request
@@ -150,6 +150,16 @@ def _needs_request(row: MapRow) -> bool:
 _MAP_FIELDS = {"гипотеза": "hypothesis", "основание": "grounds"}
 _EFFECT_FIELDS = {"показатель эффекта": "metric", "как считать": "how_to_calculate", "что подтвердит": "expected_trend"}
 _ITEM_FIELDS = {"показатель": "metric", "пояснение": "note", "пункт": "clause"}
+# 2.5: эксперт видит в Excel выжимку — правка текста правит её, полный текст агента остаётся для анализа
+_BRIEF_OF = {"hypothesis": "hypothesis_brief", "grounds": "grounds_brief",
+             "how_to_calculate": "how_to_calculate_brief", "expected_trend": "expected_trend_brief"}
+_BULLET = "•-—*· \t"
+
+
+def _split_points(text: str) -> list[str]:
+    """Текст пользователя — пункты выжимки: по строке на пункт, без маркеров и пустых строк."""
+    points = [line.strip().lstrip(_BULLET).strip() for line in text.splitlines()]
+    return [p for p in points if p] or [text.strip()]
 
 
 def _edit_text(ctx: _Ctx, op: EditText) -> Change:
@@ -159,24 +169,35 @@ def _edit_text(ctx: _Ctx, op: EditText) -> Change:
         if n not in ctx.verdicts:
             raise OperationError(f"индикатора {n} нет")
         old = ctx.verdicts[n]
-        ctx.verdicts[n] = _valid(Verdict, old, rationale=op.new_text)
+        points = _split_points(op.new_text)
+        ctx.verdicts[n] = _valid(Verdict, old, rationale_brief=points)
         _add_once(marks.edited_verdicts, n)
-        return Change(f"Вердикты, инд. {n}", "обоснование переформулировано", old.rationale, op.new_text)
+        return Change(f"Вердикты, инд. {n}", "обоснование переформулировано",
+                      _points(old.rationale_brief, old.rationale), _points(points, ""))
     if op.sheet == "строка карты":
         row = _row(ctx, int(op.key))
         if op.field in _MAP_FIELDS:
-            before = getattr(row, _MAP_FIELDS[op.field])
-            new_row = _valid(MapRow, row, **{_MAP_FIELDS[op.field]: op.new_text})
+            full = _MAP_FIELDS[op.field]
+            before = _points(getattr(row, _BRIEF_OF[full]), getattr(row, full))
+            after = _split_points(op.new_text)
+            new_row = _valid(MapRow, row, **{_BRIEF_OF[full]: after})
+            after = _points(after, "")
         else:
             if op.effect_index > len(row.effects):
                 raise OperationError(f"у строки {row.row_id} нет эффекта № {op.effect_index}")
             effects = [e.model_dump() for e in row.effects]
-            before = effects[op.effect_index - 1][_EFFECT_FIELDS[op.field]]
-            effects[op.effect_index - 1][_EFFECT_FIELDS[op.field]] = op.new_text
+            effect, full = effects[op.effect_index - 1], _EFFECT_FIELDS[op.field]
+            if full in _BRIEF_OF:   # «как считать», «что подтвердит» — выжимка
+                before = _points(effect[_BRIEF_OF[full]], effect[full])
+                effect[_BRIEF_OF[full]] = _split_points(op.new_text)
+                after = _points(effect[_BRIEF_OF[full]], "")
+            else:                   # название показателя — одно, выжимки у него нет
+                before, after = effect[full], op.new_text
+                effect[full] = op.new_text
             new_row = _valid(MapRow, row, effects=effects)
         _set_rows(ctx, [new_row if r.row_id == row.row_id else r for r in ctx.hyp_map.rows])
         _add_once(marks.edited_rows, row.row_id)
-        return Change(f"Карта гипотез, стр. {row.row_id}", f"переформулировано поле «{op.field}»", before, op.new_text)
+        return Change(f"Карта гипотез, стр. {row.row_id}", f"переформулировано поле «{op.field}»", before, after)
     item = _item(ctx, op.key)
     before = getattr(item, _ITEM_FIELDS[op.field])
     new_item = _valid(RequestItem, item, **{_ITEM_FIELDS[op.field]: op.new_text})
@@ -204,6 +225,7 @@ def _apply_verdict(ctx: _Ctx, new: Verdict) -> str:
 def _set_verdict(ctx: _Ctx, op: SetVerdict) -> Change:
     old = ctx.verdicts[op.indicator]
     new = Verdict(indicator=op.indicator, name=old.name, verdict=op.verdict, rationale=op.rationale,
+                  rationale_brief=_split_points(op.rationale),   # выжимка — слова эксперта
                   missing_data=op.missing_data, proof=old.proof, clause=old.clause, sources=old.sources)
     before = _apply_verdict(ctx, new)
     _add_once(ctx.state.marks.edited_verdicts, op.indicator)
@@ -277,6 +299,8 @@ def _merge_map_rows(ctx: _Ctx, op: MergeMapRows) -> Change:
         row_id=keep, indicators=sorted({n for r in rows for n in r.indicators}), hypothesis=op.hypothesis,
         grounds=" | ".join(r.grounds for r in rows), effects=list(effects.values()), data=list(data.values()),
         proof=next((r.proof for r in rows if r.proof), None), clause=", ".join(dict.fromkeys(clauses)) or None,
+        hypothesis_brief=_split_points(op.hypothesis),
+        grounds_brief=list(dict.fromkeys(p for r in rows for p in (r.grounds_brief or [r.grounds]))),
     )
     _set_rows(ctx, [merged] + [r for r in ctx.hyp_map.rows if r.row_id not in ids])
     _drop_row_from_request(ctx, gone, keep, "")
@@ -329,7 +353,8 @@ def _prepare_recheck(ctx: _Ctx, op: RecheckIndicator, prefix: str) -> Candidate:
     if new.verdict == "ошибка":
         raise OperationError(f"перепроверка не удалась: {new.rationale[:300]}")
     old = ctx.verdicts[op.indicator]
-    return Candidate(op, new, f"{old.verdict} — {old.rationale}", f"{new.verdict} — {new.rationale}", cost)
+    return Candidate(op, new, f"{old.verdict}\n{_points(old.rationale_brief, old.rationale)}",
+                     f"{new.verdict}\n{_points(new.rationale_brief, new.rationale)}", cost)
 
 
 def _accept_recheck(ctx: _Ctx, cand: Candidate) -> Change:
@@ -343,7 +368,7 @@ def _prepare_hypotheses(ctx: _Ctx, op: BuildHypotheses, prefix: str) -> Candidat
     if not _in_work(op.indicator, v.verdict):
         raise OperationError(
             f"по индикатору {op.indicator} гипотезы не строятся: вердикт «{v.verdict}»"
-            + (" — для индикаторов 1–6 это строка «проверка не завершена»" if v.verdict == "нет данных" else "")
+            + (" — для индикаторов 1–6 это строка «нужна ручная проверка»" if v.verdict == "нет данных" else "")
         )
     node = run_hypotheses_violated if v.verdict == "нарушен" else run_hypotheses_no_data
     buckets = Buckets(violated=[v]) if v.verdict == "нарушен" else Buckets(no_data=[v])
