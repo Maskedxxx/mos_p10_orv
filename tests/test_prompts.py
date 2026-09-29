@@ -28,7 +28,7 @@ from app.config import (
     all_indicators,
     prompt_path,
 )
-from app.contracts import ActPassport, DataRequest, DialogTurn, HypothesisMap, HypothesisSet
+from app.contracts import ActPassport, DataRequest, DialogTurn, HypothesisMap, HypothesisSet, HypothesisSetOutput, MergeOutput
 
 INDICATOR_PROMPTS = [prompt_path(ind.number) for ind in all_indicators()]
 NODE_PROMPTS = [PROMPT_HYPOTHESES_VIOLATED, PROMPT_HYPOTHESES_NO_DATA, PROMPT_MERGE, PROMPT_REQUEST, PROMPT_DIALOG]
@@ -129,9 +129,9 @@ def _example_json(text: str, start_marker: str, end_marker: str) -> dict:
 
 
 @pytest.mark.parametrize("path, model_cls, start, end", [
-    (PROMPT_HYPOTHESES_VIOLATED, HypothesisSet, '{\n  "indicator": 7', "\n\nПоле grounds"),
-    (PROMPT_HYPOTHESES_NO_DATA, HypothesisSet, '{\n  "indicator": 10', "\n\nПоле where"),
-    (PROMPT_MERGE, HypothesisMap, '{\n  "rows"', "\n\nПоле decisions"),
+    (PROMPT_HYPOTHESES_VIOLATED, HypothesisSetOutput, '{\n  "indicator": 7', "\n\nПоле grounds"),
+    (PROMPT_HYPOTHESES_NO_DATA, HypothesisSetOutput, '{\n  "indicator": 10', "\n\nПоле where"),
+    (PROMPT_MERGE, MergeOutput, '{\n  "rows"', "\n\nПоле decisions"),
     (PROMPT_REQUEST, DataRequest, '{\n  "items"', "\n\nПоле years"),
     (PROMPT_DIALOG, DialogTurn, '{\n  "reply"', "\n\nПоле plan"),
 ], ids=["04a", "04b", "05", "06", "07"])
@@ -164,3 +164,41 @@ def test_request_prompt_knows_existing_blank_block():
     from app.nodes.request import EXISTING_BLANK_HEADER
     text = (PROMPTS_DIR / "06_request.md").read_text(encoding="utf-8")
     assert EXISTING_BLANK_HEADER.removeprefix("## ") in text
+
+
+
+# ---- 2.5: выжимка для эксперта — отдельный ключ рядом с полным текстом ----
+
+_BRIEF_OPEN, _BRIEF_CLOSE = "<выжимка_для_эксперта>", "</выжимка_для_эксперта>"
+
+
+def _brief_block(path) -> str:
+    text = path.read_text(encoding="utf-8")
+    assert text.count(_BRIEF_OPEN) == 1 and text.count(_BRIEF_CLOSE) == 1, path.name
+    return text[text.index(_BRIEF_OPEN):text.index(_BRIEF_CLOSE)]
+
+
+def test_indicator_prompts_share_one_brief_block_and_key():
+    """Блок выжимки одинаков во всех 12 промптах индикаторов — правило пишется одно на всех;
+    ключ rationale_brief есть в примере ответа каждого."""
+    paths = [PROMPTS_DIR / f"02_indicator_{n:02d}.md" for n in range(1, 13)]
+    blocks = {_brief_block(p) for p in paths}
+    assert len(blocks) == 1
+    block = blocks.pop()
+    assert "rationale_brief" in block and "Смотрел:" in block and "Не нашёл:" in block
+    for p in paths:
+        assert '"rationale_brief": [' in p.read_text(encoding="utf-8"), p.name
+
+
+def test_hypotheses_prompts_share_one_brief_block():
+    """Блок выжимки одинаков в 04a, 04b и 05 — гипотезы, основания, эффекты пишутся по одному правилу."""
+    blocks = {_brief_block(p) for p in (PROMPT_HYPOTHESES_VIOLATED, PROMPT_HYPOTHESES_NO_DATA, PROMPT_MERGE)}
+    assert len(blocks) == 1
+    block = blocks.pop()
+    for key in ("hypothesis_brief", "grounds_brief", "how_to_calculate_brief", "expected_trend_brief"):
+        assert key in block, key
+
+
+def test_merge_prompt_says_how_to_brief_merged_rows():
+    text = PROMPT_MERGE.read_text(encoding="utf-8")
+    assert "для слитой — заново по итоговой формулировке" in text
