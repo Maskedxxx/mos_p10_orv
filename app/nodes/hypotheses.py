@@ -11,7 +11,7 @@ run_hypotheses_no_data) — по сигнатуре из ТЗ, — а общая
 Флаг вместо двух функций был бы менее читаем на месте вызова в оркестраторе.
 
 В модель уходит полный текст акта плюс карточка вердикта отдельным помеченным
-JSON-блоком (см. _build_document) — вердикт не подмешивается в текст акта, модель
+JSON-блоком (см. _verdict_card) — вердикт не подмешивается в текст акта, модель
 не должна его с ним перепутать. Инструменты не нужны ни одной из веток: гипотезы
 пишутся по уже собранному вердикту и тексту акта, в интернет ходить незачем
 (config.ALLOWED_TOOLS_TEXT — пустой список).
@@ -46,6 +46,7 @@ from pathlib import Path
 
 from app.config import (
     ALLOWED_TOOLS_TEXT,
+    CACHE_WARMUP_S,
     NO_DATA_TEXT_FAMILY,
     PROMPT_HYPOTHESES_NO_DATA,
     PROMPT_HYPOTHESES_VIOLATED,
@@ -97,19 +98,36 @@ def _add_cost_to_meta(run_id: str, cost_delta: float) -> None:
         update_meta(run_id, cost_usd=current.cost_usd + cost_delta)
 
 
-def _build_document(document_md: str, passport_block_text: str, verdict: Verdict) -> str:
+def _shared_context(document_md: str, passport_block_text: str) -> str:
     """
-    Собрать документ для stdin агента: полный текст акта, блок паспорта (если
-    есть), карточка вердикта — три помеченных блока в порядке, описанном
-    во входных данных промптов 04a/04b v2. Карточка сериализуется читаемо
-    (indent=2, кириллица без escape).
+    Общий для всех агентов-гипотез текст (2.6): полный текст акта и блок паспорта.
+    Уходит в системный промпт — агенты читают его из кэша друг у друга, а не пишут
+    каждый заново. Порядок блоков — как во входных данных промптов 04a/04b v2.
     """
-    verdict_json = json.dumps(verdict.model_dump(mode="json"), ensure_ascii=False, indent=2)
     parts = ["## ПОЛНЫЙ ТЕКСТ АКТА\n\n" f"{document_md}\n"]
     if passport_block_text:
         parts.append(passport_block_text)
-    parts.append("## КАРТОЧКА ВЕРДИКТА (JSON)\n\n" f"```json\n{verdict_json}\n```\n")
     return "\n".join(parts)
+
+
+def _verdict_card(verdict: Verdict) -> str:
+    """
+    Своё у каждого агента: карточка вердикта — в stdin, после общего текста акта
+    и паспорта. Сериализуется читаемо (indent=2, кириллица без escape).
+    """
+    verdict_json = json.dumps(verdict.model_dump(mode="json"), ensure_ascii=False, indent=2)
+    return "## КАРТОЧКА ВЕРДИКТА (JSON)\n\n" f"```json\n{verdict_json}\n```\n"
+
+
+def _after(delay_s: float, fn, *args):
+    """
+    Запустить fn через delay_s секунд (2.6): ведомый агент ждёт, пока первый в группе
+    запишет общий текст в кэш — одновременно стартовавшие агенты пишут его каждый сам.
+    Общий помощник узлов гипотез и вердиктов.
+    """
+    if delay_s > 0:
+        time.sleep(delay_s)
+    return fn(*args)
 
 
 def _empty_set(verdict: Verdict, error_text: str) -> HypothesisSet:
@@ -145,17 +163,16 @@ def _run_one_hypothesis(
     """
     n = verdict.indicator
     try:
-        document = _build_document(document_md, passport_block_text, verdict)
-
         result = call(
             instruction,
-            document,
+            _verdict_card(verdict),
             HypothesisSetOutput,   # 2.5: выжимки для эксперта в ответе обязательны
             run_id=run_id,
             trace_name=f"{trace_prefix}05_hypotheses/{n:02d}.raw.json",
             allowed_tools=ALLOWED_TOOLS_TEXT,
             timeout_s=timeout_s,
             max_budget_usd=max_budget_usd,
+            shared_context=_shared_context(document_md, passport_block_text),
         )
 
         if not result.ok or result.value is None:
@@ -204,10 +221,11 @@ def _run_hypotheses(
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [
             executor.submit(
+                _after, CACHE_WARMUP_S if i else 0.0,   # первый пишет акт в кэш, остальные читают
                 _run_one_hypothesis, verdict, document_md, passport_block_text, run_id, instruction,
                 timeout_s, max_budget_usd, trace_prefix,
             )
-            for verdict in verdicts
+            for i, verdict in enumerate(verdicts)
         ]
         for future in as_completed(futures):
             n, hset, cost, ok = future.result()

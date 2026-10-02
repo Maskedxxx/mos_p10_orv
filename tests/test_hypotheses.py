@@ -210,30 +210,24 @@ def test_tools_are_empty(run_id, tmp_prompts, monkeypatch):
         assert tools == []
 
 
-def test_stdin_has_document_and_distinguishable_verdict_card(run_id, tmp_prompts, monkeypatch):
-    """6. В stdin есть и текст акта, и карточка вердикта, и они различимы."""
-    seen_documents: dict[int, str] = {}
+def test_act_in_shared_context_and_verdict_card_in_stdin(run_id, tmp_prompts, monkeypatch):
+    """6. 2.6: текст акта — общим контекстом (системный промпт, кэш для всех агентов-гипотез),
+    карточка вердикта — в stdin; они различимы и не смешиваются."""
+    seen: dict[int, tuple[str, str]] = {}
 
     def _effect(instruction, document, model_cls, **kwargs):
         n = _n_from_trace_name(kwargs["trace_name"])
-        seen_documents[n] = document
+        seen[n] = (document, kwargs["shared_context"])
         return _ok_call_result(n)
 
     monkeypatch.setattr(hyp_module, "call", Mock(side_effect=_effect))
 
     run_hypotheses_violated(_buckets_violated([1]), "ПОЛНЫЙ ТЕКСТ МАРКЕР", run_id)
 
-    doc = seen_documents[1]
-    assert "## ПОЛНЫЙ ТЕКСТ АКТА" in doc
-    assert "ПОЛНЫЙ ТЕКСТ МАРКЕР" in doc
-    assert "## КАРТОЧКА ВЕРДИКТА (JSON)" in doc
-    assert '"verdict": "нарушен"' in doc
-    # Различимы: заголовок текста акта стоит раньше заголовка карточки вердикта,
-    # а сам текст акта не встречается внутри JSON-блока карточки
-    text_pos = doc.index("## ПОЛНЫЙ ТЕКСТ АКТА")
-    card_pos = doc.index("## КАРТОЧКА ВЕРДИКТА (JSON)")
-    assert text_pos < card_pos
-    assert doc.index("ПОЛНЫЙ ТЕКСТ МАРКЕР") < card_pos
+    card, shared = seen[1]
+    assert shared.startswith("## ПОЛНЫЙ ТЕКСТ АКТА") and "ПОЛНЫЙ ТЕКСТ МАРКЕР" in shared
+    assert card.startswith("## КАРТОЧКА ВЕРДИКТА (JSON)") and '"verdict": "нарушен"' in card
+    assert "ПОЛНЫЙ ТЕКСТ МАРКЕР" not in card and "КАРТОЧКА ВЕРДИКТА" not in shared
 
 
 def test_violated_branch_uses_prompt_04a(run_id, tmp_prompts, monkeypatch):
@@ -401,7 +395,7 @@ def test_passport_block_between_text_and_card(run_id, tmp_prompts, monkeypatch, 
     seen = {}
 
     def _effect(instruction, document, schema, **kwargs):
-        seen["doc"] = document
+        seen["doc"] = kwargs["shared_context"] + document   # 2.6: в системном промпте, затем stdin
         return _ok_call_result(1)
 
     monkeypatch.setattr(hyp_module, "call", Mock(side_effect=_effect))
@@ -419,3 +413,19 @@ def test_hypotheses_answer_uses_strict_contract_with_brief(run_id, tmp_prompts, 
     monkeypatch.setattr(hyp_module, "call", mock)
     run_hypotheses_violated(_buckets_violated([7]), "текст акта", run_id)
     assert mock.call_args.args[2] is HypothesisSetOutput
+
+
+
+def test_first_hypothesis_call_starts_before_others(run_id, tmp_prompts, monkeypatch):
+    """2.6: первый агент ветки стартует сразу и пишет акт в кэш, остальные — через CACHE_WARMUP_S."""
+    import time
+    monkeypatch.setattr(hyp_module, "CACHE_WARMUP_S", 0.3)
+    started: dict[int, float] = {}
+
+    def _effect(instruction, document, model_cls, **kwargs):
+        started[_n_from_trace_name(kwargs["trace_name"])] = time.monotonic()
+        return _ok_call_result(_n_from_trace_name(kwargs["trace_name"]))
+
+    monkeypatch.setattr(hyp_module, "call", Mock(side_effect=_effect))
+    run_hypotheses_violated(_buckets_violated([7, 8, 9]), "текст", run_id)
+    assert started[7] + 0.25 <= min(started[8], started[9])

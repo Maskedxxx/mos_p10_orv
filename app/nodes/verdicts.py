@@ -41,7 +41,7 @@ from app.config import (
 from app.contracts import ActPassport, Verdict, VerdictOutput
 from app.logger import get_run_logger
 from app.runner import call
-from app.nodes.hypotheses import _add_cost_to_meta, append_task_clarification
+from app.nodes.hypotheses import _add_cost_to_meta, _after, append_task_clarification
 from app.trace import save_json
 
 # Длина, до которой обрезается текст ошибки в rationale вердикта "ошибка"
@@ -149,13 +149,6 @@ def _start_delays(nums: list[int]) -> dict[int, float]:
         delays[n] = CACHE_WARMUP_S if route in seen else 0.0
         seen.add(route)
     return delays
-
-
-def _after(delay_s: float, fn, *args):
-    """Запустить fn через delay_s секунд — ведомый агент ждёт, пока лидер запишет акт в кэш."""
-    if delay_s > 0:
-        time.sleep(delay_s)
-    return fn(*args)
 
 
 def run_verdicts(
