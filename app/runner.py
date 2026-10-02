@@ -36,6 +36,14 @@ _run_attempt): все ретраятся полным повтором, БЕЗ -
 Сырой stdout сохраняется на КАЖДОЙ попытке через trace.save_raw (в обоих режимах) —
 прямое требование владельца: без сырых ответов нечем отлаживать сбои модели.
 
+Кэш (2.6). Общий для группы агентов текст (акт и паспорт) передаётся не в stdin,
+а файлом в системный промпт (--append-system-prompt-file, shared_context): кэш
+модели берёт куски запроса целиком, и только так агенты с разными заданиями читают
+акт из кэша друг у друга, а не пишут его каждый заново. Файл лежит в
+runs/<id>/_context/ — часть трейса. Срок кэша для пайплайна — 5 минут
+(FORCE_PROMPT_CACHING_5M=1, запись 1,25× цены входа вместо 2× у часового); диалог
+оставляет срок по умолчанию (1 час) — человек думает между сообщениями.
+
 Бюджет — два независимых уровня защиты: max_budget_usd передаётся в саму CLI
 как --max-budget-usd (потолок на ОДИН вызов процесса — останавливает
 зациклившийся вызов до того, как он потратит много) и отдельно проверяется в
@@ -50,8 +58,10 @@ permission_denials собираются по ВСЕМ попыткам в CallRe
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import os
 import subprocess
 import time
 from dataclasses import dataclass
@@ -61,7 +71,7 @@ from pydantic import BaseModel, ValidationError
 
 from app.config import EFFORT, MODEL
 from app.logger import get_run_logger
-from app.trace import save_raw
+from app.trace import save_bytes, save_raw
 
 # Тип модели ответа для call() — только pydantic-модели (--json-schema требует схему)
 ModelT = TypeVar("ModelT", bound=BaseModel)
@@ -133,6 +143,7 @@ def _build_cmd(
     resume_session_id: str | None,
     max_budget_usd: float | None,
     model: str = MODEL,
+    system_file: str | None = None,
 ) -> list[str]:
     """
     Собрать argv для вызова `claude -p` (список аргументов, не строка через shell).
@@ -155,7 +166,20 @@ def _build_cmd(
     ]
     if max_budget_usd is not None:
         cmd += ["--max-budget-usd", str(max_budget_usd)]
+    if system_file is not None:
+        cmd += ["--append-system-prompt-file", system_file]   # общий контекст группы агентов — в кэш
     return cmd
+
+
+# Срок кэша 5 минут для вызовов пайплайна: чтения внутри прогона идут через секунды и минуты
+_SHORT_CACHE_ENV = {"FORCE_PROMPT_CACHING_5M": "1"}
+
+
+def _shared_context_file(run_id: str, shared_context: str) -> str:
+    """Файл общего контекста в папке прогона — один на содержимое (одинаковый текст — один файл)."""
+    data = shared_context.encode("utf-8")
+    relname = f"_context/{hashlib.sha1(data).hexdigest()[:12]}.md"
+    return str(save_bytes(run_id, relname, data))
 
 
 def _retry_message(error_text: str) -> str:
@@ -197,6 +221,7 @@ def _run_attempt(
     timeout_s: int,
     run_id: str,
     trace_name: str,
+    env: dict[str, str] | None = None,
 ) -> _AttemptOutcome:
     """
     Выполнить один запуск процесса claude -p: собрать kwargs, запустить, сохранить
@@ -209,6 +234,8 @@ def _run_attempt(
     """
     attempt_started = time.monotonic()
     run_kwargs: dict[str, Any] = {"capture_output": True, "text": True, "timeout": timeout_s}
+    if env is not None:
+        run_kwargs["env"] = env
     if send_document and document is not None:
         run_kwargs["input"] = document
     else:
@@ -298,6 +325,8 @@ def call(
     timeout_s: int = 900,
     max_budget_usd: float | None = None,
     model: str = MODEL,
+    shared_context: str | None = None,
+    short_cache_ttl: bool = True,
 ) -> CallResult[ModelT]:
     """
     Вызвать `claude -p` с ретраями и вернуть провалидированный ответ.
@@ -309,6 +338,10 @@ def call(
     max_budget_usd, если задан, действует на двух уровнях: передаётся в саму
     CLI как --max-budget-usd (потолок на один вызов процесса) и проверяется в
     Python как сумма стоимости по всем попыткам (потолок на весь call()).
+
+    shared_context — общий для группы агентов текст: уходит файлом в системный промпт
+    (см. «Кэш» в docstring модуля), а не в stdin. short_cache_ttl — срок кэша 5 минут
+    (пайплайн); False — срок по умолчанию, 1 час (диалог).
 
     Исключение бросается только если ретраем чинить бессмысленно: бинарь
     claude не найден, либо сама функция вызвана с неверными аргументами.
@@ -329,6 +362,9 @@ def call(
     attempts_made = 0
     permission_denials_total: list[Any] = []
 
+    system_file = _shared_context_file(run_id, shared_context) if shared_context is not None else None
+    env = {**os.environ, **_SHORT_CACHE_ENV} if short_cache_ttl else None
+
     # Состояние следующей попытки: что слать и слать ли документ в stdin
     message = instruction
     resume_session_id: str | None = None
@@ -337,8 +373,8 @@ def call(
     for attempt in range(1, max_attempts + 1):
         attempts_made = attempt
 
-        cmd = _build_cmd(message, schema_json, allowed_tools, resume_session_id, max_budget_usd, model)
-        outcome = _run_attempt(cmd, document, send_document, timeout_s, run_id, trace_name)
+        cmd = _build_cmd(message, schema_json, allowed_tools, resume_session_id, max_budget_usd, model, system_file)
+        outcome = _run_attempt(cmd, document, send_document, timeout_s, run_id, trace_name, env)
 
         session_id = outcome.session_id or session_id
         cost_total += outcome.cost_usd

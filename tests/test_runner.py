@@ -587,3 +587,67 @@ def test_build_cmd_model_override():
     assert _build_cmd("т", "{}", [], None, None)[_build_cmd("т", "{}", [], None, None).index("--model") + 1] == MODEL
     cmd = _build_cmd("т", "{}", [], None, None, model="opus")
     assert cmd[cmd.index("--model") + 1] == "opus"
+
+
+
+# ---- 2.6: кэш — общий контекст в системный промпт, срок кэша 5 минут для пайплайна ----
+
+
+def _ok_stdout(valid: dict) -> str:
+    return _stdout_with_events(_result_event(json.dumps(valid)))
+
+
+def _flag_value(cmd: list[str], flag: str) -> str | None:
+    return cmd[cmd.index(flag) + 1] if flag in cmd else None
+
+
+def test_shared_context_goes_to_system_prompt_file(tmp_runs_dir, valid_verdict_ok, monkeypatch):
+    """Акт и паспорт — общий для группы агентов текст — уходят файлом в системный промпт:
+    кэш берёт куски целиком, и только так агенты с разными заданиями читают акт друг у друга."""
+    mock_run = Mock(return_value=_proc(_ok_stdout(valid_verdict_ok)))
+    monkeypatch.setattr(subprocess, "run", mock_run)
+    call("инструкция", None, Verdict, run_id="run_ctx", trace_name="03_verdicts/01.raw.json",
+         allowed_tools=[], shared_context="## ПОЛНЫЙ ТЕКСТ АКТА\n\nакт")
+    cmd, kwargs = mock_run.call_args.args[0], mock_run.call_args.kwargs
+    path = _flag_value(cmd, "--append-system-prompt-file")
+    assert path is not None and path.startswith(str(tmp_runs_dir / "run_ctx" / "_context"))
+    assert open(path, encoding="utf-8").read() == "## ПОЛНЫЙ ТЕКСТ АКТА\n\nакт"
+    assert kwargs["stdin"] == subprocess.DEVNULL
+
+
+def test_same_context_is_one_file(tmp_runs_dir, valid_verdict_ok, monkeypatch):
+    mock_run = Mock(return_value=_proc(_ok_stdout(valid_verdict_ok)))
+    monkeypatch.setattr(subprocess, "run", mock_run)
+    for n in (1, 2):
+        call(f"инструкция {n}", None, Verdict, run_id="run_ctx", trace_name=f"03_verdicts/0{n}.raw.json",
+             allowed_tools=[], shared_context="акт")
+    paths = {_flag_value(c.args[0], "--append-system-prompt-file") for c in mock_run.call_args_list}
+    assert len(paths) == 1 and len(list((tmp_runs_dir / "run_ctx" / "_context").iterdir())) == 1
+
+
+def test_pipeline_cache_ttl_is_five_minutes_dialog_keeps_default(tmp_runs_dir, valid_verdict_ok, monkeypatch):
+    """Пайплайн — срок кэша 5 минут (запись 1,25× вместо 2×); диалог — как было (1 час)."""
+    mock_run = Mock(return_value=_proc(_ok_stdout(valid_verdict_ok)))
+    monkeypatch.setattr(subprocess, "run", mock_run)
+    call("и", "док", Verdict, run_id="run_ttl", trace_name="a.raw.json", allowed_tools=[])
+    assert mock_run.call_args.kwargs["env"]["FORCE_PROMPT_CACHING_5M"] == "1"
+    call("и", "док", Verdict, run_id="run_ttl", trace_name="b.raw.json", allowed_tools=[], short_cache_ttl=False)
+    assert "FORCE_PROMPT_CACHING_5M" not in (mock_run.call_args.kwargs.get("env") or {})
+
+
+def test_without_shared_context_command_unchanged(tmp_runs_dir, valid_verdict_ok, monkeypatch):
+    mock_run = Mock(return_value=_proc(_ok_stdout(valid_verdict_ok)))
+    monkeypatch.setattr(subprocess, "run", mock_run)
+    call("и", "док", Verdict, run_id="run_plain", trace_name="a.raw.json", allowed_tools=[])
+    assert "--append-system-prompt-file" not in mock_run.call_args.args[0]
+    assert mock_run.call_args.kwargs["input"] == "док"
+
+
+def test_resume_keeps_shared_context(tmp_runs_dir, valid_verdict_ok, monkeypatch):
+    """Повтор через --resume после ответа не по схеме — с тем же системным промптом."""
+    bad = _stdout_with_events(_result_event("{\"verdict\": \"x\"}", session_id="sess-9"))
+    mock_run = Mock(side_effect=[_proc(bad), _proc(_ok_stdout(valid_verdict_ok))])
+    monkeypatch.setattr(subprocess, "run", mock_run)
+    res = call("и", None, Verdict, run_id="run_res", trace_name="a.raw.json", allowed_tools=[], shared_context="акт")
+    second = mock_run.call_args_list[1].args[0]
+    assert res.ok and "--resume" in second and _flag_value(second, "--append-system-prompt-file")
