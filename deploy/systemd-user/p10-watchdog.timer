@@ -1,0 +1,11 @@
+# П-10 ОРВ — таймер сторожа: первая проверка через 2 минуты после загрузки, дальше раз в минуту.
+[Unit]
+Description=П-10 ОРВ: сторож — проверка раз в минуту
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

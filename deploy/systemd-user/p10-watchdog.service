@@ -1,0 +1,8 @@
+# П-10 ОРВ — сторож: один проход проверки (запускает таймер p10-watchdog.timer раз в минуту).
+# Что проверяет и когда перезапускает — в deploy/p10-watchdog.sh.
+[Unit]
+Description=П-10 ОРВ: сторож — сервис и публичная ссылка отвечают
+
+[Service]
+Type=oneshot
+ExecStart=/home/masked/projects/p10-orv/deploy/p10-watchdog.sh

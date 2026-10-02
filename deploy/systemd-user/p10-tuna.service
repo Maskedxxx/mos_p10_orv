@@ -1,0 +1,17 @@
+# П-10 ОРВ — публичная ссылка https://p10-orv.ru.tuna.am (туннель tuna на порт 8030).
+# Поднимается при загрузке спарка и перезапускается при обрыве. Пароля на туннеле нет:
+# у сервиса свой вход. Домен p10-orv.ru зарезервирован в аккаунте tuna.
+# Журнал: journalctl --user -u p10-tuna.
+[Unit]
+Description=П-10 ОРВ: публичная ссылка p10-orv.ru.tuna.am (tuna → порт 8030)
+After=p10-web.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/tuna http 8030 --subdomain=p10-orv --location=ru
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

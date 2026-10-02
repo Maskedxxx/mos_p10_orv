@@ -1,0 +1,21 @@
+# П-10 ОРВ — веб-страница сервиса (NiceGUI, порт 8030), пользовательский юнит systemd.
+# Поднимается при загрузке спарка (у пользователя masked включён linger — без входа
+# в систему) и перезапускается при любом падении процесса. Зависание ловит сторож
+# p10-watchdog. Вывод процесса — в журнал: journalctl --user -u p10-web.
+# Установка и команды — README, раздел «Как запустить».
+[Unit]
+Description=П-10 ОРВ: веб-страница (NiceGUI, порт 8030)
+# Не прекращать попытки перезапуска, сколько бы падений подряд ни было
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=/home/masked/projects/p10-orv
+ExecStart=/home/masked/projects/p10-orv/.venv/bin/python -m app.web
+Environment=PYTHONUNBUFFERED=1
+Environment=LANG=ru_RU.utf8
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
