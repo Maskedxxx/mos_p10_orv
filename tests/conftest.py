@@ -138,3 +138,13 @@ def valid_passport() -> dict:
                        "appointed": {**stated_no, "items": []}},
         "control": {**stated_no, "authority": None, "subject": None, "measures": [], "outcomes": [], "clauses": []},
     }
+
+
+@pytest.fixture(autouse=True)
+def _no_cache_warmup(monkeypatch):
+    """Сдвиг старта агентов ради кэша (2.6) в тестах не ждём: 12 секунд на тест ни к чему.
+    Тест самого сдвига ставит своё значение поверх."""
+    import app.nodes.hypotheses as hypotheses_module
+    import app.nodes.verdicts as verdicts_module
+    monkeypatch.setattr(verdicts_module, "CACHE_WARMUP_S", 0, raising=False)
+    monkeypatch.setattr(hypotheses_module, "CACHE_WARMUP_S", 0, raising=False)

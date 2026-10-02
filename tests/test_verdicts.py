@@ -363,7 +363,7 @@ def test_document_carries_full_act_text_under_marker(run_id, tmp_prompts_dir, mo
 
     def _effect(instruction, document, model_cls, **kwargs):
         n = _n_from_trace_name(kwargs["trace_name"])
-        seen_documents[n] = document
+        seen_documents[n] = kwargs["shared_context"]   # 2.6: акт — общим контекстом (системный промпт)
         return _ok_call_result(n)
 
     monkeypatch.setattr(verdicts_module, "call", Mock(side_effect=_effect))
@@ -452,7 +452,7 @@ def test_passport_block_follows_act_text(run_id, monkeypatch, valid_passport):
     seen = {}
 
     def _effect(instruction, document, schema, **kwargs):
-        seen["doc"] = document
+        seen["doc"] = kwargs["shared_context"]   # 2.6: общим контекстом (системный промпт)
         return _ok_call_result(1)
 
     monkeypatch.setattr(verdicts_module, "call", Mock(side_effect=_effect))
@@ -467,7 +467,7 @@ def test_no_passport_block_without_passport(run_id, monkeypatch):
     seen = {}
 
     def _effect(instruction, document, schema, **kwargs):
-        seen["doc"] = document
+        seen["doc"] = kwargs["shared_context"]   # 2.6: общим контекстом (системный промпт)
         return _ok_call_result(1)
 
     monkeypatch.setattr(verdicts_module, "call", Mock(side_effect=_effect))
@@ -483,3 +483,48 @@ def test_indicator_answer_uses_strict_contract_with_brief(run_id, tmp_prompts_di
     monkeypatch.setattr(verdicts_module, "call", mock)
     run_verdicts("текст акта", run_id, indicators=[1])
     assert mock.call_args.args[2] is VerdictOutput
+
+
+
+# ---- 2.6: кэш — акт и паспорт общим контекстом, лидеры групп стартуют первыми ----
+
+
+def test_act_and_passport_go_to_shared_context_not_stdin(run_id, tmp_prompts_dir, monkeypatch):
+    seen = []
+
+    def _effect(instruction, document, model_cls, **kwargs):
+        seen.append((document, kwargs.get("shared_context")))
+        return _default_side_effect(instruction, document, model_cls, **kwargs)
+
+    monkeypatch.setattr(verdicts_module, "call", Mock(side_effect=_effect))
+    run_verdicts("текст акта", run_id)
+    assert len(seen) == 12 and all(document is None for document, _ in seen)
+    assert {ctx for _, ctx in seen} == {"## ПОЛНЫЙ ТЕКСТ АКТА\n\nтекст акта"}
+
+
+def test_group_leaders_start_before_followers(run_id, tmp_prompts_dir, monkeypatch):
+    """Лидер каждой группы маршрута (первый текстовый — 1, первый с интернетом — 3) стартует сразу,
+    остальные — через CACHE_WARMUP_S: к их старту лидер уже записал акт в кэш."""
+    import time
+    monkeypatch.setattr(verdicts_module, "CACHE_WARMUP_S", 0.3)
+    started = {}
+
+    def _effect(instruction, document, model_cls, **kwargs):
+        started[_n_from_trace_name(kwargs["trace_name"])] = time.monotonic()
+        return _default_side_effect(instruction, document, model_cls, **kwargs)
+
+    monkeypatch.setattr(verdicts_module, "call", Mock(side_effect=_effect))
+    result = run_verdicts("текст акта", run_id)
+    leaders = {1, 3}
+    assert len(result) == 12
+    assert max(started[n] for n in leaders) + 0.25 <= min(t for n, t in started.items() if n not in leaders)
+
+
+def test_single_indicator_recheck_has_no_delay(run_id, tmp_prompts_dir, monkeypatch):
+    """Перепроверка одного индикатора из диалога — он сам себе лидер, ждать нечего."""
+    import time
+    monkeypatch.setattr(verdicts_module, "CACHE_WARMUP_S", 5)
+    monkeypatch.setattr(verdicts_module, "call", Mock(side_effect=_default_side_effect))
+    t = time.monotonic()
+    run_verdicts("текст акта", run_id, indicators=[7])
+    assert time.monotonic() - t < 2

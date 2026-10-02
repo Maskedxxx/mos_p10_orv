@@ -33,6 +33,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from app.config import (
     ALLOWED_TOOLS_TEXT,
     ALLOWED_TOOLS_WEB,
+    CACHE_WARMUP_S,
     all_indicators,
     get_indicator,
     prompt_path,
@@ -94,18 +95,21 @@ def _run_one_indicator(
         name_fallback = indicator.name
 
         instruction = append_task_clarification(prompt_path(n).read_text(encoding="utf-8"), extra_instruction)
-        document = _build_document(document_md, passport_block_text)
+        # 2.6: акт и паспорт — общий для всех 12 агентов текст — уходят в системный промпт,
+        # чтобы агенты читали его из кэша друг у друга; в stdin ничего не идёт
+        shared = _build_document(document_md, passport_block_text)
         allowed_tools = ALLOWED_TOOLS_TEXT if indicator.route == "текст" else ALLOWED_TOOLS_WEB
 
         result = call(
             instruction,
-            document,
+            None,
             VerdictOutput,   # 2.5: выжимка для эксперта в ответе обязательна
             run_id=run_id,
             trace_name=f"{trace_prefix}03_verdicts/{n:02d}.raw.json",
             allowed_tools=allowed_tools,
             timeout_s=timeout_s,
             max_budget_usd=max_budget_usd,
+            shared_context=shared,
         )
 
         if result.permission_denials:
@@ -127,6 +131,31 @@ def _run_one_indicator(
     except Exception as exc:  # исключение внутри потока не должно ронять весь прогон
         verdict = _error_verdict(n, name_fallback, f"необработанное исключение: {exc}", 1)
         return n, verdict, 0.0
+
+
+def _start_delays(nums: list[int]) -> dict[int, float]:
+    """
+    Сдвиг старта агентов по группам маршрута (2.6): первый индикатор группы — сразу,
+    остальные — через CACHE_WARMUP_S. Инструменты стоят в начале кэша, поэтому у
+    текстовых агентов и агентов с интернетом кэш разный — лидер у каждой группы свой.
+    """
+    delays: dict[int, float] = {}
+    seen: set[str] = set()
+    for n in nums:
+        try:
+            route = get_indicator(n).route
+        except Exception:   # неизвестный номер — без сдвига; ошибку покажет сам агент
+            route = f"?{n}"
+        delays[n] = CACHE_WARMUP_S if route in seen else 0.0
+        seen.add(route)
+    return delays
+
+
+def _after(delay_s: float, fn, *args):
+    """Запустить fn через delay_s секунд — ведомый агент ждёт, пока лидер запишет акт в кэш."""
+    if delay_s > 0:
+        time.sleep(delay_s)
+    return fn(*args)
 
 
 def run_verdicts(
@@ -179,11 +208,12 @@ def run_verdicts(
     from app.nodes.passport import passport_block
 
     block = passport_block(passport)
+    delays = _start_delays(nums)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [
             executor.submit(
-                _run_one_indicator, n, document_md, block, run_id, timeout_s, max_budget_usd,
-                extra_instruction, trace_prefix,
+                _after, delays[n], _run_one_indicator, n, document_md, block, run_id, timeout_s,
+                max_budget_usd, extra_instruction, trace_prefix,
             )
             for n in nums
         ]
