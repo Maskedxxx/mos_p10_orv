@@ -46,7 +46,7 @@ def test_turn_sends_all_blocks_and_records_chat(rid, monkeypatch):
 
     res = dialog_module.turn(rid, "Почему индикатор 3 нарушен?")
 
-    doc = seen["document"]
+    doc = seen["shared_context"] + seen["document"]   # 2.6: акт и паспорт — в системном промпте, остальное — stdin
     for block in ("## ПОЛНЫЙ ТЕКСТ АКТА", "## ВЕРДИКТЫ (JSON)", "## КАРТА ГИПОТЕЗ (JSON)", "## ЗАПРОС ПОКАЗАТЕЛЕЙ (JSON)",
                   "## СОСТОЯНИЕ ВЕРСИЙ (JSON)", "## ИСТОРИЯ ДИАЛОГА", "## СООБЩЕНИЕ ПОЛЬЗОВАТЕЛЯ"):
         assert block in doc
@@ -103,3 +103,22 @@ def test_turn_marks_user_message_with_session(rid, monkeypatch):
     dialog_module.turn(rid, "Вопрос", session="s-7f3a91")
     user, assistant = dialog_module.read_chat(rid)
     assert user["session"] == "s-7f3a91" and "session" not in assistant
+
+
+
+def test_act_and_passport_are_cached_between_turns(rid, monkeypatch):
+    """2.6: акт и паспорт за жизнь прогона не меняются — уходят в системный промпт и читаются
+    из кэша между ходами; всё, что меняется (вердикты, карта, история, сообщение), — в stdin.
+    Срок кэша — по умолчанию (1 час): человек думает между сообщениями."""
+    seen = {}
+
+    def _effect(instruction, document, model_cls, **kw):
+        seen.update(document=document, **kw)
+        return _ok(DialogTurn(reply="ок"))
+
+    monkeypatch.setattr(dialog_module, "call", Mock(side_effect=_effect))
+    dialog_module.turn(rid, "вопрос")
+    assert seen["shared_context"].startswith("## ПОЛНЫЙ ТЕКСТ АКТА") and "ТЕКСТ АКТА: п. 2.4.1" in seen["shared_context"]
+    assert "## ВЕРДИКТЫ (JSON)" not in seen["shared_context"]
+    assert "ТЕКСТ АКТА: п. 2.4.1" not in seen["document"] and seen["document"].startswith("## ВЕРДИКТЫ (JSON)")
+    assert seen["short_cache_ttl"] is False

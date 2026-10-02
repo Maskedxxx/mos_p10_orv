@@ -67,17 +67,27 @@ def _json_block(title: str, raw: str) -> str:
     return f"## {title}\n\n```json\n{raw.strip()}\n```\n"
 
 
+def shared_context(run_id: str) -> str:
+    """
+    Акт и паспорт — за жизнь прогона не меняются (2.6): уходят в системный промпт, и каждый
+    следующий ход читает их из кэша, а не пишет заново. Порядок блоков для модели прежний.
+    """
+    root = run_dir(run_id)
+    parts = [f"## ПОЛНЫЙ ТЕКСТ АКТА\n\n{(root / '01_document.md').read_text(encoding='utf-8')}\n"]
+    if (root / "02_passport.json").is_file():
+        parts.append(_json_block("ПАСПОРТ АКТА (JSON)", (root / "02_passport.json").read_text(encoding="utf-8")))
+    return "\n".join(parts)
+
+
 def build_document(run_id: str, message: str, history: list[dict]) -> str:
-    """Вход модели: текущая версия прогона, история чата, сообщение пользователя — последним блоком."""
+    """Вход модели в stdin: текущая версия прогона, история чата, сообщение пользователя — последним блоком.
+    Акт и паспорт — не здесь, а в shared_context (системный промпт)."""
     root = run_dir(run_id)
     verdicts = [json.loads(p.read_text(encoding="utf-8")) for p in sorted((root / "03_verdicts").glob("[0-9][0-9].json"))]
     for v in verdicts:
         v.pop("attempts", None)
     state = versions.load_state(run_id)
-    parts = [f"## ПОЛНЫЙ ТЕКСТ АКТА\n\n{(root / '01_document.md').read_text(encoding='utf-8')}\n"]
-    if (root / "02_passport.json").is_file():
-        parts.append(_json_block("ПАСПОРТ АКТА (JSON)", (root / "02_passport.json").read_text(encoding="utf-8")))
-    parts += [
+    parts = [
         _json_block("ВЕРДИКТЫ (JSON)", json.dumps(verdicts, ensure_ascii=False, indent=2)),
         _json_block("КАРТА ГИПОТЕЗ (JSON)", (root / "06_map.json").read_text(encoding="utf-8")),
         _json_block("ЗАПРОС ПОКАЗАТЕЛЕЙ (JSON)", (root / "07_request.json").read_text(encoding="utf-8")),
@@ -105,6 +115,8 @@ def turn(run_id: str, message: str, *, session: str | None = None, timeout_s: in
         allowed_tools=ALLOWED_TOOLS_TEXT,
         timeout_s=timeout_s,
         model=DIALOG_MODEL,
+        shared_context=shared_context(run_id),
+        short_cache_ttl=False,   # срок кэша 1 час: человек думает между сообщениями дольше 5 минут
     )
     _add_cost_to_meta(run_id, result.cost_usd)
     if not result.ok or result.value is None:
