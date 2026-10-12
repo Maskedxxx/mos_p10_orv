@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "garant": {
+      "type": "http",
+      "url": "https://mcp.garant.ru/mcp",
+      "headers": {"Authorization": "Bearer ${GARANT_TOKEN}"}
+    }
+  }
+}

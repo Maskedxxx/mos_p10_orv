@@ -651,3 +651,138 @@ def test_resume_keeps_shared_context(tmp_runs_dir, valid_verdict_ok, monkeypatch
     res = call("и", None, Verdict, run_id="run_res", trace_name="a.raw.json", allowed_tools=[], shared_context="акт")
     second = mock_run.call_args_list[1].args[0]
     assert res.ok and "--resume" in second and _flag_value(second, "--append-system-prompt-file")
+
+
+# ---- 2.7 (итерация 4, Б): Гарант через MCP ----
+# Проба 2026-10-12 на спарке (CLI 2.1.292): --safe-mode отключает MCP-серверы
+# целиком (mcp_servers: []), поэтому агенту с Гарантом изоляция собирается иначе:
+# --setting-sources local (без личного CLAUDE.md и плагинов машины),
+# --disable-slash-commands (без навыков), --strict-mcp-config + --mcp-config
+# (только сервер Гаранта); прокси, которые жили в настройках машины, — через
+# окружение процесса. Проверено: сервер connected, CLAUDE.md в контексте нет.
+
+
+@pytest.fixture
+def garant_files(tmp_path, monkeypatch):
+    """Токен и настройки CLI машины — во временных файлах, чтобы тест не читал настоящие."""
+    import app.runner as runner_mod
+    token = tmp_path / "token"
+    token.write_text("SECRET-TOKEN-123\n", encoding="utf-8")
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"env": {"HTTPS_PROXY": "http://p:1", "HTTP_PROXY": "http://p:1",
+                                            "NO_PROXY": "localhost", "DISABLE_AUTOUPDATER": "1"},
+                                    "model": "opus"}), encoding="utf-8")
+    monkeypatch.setattr(runner_mod, "GARANT_TOKEN_FILE", token)
+    monkeypatch.setattr(runner_mod, "CLI_SETTINGS_FILE", settings)
+    return token
+
+
+def test_mcp_tools_command_flags():
+    """С инструментами Гаранта: сервер Гаранта, только перечисленные его инструменты, без --safe-mode."""
+    from app.config import GARANT_MCP_CONFIG
+    cmd = _build_cmd("т", "{}", ["WebSearch"], None, None, mcp_tools=["garant_search", "garant_snippets"])
+    assert _flag_value(cmd, "--mcp-config") == str(GARANT_MCP_CONFIG)
+    assert "--strict-mcp-config" in cmd and "--safe-mode" not in cmd
+    assert _flag_value(cmd, "--setting-sources") == ""
+    assert "--disable-slash-commands" in cmd
+    assert _flag_value(cmd, "--permission-mode") == "dontAsk"
+    assert _flag_value(cmd, "--tools") == "WebSearch"   # встроенные — как раньше
+    assert _flag_value(cmd, "--allowedTools") == "WebSearch mcp__garant__garant_search mcp__garant__garant_snippets"
+
+
+def test_without_mcp_tools_isolation_unchanged():
+    """Без Гаранта команда побайтно прежняя (до 2.7): та же изоляция, тот же порядок флагов."""
+    from app.config import EFFORT, MODEL
+    expected = ["claude", "-p", "т", "--json-schema", "{}", "--output-format", "json", "--tools", "WebSearch",
+                "--allowedTools", "WebSearch", "--strict-mcp-config", "--safe-mode", "--permission-mode", "dontAsk",
+                "--model", MODEL, "--effort", EFFORT]
+    assert _build_cmd("т", "{}", ["WebSearch"], None, None) == expected
+    assert _build_cmd("т", "{}", ["WebSearch"], None, None, mcp_tools=[]) == expected
+
+
+def test_garant_mcp_config_has_no_token():
+    """Файл подключения лежит в репо: токена в нём нет, только подстановка из окружения."""
+    from app.config import GARANT_MCP_CONFIG
+    data = json.loads(GARANT_MCP_CONFIG.read_text(encoding="utf-8"))
+    assert set(data["mcpServers"]) == {"garant"}   # второй сервер в этом файле подключился бы агентам
+    server = data["mcpServers"]["garant"]
+    assert server["url"] == "https://mcp.garant.ru/mcp"
+    assert server["headers"]["Authorization"] == "Bearer ${GARANT_TOKEN}"
+
+
+def test_call_with_mcp_passes_token_and_proxy_only_in_env(tmp_runs_dir, valid_verdict_ok, garant_files, monkeypatch, caplog):
+    """Токен — только в окружении процесса этого вызова; в команде, логе и трейсе его нет."""
+    mock_run = Mock(return_value=_proc(_ok_stdout(valid_verdict_ok)))
+    monkeypatch.setattr(subprocess, "run", mock_run)
+    caplog.set_level("DEBUG")
+    res = call("и", "док", Verdict, run_id="run_g", trace_name="03_verdicts/03.raw.json",
+               allowed_tools=["WebSearch"], mcp_tools=["garant_search"])
+    assert res.ok
+    env = mock_run.call_args.kwargs["env"]
+    assert env["GARANT_TOKEN"] == "SECRET-TOKEN-123"
+    assert env["HTTPS_PROXY"] == "http://p:1" and env["NO_PROXY"] == "localhost"
+    assert env["FORCE_PROMPT_CACHING_5M"] == "1"
+    assert env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1"
+    assert "SECRET-TOKEN-123" not in " ".join(mock_run.call_args.args[0])
+    assert "SECRET-TOKEN-123" not in caplog.text
+    for f in (tmp_runs_dir / "run_g").rglob("*"):
+        if f.is_file():
+            assert "SECRET-TOKEN-123" not in f.read_text(encoding="utf-8", errors="ignore")
+
+
+def test_call_without_mcp_has_no_token_in_env(tmp_runs_dir, valid_verdict_ok, garant_files, monkeypatch):
+    """Без Гаранта токена нет в окружении — и на основном пути пайплайна (кэш 5 минут), и в диалоге."""
+    mock_run = Mock(return_value=_proc(_ok_stdout(valid_verdict_ok)))
+    monkeypatch.setattr(subprocess, "run", mock_run)
+    call("и", "док", Verdict, run_id="run_ng", trace_name="a.raw.json", allowed_tools=[])
+    env = mock_run.call_args.kwargs["env"]
+    assert "GARANT_TOKEN" not in env and "CLAUDE_CODE_DISABLE_AUTO_MEMORY" not in env
+    call("и", "док", Verdict, run_id="run_ng", trace_name="b.raw.json", allowed_tools=[], short_cache_ttl=False)
+    assert "GARANT_TOKEN" not in (mock_run.call_args.kwargs.get("env") or {})
+
+
+def test_retries_keep_garant_flags_and_env(tmp_runs_dir, valid_verdict_ok, garant_files, monkeypatch):
+    """Ретрай через --resume и полный повтор после сбоя — с теми же флагами Гаранта и окружением; токена нет в ошибке."""
+    bad = _stdout_with_events(_result_event("{\"verdict\": \"x\"}", session_id="sess-9"))
+    mock_run = Mock(side_effect=[_proc(bad), _proc("", returncode=1, stderr="сбой"), _proc(_ok_stdout(valid_verdict_ok))])
+    monkeypatch.setattr(subprocess, "run", mock_run)
+    res = call("и", "док", Verdict, run_id="run_rt", trace_name="a.raw.json", allowed_tools=[], mcp_tools=["garant_search"])
+    assert res.ok and len(mock_run.call_args_list) == 3
+    for c in mock_run.call_args_list:
+        assert _flag_value(c.args[0], "--mcp-config") and "mcp__garant__garant_search" in _flag_value(c.args[0], "--allowedTools")
+        assert c.kwargs["env"]["GARANT_TOKEN"] == "SECRET-TOKEN-123"
+    assert "--resume" in mock_run.call_args_list[1].args[0]
+    assert "SECRET-TOKEN-123" not in (res.error or "")
+
+
+@pytest.mark.parametrize("content", ["", "  \n", "AB CD"])
+def test_bad_token_file_fails_clearly(tmp_runs_dir, tmp_path, monkeypatch, content):
+    """Пустой или испорченный файл токена — понятная ошибка до запуска модели."""
+    import app.runner as runner_mod
+    token = tmp_path / "token"
+    token.write_text(content, encoding="utf-8")
+    monkeypatch.setattr(runner_mod, "GARANT_TOKEN_FILE", token)
+    monkeypatch.setattr(subprocess, "run", Mock())
+    with pytest.raises(RuntimeError, match="токеном Гаранта"):
+        call("и", "док", Verdict, run_id="run_bt", trace_name="a.raw.json", allowed_tools=[], mcp_tools=["garant_search"])
+
+
+@pytest.mark.parametrize("settings", ["не json", "[]", '{"env": [1, 2]}'])
+def test_broken_cli_settings_do_not_break_call(tmp_runs_dir, valid_verdict_ok, garant_files, monkeypatch, settings):
+    """Испорченные настройки CLI не роняют вызов: просто без прокси."""
+    import app.runner as runner_mod
+    runner_mod.CLI_SETTINGS_FILE.write_text(settings, encoding="utf-8")
+    mock_run = Mock(return_value=_proc(_ok_stdout(valid_verdict_ok)))
+    monkeypatch.setattr(subprocess, "run", mock_run)
+    assert call("и", "док", Verdict, run_id="run_bs", trace_name="a.raw.json", allowed_tools=[],
+                mcp_tools=["garant_search"]).ok
+    assert "HTTPS_PROXY" not in {k for k in mock_run.call_args.kwargs["env"] if mock_run.call_args.kwargs["env"].get(k) == "http://p:1"}
+
+
+def test_call_with_mcp_without_token_file_fails_clearly(tmp_runs_dir, valid_verdict_ok, tmp_path, monkeypatch):
+    """Нет файла токена — понятная ошибка до запуска модели, а не тихий вызов без Гаранта."""
+    import app.runner as runner_mod
+    monkeypatch.setattr(runner_mod, "GARANT_TOKEN_FILE", tmp_path / "нет")
+    monkeypatch.setattr(subprocess, "run", Mock())
+    with pytest.raises(RuntimeError, match="токеном Гаранта"):
+        call("и", "док", Verdict, run_id="run_nt", trace_name="a.raw.json", allowed_tools=[], mcp_tools=["garant_search"])

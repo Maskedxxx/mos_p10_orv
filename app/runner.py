@@ -49,6 +49,16 @@ runs/<id>/_context/ — часть трейса. Срок кэша для пай
 зациклившийся вызов до того, как он потратит много) и отдельно проверяется в
 Python как сумма total_cost_usd по всем попыткам (потолок на весь call()/call_text()).
 
+ГАРАНТ (2.7, итерация 4, доработка Б). Узел передаёт mcp_tools — имена инструментов
+MCP-сервера Гаранта, которые разрешены агенту (без префикса mcp__garant__). Тогда
+агент запускается с сервером Гаранта; видит он все его инструменты, но вызвать может
+только перечисленные — остальные запрещены (--permission-mode dontAsk). Проба
+2026-10-12 (CLI 2.1.292): --safe-mode отключает MCP-серверы целиком, поэтому для
+такого агента изоляция собирается иначе — см. _MCP_ISOLATION_FLAGS. Токен Гаранта
+и прокси машины уходят только в окружение процесса этого вызова. Неверный или
+просроченный токен CLI не останавливает: инструмент вернёт агенту «ошибка
+аутентификации», и это будет видно в его разборе и в сыром ответе.
+
 permission_denials собираются по ВСЕМ попыткам в CallResult.permission_denials —
 непустой список означает, что промпту узла зачем-то понадобился инструмент,
 на который не было прав (сигнал кривого промпта, особенно у текстовых
@@ -69,7 +79,7 @@ from typing import Any, Generic, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
-from app.config import EFFORT, MODEL
+from app.config import CLI_SETTINGS_FILE, EFFORT, GARANT_MCP_CONFIG, GARANT_TOKEN_FILE, MODEL
 from app.logger import get_run_logger
 from app.trace import save_bytes, save_raw
 
@@ -132,8 +142,33 @@ class _AttemptOutcome:
 #   --permission-mode dontAsk всё, что не одобрено заранее, запрещается, а не ждёт ответа.
 # Набор инструментов задаёт --tools в _build_cmd — ровно allowed_tools узла.
 # --bare и --setting-sources не подходят: первый не читает подписку, второй
-# отключает настройки с переменными прокси, без которых модель недоступна.
+# отключает настройки с переменными прокси, без которых модель недоступна
+# (агенту с Гарантом прокси передаются окружением — см. _MCP_ISOLATION_FLAGS).
 _ISOLATION_FLAGS = ["--strict-mcp-config", "--safe-mode", "--permission-mode", "dontAsk"]
+
+# Изоляция агента с Гарантом (итерация 4, Б). Пробы 2026-10-12 на спарке (CLI 2.1.292):
+#   - с --safe-mode MCP-сервер не подключается (mcp_servers: []);
+#   - --setting-sources "" — ни один файл настроек не читается: ни настройки машины
+#     (личный CLAUDE.md, плагины, хуки), ни .claude/settings.local.json рабочей папки
+#     (с «local» он читался — проверено подменой языка ответа);
+#   - --disable-slash-commands — без навыков;
+#   - автопамять CLI по проекту отключает окружение (_mcp_env): без этого она была
+#     включена (memory_paths у init-события), с ним — нет.
+# Проверено: сервер Гаранта connected, CLAUDE.md и память в контексте нет. Прокси из
+# настроек машины при этом тоже не читаются — их передаёт окружение процесса.
+#   --strict-mcp-config + --mcp-config — только сервер Гаранта из файла репо;
+#   --permission-mode dontAsk — вызвать можно только перечисленное в --allowedTools.
+_MCP_ISOLATION_FLAGS = [
+    "--strict-mcp-config", "--mcp-config", str(GARANT_MCP_CONFIG),
+    "--setting-sources", "", "--disable-slash-commands",
+    "--permission-mode", "dontAsk",
+]
+# Префикс имён инструментов сервера Гаранта в CLI: mcp__<имя сервера>__<инструмент>
+_GARANT_TOOL_PREFIX = "mcp__garant__"
+# Переменные из настроек CLI машины, которые нужны агенту с Гарантом: без прокси модель недоступна
+_PROXY_ENV_KEYS = ("HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY")
+# Автопамять CLI по проекту — не для агентов сервиса (без --safe-mode она включена)
+_NO_AUTO_MEMORY_ENV = {"CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"}
 
 
 def _build_cmd(
@@ -144,11 +179,13 @@ def _build_cmd(
     max_budget_usd: float | None,
     model: str = MODEL,
     system_file: str | None = None,
+    mcp_tools: list[str] | None = None,
 ) -> list[str]:
     """
     Собрать argv для вызова `claude -p` (список аргументов, не строка через shell).
 
     schema_json=None — режим без --json-schema (текстовый ответ, call_text()).
+    mcp_tools — разрешённые инструменты Гаранта; пусто/None — вызов без MCP, как раньше.
     """
     cmd = ["claude", "-p"]
     if resume_session_id is not None:
@@ -156,11 +193,13 @@ def _build_cmd(
     cmd.append(message)
     if schema_json is not None:
         cmd += ["--json-schema", schema_json]
+    # Инструменты Гаранта одобряются по полным именам; встроенные (--tools) — как раньше
+    approved = allowed_tools + [_GARANT_TOOL_PREFIX + t for t in (mcp_tools or [])]
     cmd += [
         "--output-format", "json",
-        "--tools", ",".join(allowed_tools),         # доступны ровно инструменты узла
-        "--allowedTools", " ".join(allowed_tools),  # и они же одобрены без запроса
-        *_ISOLATION_FLAGS,
+        "--tools", ",".join(allowed_tools),         # доступны ровно встроенные инструменты узла
+        "--allowedTools", " ".join(approved),       # и они же (плюс Гарант) одобрены без запроса
+        *(_MCP_ISOLATION_FLAGS if mcp_tools else _ISOLATION_FLAGS),
         "--model", model,
         "--effort", EFFORT,
     ]
@@ -180,6 +219,28 @@ def _shared_context_file(run_id: str, shared_context: str) -> str:
     data = shared_context.encode("utf-8")
     relname = f"_context/{hashlib.sha1(data).hexdigest()[:12]}.md"
     return str(save_bytes(run_id, relname, data))
+
+
+def _mcp_env() -> dict[str, str]:
+    """
+    Окружение процесса агента с Гарантом: токен из файла машины и прокси из настроек CLI.
+    Токен никуда не пишется — ни в команду, ни в лог, ни в трейс.
+    """
+    try:
+        token = GARANT_TOKEN_FILE.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise RuntimeError(f"нет файла с токеном Гаранта или он не читается ({GARANT_TOKEN_FILE})") from exc
+    if not token or any(ch.isspace() for ch in token):
+        raise RuntimeError(f"файл с токеном Гаранта пуст или испорчен ({GARANT_TOKEN_FILE})")
+    env = {"GARANT_TOKEN": token, **_NO_AUTO_MEMORY_ENV}
+    # Прокси: файл настроек может отсутствовать (на машине без прокси это нормально) —
+    # тогда переменных нет; испорченный файл не роняет вызов, но и прокси не даёт
+    try:
+        cli_env = json.loads(CLI_SETTINGS_FILE.read_text(encoding="utf-8")).get("env") or {}
+        env.update({k: str(cli_env[k]) for k in _PROXY_ENV_KEYS if k in cli_env})
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, AttributeError, TypeError):
+        pass
+    return env
 
 
 def _retry_message(error_text: str) -> str:
@@ -327,6 +388,7 @@ def call(
     model: str = MODEL,
     shared_context: str | None = None,
     short_cache_ttl: bool = True,
+    mcp_tools: list[str] | None = None,
 ) -> CallResult[ModelT]:
     """
     Вызвать `claude -p` с ретраями и вернуть провалидированный ответ.
@@ -343,8 +405,12 @@ def call(
     (см. «Кэш» в docstring модуля), а не в stdin. short_cache_ttl — срок кэша 5 минут
     (пайплайн); False — срок по умолчанию, 1 час (диалог).
 
+    mcp_tools — инструменты Гаранта, разрешённые агенту (см. «ГАРАНТ» в docstring модуля).
+
     Исключение бросается только если ретраем чинить бессмысленно: бинарь
-    claude не найден, либо сама функция вызвана с неверными аргументами.
+    claude не найден, функция вызвана с неверными аргументами, либо агенту нужен
+    Гарант, а файла токена нет или он испорчен (RuntimeError до запуска модели:
+    тихо работать без Гаранта нельзя; узел превращает исключение в вердикт «ошибка»).
     Исчерпание попыток — НЕ исключение, а CallResult(ok=False, ...); решение,
     что делать дальше, принимает вызывающий узел.
     """
@@ -364,6 +430,8 @@ def call(
 
     system_file = _shared_context_file(run_id, shared_context) if shared_context is not None else None
     env = {**os.environ, **_SHORT_CACHE_ENV} if short_cache_ttl else None
+    if mcp_tools:
+        env = {**(env if env is not None else os.environ), **_mcp_env()}
 
     # Состояние следующей попытки: что слать и слать ли документ в stdin
     message = instruction
@@ -373,7 +441,8 @@ def call(
     for attempt in range(1, max_attempts + 1):
         attempts_made = attempt
 
-        cmd = _build_cmd(message, schema_json, allowed_tools, resume_session_id, max_budget_usd, model, system_file)
+        cmd = _build_cmd(message, schema_json, allowed_tools, resume_session_id, max_budget_usd, model, system_file,
+                         mcp_tools)
         outcome = _run_attempt(cmd, document, send_document, timeout_s, run_id, trace_name, env)
 
         session_id = outcome.session_id or session_id
