@@ -194,26 +194,33 @@ def test_failure_never_becomes_checked(run_id, tmp_prompts_dir, monkeypatch):
 
 
 def test_tools_follow_route_for_all_twelve_indicators(run_id, tmp_prompts_dir, monkeypatch):
-    """6. Инструменты по маршруту: для индикаторов 1,2,5,6 — пустой список,
-    для остальных восьми — оба инструмента. Проверка на всех двенадцати."""
+    """6. Инструменты: встроенные по маршруту (1, 2, 5 — только открыть страницу, 6 — ничего,
+    остальные — поиск и страницы) и (2.7) Гарант по таблице 6.3 плана. Проверка на всех двенадцати."""
     seen_tools: dict[int, list[str]] = {}
+    seen_garant: dict[int, list[str] | None] = {}
 
     def _effect(instruction, document, model_cls, **kwargs):
         n = _n_from_trace_name(kwargs["trace_name"])
         seen_tools[n] = kwargs["allowed_tools"]
+        seen_garant[n] = kwargs.get("mcp_tools")
         return _ok_call_result(n)
 
     monkeypatch.setattr(verdicts_module, "call", Mock(side_effect=_effect))
 
     run_verdicts("текст", run_id)
 
-    text_route_numbers = {1, 2, 5, 6}
     assert set(seen_tools) == set(range(1, 13))
     for n in range(1, 13):
-        if n in text_route_numbers:
-            assert seen_tools[n] == []
+        if n in {1, 2, 5}:
+            assert seen_tools[n] == ["WebFetch"]
+        elif n == 6:
+            assert seen_tools[n] == [] and seen_garant[n] is None
         else:
             assert seen_tools[n] == ["WebSearch", "WebFetch"]
+    assert "garant_find_hyperlinks" in seen_garant[3]
+    # выгрузка статьи — только у 4 и у 1, 2, 5 (Р8)
+    assert {n for n in range(1, 13) if seen_garant[n] and "garant_export_block_html" in seen_garant[n]} == {1, 2, 4, 5}
+    assert "garant_sutyazhnik" in seen_garant[10]
 
 
 def test_attempts_overwritten_from_call_result(run_id, tmp_prompts_dir, monkeypatch):
@@ -515,7 +522,7 @@ def test_group_leaders_start_before_followers(run_id, tmp_prompts_dir, monkeypat
 
     monkeypatch.setattr(verdicts_module, "call", Mock(side_effect=_effect))
     result = run_verdicts("текст акта", run_id)
-    leaders = {1, 3}
+    leaders = {1, 3, 6}   # группы кэша (2.7): 1, 2, 5 — страница и Гарант; 6 — без инструментов; остальные — интернет и Гарант
     assert len(result) == 12
     assert max(started[n] for n in leaders) + 0.25 <= min(t for n, t in started.items() if n not in leaders)
 

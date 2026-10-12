@@ -157,6 +157,37 @@ def web_indicators() -> list[Indicator]:
     return [ind for ind in _INDICATORS if ind.route == "текст+интернет"]
 
 
+# Гарант по индикаторам (2.7, итерация 4, Л и М; таблица 6.3 плана, решение Р8 12.10).
+# Порядок для всех: правовая база → точечно интернет → выгрузка одной статьи только там,
+# где вердикт зависит от точного текста (4; 1, 2, 5 — перечень в другом акте).
+# 6 — Гарант не нужен. 12 — только поиск: нужен ли больше, покажут тесты; поиск держит его
+# в общей группе кэша (описания инструментов MCP одинаковы при любом списке разрешённых).
+_G_FIND = ("garant_search", "garant_document_redactions")
+INDICATOR_GARANT_TOOLS: dict[int, tuple[str, ...]] = {
+    1: (*_G_FIND, "garant_snippets", "garant_export_block_html"),
+    2: (*_G_FIND, "garant_snippets", "garant_export_block_html"),
+    3: ("garant_find_hyperlinks", *_G_FIND),
+    4: (*_G_FIND, "garant_snippets", "garant_export_block_html"),
+    5: (*_G_FIND, "garant_snippets", "garant_export_block_html"),
+    7: _G_FIND,
+    8: _G_FIND,
+    9: (*_G_FIND, "garant_snippets"),
+    10: ("garant_search", "garant_sutyazhnik"),
+    11: _G_FIND,
+    12: ("garant_search",),
+}
+# Индикаторам без интернета (1, 2, 5) — только открыть страницу акта, найденного в Гаранте (М)
+INDICATOR_EXTRA_TOOLS: dict[int, tuple[str, ...]] = {1: ("WebFetch",), 2: ("WebFetch",), 5: ("WebFetch",)}
+
+
+def indicator_tools(n: int) -> tuple[list[str], list[str]]:
+    """Инструменты агента индикатора: (встроенные CLI, инструменты Гаранта)."""
+    ind = get_indicator(n)
+    builtin = list(ALLOWED_TOOLS_TEXT if ind.route == "текст" else ALLOWED_TOOLS_WEB)
+    builtin += [t for t in INDICATOR_EXTRA_TOOLS.get(n, ()) if t not in builtin]
+    return builtin, list(INDICATOR_GARANT_TOOLS.get(n, ()))
+
+
 def prompt_path(n: int) -> Path:
     """
     Вернуть абсолютный путь к файлу промпта индикатора n внутри PROMPTS_DIR.

@@ -272,7 +272,7 @@ def test_region_labels_only_in_comparison_prompts(path):
     text = path.read_text(encoding="utf-8")
     has = "{{РЕГИОНЫ_СРАВНЕНИЯ}}" in text or "{{ЧИСЛО_РЕГИОНОВ}}" in text
     assert has == (path.name in {"02_indicator_07.md", "02_indicator_08.md", "02_indicator_11.md"})
-    assert "{{" not in fill_prompt_labels(text)
+    assert "{{" not in fill_prompt_labels(text, limit=5)   # потолок подставляется всегда (узел вердиктов)
 
 
 def test_iter4_hypotheses_prompts():
@@ -327,3 +327,23 @@ def test_iter4_developer_in_prompts():
     passport = " ".join(PROMPT_PASSPORT.read_text(encoding="utf-8").split())
     assert "Единственное исключение — орган-разработчик (developers)" in passport
     assert "Correspondents(<topic> 0)" in passport
+
+
+
+def test_iter4_garant_in_indicator_prompts():
+    """Л, М: у агентов с Гарантом — блок правовой базы с их инструментами; потолок — меткой; у 3 нет групп риска."""
+    from app.config import INDICATOR_GARANT_TOOLS
+    from app.nodes.verdicts import fill_prompt_labels
+    for n, tools in INDICATOR_GARANT_TOOLS.items():
+        text = prompt_path(n).read_text(encoding="utf-8")
+        block = text.split("<правовая_база>")[1].split("</правовая_база>")[0]
+        for t in tools:
+            assert t in block, (n, t)
+        named = set(re.findall(r"garant_[a-z_]+", text))
+        assert named <= set(tools), (n, named - set(tools))   # агент не зовёт то, чего у него нет
+        assert "{{" not in fill_prompt_labels(text, limit=7)
+    for n in (3, 4, 7, 8, 9, 10, 11, 12):
+        assert "{{ПОТОЛОК_ЗАХОДОВ}} ЗАХОДОВ ПОИСКА В ИНТЕРНЕТЕ" in prompt_path(n).read_text(encoding="utf-8"), n
+    t3 = prompt_path(3).read_text(encoding="utf-8").lower()
+    assert "высокий риск" not in t3 and "низкий риск" not in t3 and "garant_find_hyperlinks" in t3
+    assert "<правовая_база>" not in prompt_path(6).read_text(encoding="utf-8")

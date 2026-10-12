@@ -18,9 +18,9 @@
 полный текст нужен в любом случае; паспорт говорит агенту, ГДЕ искать и через
 какие ключи открываются ворота «не применимо».
 
-Инструменты берутся из config.get_indicator(n).route, а не хардкодятся по номерам:
-маршрут "текст" -> ALLOWED_TOOLS_TEXT (пустой список), "текст+интернет" ->
-ALLOWED_TOOLS_WEB (WebSearch + WebFetch).
+Инструменты — config.indicator_tools(n): встроенные по маршруту ("текст" — пусто,
+"текст+интернет" — WebSearch + WebFetch, индикаторам 1, 2, 5 — ещё WebFetch) и (2.7)
+инструменты Гаранта по таблице INDICATOR_GARANT_TOOLS.
 """
 
 from __future__ import annotations
@@ -31,13 +31,12 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from app.config import (
-    ALLOWED_TOOLS_TEXT,
-    ALLOWED_TOOLS_WEB,
     CACHE_WARMUP_S,
     COMPARISON_REGIONS,
     SEARCH_LIMITS,
     all_indicators,
     get_indicator,
+    indicator_tools,
     prompt_path,
 )
 from app.contracts import ActPassport, Verdict, VerdictOutput
@@ -122,7 +121,7 @@ def _run_one_indicator(
         # 2.6: акт и паспорт — общий для всех 12 агентов текст — уходят в системный промпт,
         # чтобы агенты читали его из кэша друг у друга; в stdin ничего не идёт
         shared = _build_document(document_md, passport_block_text)
-        allowed_tools = ALLOWED_TOOLS_TEXT if indicator.route == "текст" else ALLOWED_TOOLS_WEB
+        allowed_tools, garant_tools = indicator_tools(n)
 
         result = call(
             instruction,
@@ -134,6 +133,7 @@ def _run_one_indicator(
             timeout_s=timeout_s,
             max_budget_usd=max_budget_usd,
             shared_context=shared,
+            mcp_tools=garant_tools or None,
         )
 
         if result.permission_denials:
@@ -159,19 +159,21 @@ def _run_one_indicator(
 
 def _start_delays(nums: list[int]) -> dict[int, float]:
     """
-    Сдвиг старта агентов по группам маршрута (2.6): первый индикатор группы — сразу,
-    остальные — через CACHE_WARMUP_S. Инструменты стоят в начале кэша, поэтому у
-    текстовых агентов и агентов с интернетом кэш разный — лидер у каждой группы свой.
+    Сдвиг старта агентов по группам кэша (2.6): первый индикатор группы — сразу,
+    остальные — через CACHE_WARMUP_S. Инструменты стоят в начале кэша, поэтому кэш
+    общий только у агентов с одинаковыми встроенными инструментами и (2.7) с Гарантом
+    или без: описания инструментов Гаранта одни и те же при любом списке разрешённых.
     """
     delays: dict[int, float] = {}
-    seen: set[str] = set()
+    seen: set[object] = set()
     for n in nums:
         try:
-            route = get_indicator(n).route
+            builtin, garant = indicator_tools(n)
+            group: object = (tuple(builtin), bool(garant))
         except Exception:   # неизвестный номер — без сдвига; ошибку покажет сам агент
-            route = f"?{n}"
-        delays[n] = CACHE_WARMUP_S if route in seen else 0.0
-        seen.add(route)
+            group = f"?{n}"
+        delays[n] = CACHE_WARMUP_S if group in seen else 0.0
+        seen.add(group)
     return delays
 
 
