@@ -79,7 +79,9 @@ from typing import Any, Generic, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
-from app.config import CLI_SETTINGS_FILE, EFFORT, GARANT_MCP_CONFIG, GARANT_TOKEN_FILE, MODEL
+from app.config import (
+    CLI_SETTINGS_FILE, EFFORT, GARANT_MCP_CONFIG, GARANT_NO_PROXY_HOST, GARANT_TOKEN_FILE, MODEL,
+)
 from app.logger import get_run_logger
 from app.trace import save_bytes, save_raw
 
@@ -240,6 +242,8 @@ def _mcp_env() -> dict[str, str]:
         env.update({k: str(cli_env[k]) for k in _PROXY_ENV_KEYS if k in cli_env})
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, AttributeError, TypeError):
         pass
+    # Гарант — напрямую: через прокси вызовы зависают и рвутся (см. GARANT_NO_PROXY_HOST)
+    env["NO_PROXY"] = ",".join(h for h in (env.get("NO_PROXY", ""), GARANT_NO_PROXY_HOST) if h)
     return env
 
 

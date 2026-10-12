@@ -720,7 +720,8 @@ def test_call_with_mcp_passes_token_and_proxy_only_in_env(tmp_runs_dir, valid_ve
     assert res.ok
     env = mock_run.call_args.kwargs["env"]
     assert env["GARANT_TOKEN"] == "SECRET-TOKEN-123"
-    assert env["HTTPS_PROXY"] == "http://p:1" and env["NO_PROXY"] == "localhost"
+    assert env["HTTPS_PROXY"] == "http://p:1"
+    assert env["NO_PROXY"] == "localhost,mcp.garant.ru"   # Гарант — мимо прокси, модель — через него
     assert env["FORCE_PROMPT_CACHING_5M"] == "1"
     assert env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1"
     assert "SECRET-TOKEN-123" not in " ".join(mock_run.call_args.args[0])
@@ -777,6 +778,15 @@ def test_broken_cli_settings_do_not_break_call(tmp_runs_dir, valid_verdict_ok, g
     assert call("и", "док", Verdict, run_id="run_bs", trace_name="a.raw.json", allowed_tools=[],
                 mcp_tools=["garant_search"]).ok
     assert "HTTPS_PROXY" not in {k for k in mock_run.call_args.kwargs["env"] if mock_run.call_args.kwargs["env"].get(k) == "http://p:1"}
+    assert mock_run.call_args.kwargs["env"]["NO_PROXY"] == "mcp.garant.ru"
+
+
+def test_garant_host_bypasses_proxy_matches_config():
+    """Хост, который идёт мимо прокси, — тот же, что в файле подключения к Гаранту."""
+    from urllib.parse import urlparse
+    from app.config import GARANT_MCP_CONFIG, GARANT_NO_PROXY_HOST
+    url = json.loads(GARANT_MCP_CONFIG.read_text(encoding="utf-8"))["mcpServers"]["garant"]["url"]
+    assert urlparse(url).hostname == GARANT_NO_PROXY_HOST
 
 
 def test_call_with_mcp_without_token_file_fails_clearly(tmp_runs_dir, valid_verdict_ok, tmp_path, monkeypatch):

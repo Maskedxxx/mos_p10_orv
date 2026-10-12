@@ -106,6 +106,10 @@ ALLOWED_TOOLS_WEB: list[str] = ["WebSearch", "WebFetch"]
 # машины (скилл garant-api), в репо, логи и трейсы не попадает.
 GARANT_MCP_CONFIG = PROJECT_ROOT / "deploy" / "garant_mcp.json"
 GARANT_TOKEN_FILE = Path.home() / ".config" / "garant" / "token"
+# Гарант — мимо прокси машины (в NO_PROXY агента). Проба 12.10: через прокси garant_search
+# зависал > 60 с (3 из 3), в живых прогонах — 38 обрывов из 165 вызовов; напрямую 128 из 128
+# без сбоев при 8 параллельных клиентах. Модель по-прежнему идёт через прокси.
+GARANT_NO_PROXY_HOST = "mcp.garant.ru"
 # Настройки CLI машины: из них агенту с Гарантом передаются только переменные прокси
 # (без --safe-mode CLI запускается с --setting-sources local и сам их не читает).
 CLI_SETTINGS_FILE = Path.home() / ".claude" / "settings.json"
