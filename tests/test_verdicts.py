@@ -528,3 +528,29 @@ def test_single_indicator_recheck_has_no_delay(run_id, tmp_prompts_dir, monkeypa
     t = time.monotonic()
     run_verdicts("текст акта", run_id, indicators=[7])
     assert time.monotonic() - t < 2
+
+
+# ---- 2.7 (итерация 4, К): регионы сравнения — подстановкой в промпт ----
+
+
+def test_region_labels_filled_from_config(run_id, tmp_prompts_dir, monkeypatch):
+    """Метки регионов в промпте заменяются списком из конфига; число — цифрами."""
+    from app.config import COMPARISON_REGIONS
+    (tmp_prompts_dir / "02_indicator_07.md").write_text(
+        "Порталы {{ЧИСЛО_РЕГИОНОВ}} субъектов сравнения — {{РЕГИОНЫ_СРАВНЕНИЯ}}.", encoding="utf-8")
+    mock_call = Mock(side_effect=_default_side_effect)
+    monkeypatch.setattr(verdicts_module, "call", mock_call)
+    run_verdicts("текст", run_id, indicators=[7])
+    instruction = mock_call.call_args_list[0].args[0]
+    assert "{{" not in instruction
+    assert instruction == f"Порталы {len(COMPARISON_REGIONS)} субъектов сравнения — {', '.join(COMPARISON_REGIONS)}."
+
+
+def test_region_labels_filled_from_run_list(run_id, tmp_prompts_dir, monkeypatch):
+    """Список регионов прогона (настройки прогона) важнее списка по умолчанию."""
+    (tmp_prompts_dir / "02_indicator_11.md").write_text(
+        "Начинай с {{ЧИСЛО_РЕГИОНОВ}} субъектов сравнения: {{РЕГИОНЫ_СРАВНЕНИЯ}}.", encoding="utf-8")
+    mock_call = Mock(side_effect=_default_side_effect)
+    monkeypatch.setattr(verdicts_module, "call", mock_call)
+    run_verdicts("текст", run_id, indicators=[11], regions=["Санкт-Петербург", "Казань"])
+    assert mock_call.call_args_list[0].args[0] == "Начинай с 2 субъектов сравнения: Санкт-Петербург, Казань."
