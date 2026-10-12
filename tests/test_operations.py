@@ -16,8 +16,10 @@ from openpyxl import load_workbook
 import app.operations as ops_module
 from app import versions
 from app.contracts import (
-    AddMapRow, AppendRequest, BuildHypotheses, Buckets, DataItem, DataRequest, DeleteMapRow, DeleteRequestItem,
-    EditText, Effect, Hypothesis, HypothesisMap, HypothesisSet, MergeMapRows, RecheckIndicator, RequestItem, RunMeta,
+    AddMapRow, AppendRequest, BuildHypotheses, Buckets, DataItem, DataItemOutput, DataRequest, DeleteMapRow,
+    DeleteRequestItem,
+    EditText, Effect, Hypothesis, HypothesisMap, HypothesisSet, MarkNotTracked, MergeMapRows, RecheckIndicator,
+    RequestItem, RunMeta,
     SetVerdict, SourceRef, SplitPart, SplitRequestItem, Verdict,
 )
 from app.operations import OperationError, accept, rollback, run_step
@@ -88,7 +90,7 @@ def test_delete_row_keeps_numbers_and_marks_orphan_item(rid):
     assert [r.row_id for r in _map(rid).rows] == [2]
     assert "1" in versions.load_state(rid).marks.stale_items          # позиция держалась только на строке 1
     run_step(rid, AddMapRow(kind="добавить строку карты", indicators=[10], hypothesis="h", grounds="эксперт",
-                            effects=[_EFFECT], data=[DataItem(metric="число вольеров", source="запрос органу")],
+                            effects=[_EFFECT], data=[DataItemOutput(metric="число вольеров", source="запрос органу")],
                             reason="эксперт"))
     assert [r.row_id for r in _map(rid).rows] == [2, 4]            # 1 не переиспользуется, 3 — «проверка не завершена»
     assert 4 in versions.load_state(rid).marks.stale_rows          # нет позиций запроса под новую строку
@@ -152,7 +154,7 @@ def test_build_hypotheses_refused_for_text_family_no_data(rid):
 
 def test_append_request_renumbers_from_state(rid, monkeypatch):
     run_step(rid, AddMapRow(kind="добавить строку карты", indicators=[10], hypothesis="h", grounds="эксперт",
-                            effects=[_EFFECT], data=[DataItem(metric="число вольеров", source="запрос органу")],
+                            effects=[_EFFECT], data=[DataItemOutput(metric="число вольеров", source="запрос органу")],
                             reason="эксперт"))
     existing = _req(rid)
     extended = DataRequest(items=existing.items + [RequestItem(
@@ -212,3 +214,34 @@ def test_edit_effect_calculation_changes_its_brief(rid):
                            new_text="число заявок × 2 часа", reason="коротко"))
     effect = _map(rid).rows[0].effects[0]
     assert effect.how_to_calculate_brief == ["число заявок × 2 часа"] and effect.how_to_calculate != "число заявок × 2 часа"
+
+
+
+# ---- 2.7 (итерация 4, Ж3): «нигде не ведётся» — пометка эксперта ----
+
+
+def test_mark_not_tracked_changes_source_and_drops_item(rid):
+    """Источник цифры — «нигде не ведётся»; позиция бланка, державшаяся только на ней, удаляется; журнал есть."""
+    res = run_step(rid, MarkNotTracked(kind="пометить: нигде не ведётся", row_id=1, metric="п1",
+                                       reason="такой статистики не ведут"))
+    assert res.version == 1
+    dp = _map(rid).rows[0].data[0]
+    assert (dp.metric, dp.source, dp.where) == ("п1", "нигде не ведётся", None)
+    assert "1" not in [it.num for it in _req(rid).items]
+    assert 1 in versions.load_state(rid).marks.edited_rows
+    j = versions.read_journal(rid)[-1]
+    assert j.kind == "решение эксперта" and j.reason == "такой статистики не ведут"
+
+
+def test_mark_not_tracked_unknown_metric_refused(rid):
+    with pytest.raises(OperationError):
+        run_step(rid, MarkNotTracked(kind="пометить: нигде не ведётся", row_id=1, metric="нет такой", reason="x"))
+    assert versions.load_state(rid).current == 0
+
+
+def test_model_cannot_add_row_with_not_tracked():
+    """Ж3: в «добавить строку карты» модель диалога пометку эксперта поставить не может."""
+    from pydantic import ValidationError
+    with pytest.raises(ValidationError):
+        AddMapRow(kind="добавить строку карты", indicators=[10], hypothesis="h", grounds="э", effects=[_EFFECT],
+                  data=[{"metric": "x", "source": "нигде не ведётся"}], reason="э")

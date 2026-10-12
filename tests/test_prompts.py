@@ -274,3 +274,36 @@ def test_region_labels_only_in_comparison_prompts(path):
     assert has == (path.name in {"02_indicator_07.md", "02_indicator_08.md", "02_indicator_11.md"})
     assert "{{" not in fill_prompt_labels(text)
 
+
+def test_iter4_hypotheses_prompts():
+    """Г, Ж1, Ж2, АИ в промптах гипотез: жалобы — у органа, вопрос органу с условиями, процент по исключению."""
+    for path in (PROMPT_HYPOTHESES_VIOLATED, PROMPT_HYPOTHESES_NO_DATA):
+        text = " ".join(path.read_text(encoding="utf-8").split())   # без учёта переносов строк
+        assert "число жалоб и судебных споров по применению акта" in text
+        assert "орган их не ведёт" not in text
+        assert "Вопрос органу словами ставь (source «вопрос органу»" in text
+        assert "Исключение: показатель, который орган сам ведёт как официальный" in text
+    v = " ".join(PROMPT_HYPOTHESES_VIOLATED.read_text(encoding="utf-8").split())
+    assert "прошивка (если акт её требует)" in v and "время на дорогу и курьера" not in v
+    assert "сослаться на его результат" not in v
+
+
+def test_iter4_request_prompt():
+    """АИ, АК, АЛ, Ж2 в промпте запроса; без упоминания того, что делает код с отбором."""
+    text = " ".join(PROMPT_REQUEST.read_text(encoding="utf-8").split())
+    assert "Доля не запрашивается никогда" not in text and "Процентов и долей в перечне нет" not in text
+    assert "«%» — только по исключению выше" in text
+    assert "«Объявленные» и «проведённые» (торги, отборы, конкурсы) по умолчанию — разные показатели" in text
+    assert "Если у строки несколько пунктов, выбери тот, о котором именно этот показатель" in text
+    assert "«открытый вопрос»" in text and "«вопрос органу»" in text
+    assert "код увидит это и запишет" not in text
+
+
+def test_iter4_dialog_prompt():
+    """Е, АИ, Ж2, Ж3, В в промпте диалога; операция «нигде не ведётся» есть в схеме."""
+    from app.contracts import MarkNotTracked
+    text = " ".join(PROMPT_DIALOG.read_text(encoding="utf-8").split())
+    assert "бизнес, граждане и город" in text and "без процентов и долей" not in text
+    assert "«пометить: нигде не ведётся»" in text
+    assert MarkNotTracked.model_fields["kind"].annotation.__args__[0] == "пометить: нигде не ведётся"
+    assert "эксперт подсказал, где искать" in text and "«Вопросы органу»" in text

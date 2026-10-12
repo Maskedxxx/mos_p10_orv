@@ -146,7 +146,7 @@ def test_opens_with_openpyxl_and_five_sheets(tmp_runs_dir):
     path = build_excel(_map(), _request(), _buckets(with_failed=True), _passport(), "run_a")
     wb = load_workbook(path)
     assert wb.sheetnames == [
-        "Как заполнять", "Карта гипотез", "Запрос показателей", "Вердикты", "Ошибки прогона",
+        "Как заполнять", "Карта гипотез", "Запрос показателей", "Вопросы органу", "Вердикты", "Ошибки прогона",
     ]
 
 
@@ -201,7 +201,7 @@ def test_verdicts_sheet_lists_all_buckets_sorted(tmp_runs_dir):
     hdr = _find_header_row(ws, "Вердикт")
     assert [c.value for c in ws[hdr]] == [
         "Индикатор", "Вердикт", "Обоснование", "На чём основано", "Где подробнее",
-        "Согласны?", "Если нет — какой верный", "Замечание",
+        "Согласны?", "Если нет — какой верный", "Замечание", "Где искать",   # 2.7: + «Где искать» (В)
     ]
     assert ws.max_row == hdr + 6                       # 1, 8 нарушен; 3 нет данных; 2, 5; 9 ошибка
     labels = [ws.cell(row=r, column=1).value for r in range(hdr + 1, ws.max_row + 1)]
@@ -724,6 +724,7 @@ def test_backref_round_trip(tmp_runs_dir):
 _SHEETS_AND_ANCHORS = (
     ("Карта гипотез", "Индикаторы"),
     ("Запрос показателей", "Показатель"),
+    ("Вопросы органу", "Вопрос"),          # 2.7 (Ж2)
     ("Вердикты", "Вердикт"),
     ("Ошибки прогона", "Что случилось"),
 )
@@ -795,7 +796,8 @@ def test_caption_does_not_break_header_styling(tmp_runs_dir):
 _EXPERT_COLUMNS = {
     "Карта гипотез": ("Индикаторы", ["Оценка (1–5)", "Замечание"]),
     "Запрос показателей": ("Показатель", ["Оценка (1–5)", "Замечание"]),
-    "Вердикты": ("Вердикт", ["Согласны?", "Если нет — какой верный", "Замечание"]),
+    "Вопросы органу": ("Вопрос", ["Оценка (1–5)", "Замечание"]),                       # 2.7 (Ж2)
+    "Вердикты": ("Вердикт", ["Согласны?", "Если нет — какой верный", "Замечание", "Где искать"]),  # 2.7 (В)
 }
 
 
@@ -1076,9 +1078,10 @@ def _journal() -> list[JournalEntry]:
 
 
 def test_default_book_unchanged_by_version_features(tmp_runs_dir):
-    """Без параметров версий: пять листов, колонки «Изменения» нет, строки «Версия файла» нет."""
+    """Без параметров версий: шесть листов (2.7: + «Вопросы органу»), колонки «Изменения» нет, строки «Версия файла» нет."""
     wb = load_workbook(build_excel(_map(), _request(), _buckets(with_failed=True), _passport(), "run_v0"))
-    assert wb.sheetnames == ["Как заполнять", "Карта гипотез", "Запрос показателей", "Вердикты", "Ошибки прогона"]
+    assert wb.sheetnames == ["Как заполнять", "Карта гипотез", "Запрос показателей", "Вопросы органу", "Вердикты",
+                             "Ошибки прогона"]
     for sheet, anchor in (("Карта гипотез", "Индикаторы"), ("Запрос показателей", "Показатель"), ("Вердикты", "Вердикт")):
         ws = wb[sheet]
         assert "Изменения" not in [c.value for c in ws[_find_header_row(ws, anchor)]]
@@ -1192,3 +1195,85 @@ def test_unverified_row_shows_looked_and_not_found(tmp_runs_dir):
     hyp = rows[2][2]
     assert hyp == "Нужна ручная проверка.\n\n• " + "\n• ".join(brief)
     assert "сопоставить требования" not in hyp
+
+
+# ---- 2.7 (итерация 4): Ж2, Ж3, В ----
+
+
+def _map_iter4() -> HypothesisMap:
+    """Строка 1: цифра органу, вопрос органу, открытый источник и цифра, которую нигде не ведут."""
+    return HypothesisMap(rows=[MapRow(
+        row_id=1, indicators=[11], hypothesis="гипотеза про сроки ГЭЭ", grounds="основание",
+        effects=[Effect(affected="бизнес и город", metric="дни ожидания", how_to_calculate="разность сроков",
+                        expected_trend="рост доли продлений относительно 2023 года подтвердит гипотезу")],
+        data=[
+            DataItem(metric="число продлений срока ГЭЭ", source="запрос органу"),
+            DataItem(metric="Назовите три наиболее частых основания для продления срока ГЭЭ", source="вопрос органу"),
+            DataItem(metric="средняя зарплата эксперта", source="открытый", where="Росстат"),
+            DataItem(metric="число погибших по видам нарушений", source="нигде не ведётся"),
+        ],
+        proof="цитата", clause="2.7.1.2",
+    )])
+
+
+def _request_iter4() -> DataRequest:
+    return DataRequest(items=[
+        RequestItem(num="1", kind="показатель по годам", metric="число продлений срока ГЭЭ (п. 2.7.1.2)", unit="ед.",
+                    clause="2.7.1.2", for_rows=[1], sources=[SourceRef(row_id=1, metric="число продлений срока ГЭЭ")]),
+        RequestItem(num="2", kind="открытый вопрос",
+                    metric="Назовите три наиболее частых основания для продления срока ГЭЭ", clause="2.7.1.2",
+                    for_rows=[1], sources=[SourceRef(row_id=1, metric="Назовите три наиболее частых основания для продления срока ГЭЭ")]),
+    ], years=[2023, 2024, 2025])
+
+
+def _sheet_rows(ws) -> list[list]:
+    return [[c.value for c in row] for row in ws.iter_rows()]
+
+
+def test_questions_sheet_after_request_and_not_in_request(tmp_runs_dir):
+    """Ж2: вопросы органу — отдельный лист после «Запроса показателей»; в самом запросе их нет."""
+    wb = load_workbook(build_excel(_map_iter4(), _request_iter4(), _buckets(with_failed=False), _passport(), "run_q"))
+    names = wb.sheetnames
+    assert names.index("Вопросы органу") == names.index("Запрос показателей") + 1
+    req_text = str(_sheet_rows(wb["Запрос показателей"]))
+    assert "Назовите три наиболее частых" not in req_text and "число продлений срока ГЭЭ" in req_text
+    ws = wb["Вопросы органу"]
+    rows = _sheet_rows(ws)
+    header = next(r for r in rows if r and r[0] == "№")
+    assert header[:4] == ["№", "Вопрос", "Пункт акта", "Строки карты"]
+    assert "Оценка (1–5)" in header and "Замечание" in header
+    q = next(r for r in rows if r and r[0] == "2")
+    assert q[1] == "Назовите три наиболее частых основания для продления срока ГЭЭ" and q[2] == "2.7.1.2"
+    assert "стр. 1" in q[3]
+    assert "Вопросы органу словами" in str(rows[0])
+
+
+def test_questions_sheet_says_none_when_empty(tmp_runs_dir):
+    wb = load_workbook(build_excel(_map(), _request(), _buckets(with_failed=False), _passport(), "run_q0"))
+    assert "вопросов нет" in str(_sheet_rows(wb["Вопросы органу"]))
+
+
+def test_map_data_cell_groups_question_and_not_tracked(tmp_runs_dir):
+    """Ж2, Ж3: в графе «Данные» — запрос в орган, вопрос органу, открытые, нигде не ведётся."""
+    wb = load_workbook(build_excel(_map_iter4(), _request_iter4(), _buckets(with_failed=False), _passport(), "run_d"))
+    ws = wb["Карта гипотез"]
+    cell = next(str(r[4]) for r in _sheet_rows(ws) if r and r[0] == 1)
+    assert "Запрос в орган (лист «Запрос показателей», № 1):" in cell
+    assert "Вопрос органу (лист «Вопросы органу», № 2):" in cell
+    assert "Нигде не ведётся (отметил эксперт):\n— число погибших по видам нарушений" in cell
+    opened = cell.split("Открытые источники")[1].split("Нигде не ведётся")[0]
+    assert "число погибших" not in opened and "Назовите" not in opened
+
+
+def test_verdicts_no_data_highlighted_and_where_to_search_column(tmp_runs_dir):
+    """В: строки «нет данных» подсвечены, у эксперта графа «Где искать»."""
+    wb = load_workbook(build_excel(_map(), _request(), _buckets(with_failed=False), _passport(), "run_w"))
+    ws = wb["Вердикты"]
+    rows = list(ws.iter_rows())
+    header = next(r for r in rows if r[0].value == "Индикатор")
+    names = [c.value for c in header]
+    assert names.index("Где искать") == names.index("Замечание") + 1
+    no_data = next(r for r in rows if r[1].value == "нет данных")
+    other = next(r for r in rows if r[1].value == "нарушен")
+    assert no_data[0].fill.fgColor.rgb != other[0].fill.fgColor.rgb
+    assert "Где искать" in str(ws.cell(1, 1).value)

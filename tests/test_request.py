@@ -408,3 +408,13 @@ def test_append_trace_prefix_and_candidate_without_writing(run_id, tmp_prompt, m
 
     assert seen["trace_name"] == "dialog/v4/07_request.raw.json"
     assert not (run_dir(run_id) / "07_request.json").exists()
+
+
+def test_coverage_counts_questions_to_authority(run_id, tmp_prompt, monkeypatch):
+    """Ж2: вопрос органу из карты, не вошедший в бланк и не объяснённый, — потеря, как показатель."""
+    hyp_map = _map([_row2(1, [("число заявок", "запрос органу"), ("В каких случаях привлекаются эксперты?", "вопрос органу")])])
+    req = DataRequest(items=[_item("1", "число заявок (п. 1)", [1], [(1, "число заявок")], unit="ед.")], years=[2025])
+    monkeypatch.setattr(request_module, "call", Mock(return_value=_ok_call_result(req)))
+    build_request(hyp_map, run_id)
+    log_text = (run_dir(run_id) / "run.log").read_text(encoding="utf-8")
+    assert "не вошёл ни в одну позицию" in log_text and "В каких случаях привлекаются эксперты?" in log_text

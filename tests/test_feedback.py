@@ -84,3 +84,48 @@ def test_not_a_result_workbook(tmp_path):
     Workbook().save(p)
     with pytest.raises(ValueError, match="нет листа"):
         read_remarks(p)
+
+
+# ---- 2.7 (итерация 4): «Где искать» и лист «Вопросы органу» ----
+
+
+def test_where_to_search_becomes_recheck_message(tmp_runs_dir, tmp_path):
+    """В: подсказка эксперта «Где искать» — в очередь, сообщением о перепроверке."""
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), _passport(), "run_fw")
+    wb = load_workbook(path)
+    ws = wb["Вердикты"]
+    hdr = _find_header_row(ws, "Индикатор")
+    row = next(r for r in range(hdr + 1, ws.max_row + 1) if str(ws.cell(r, 1).value).startswith("3."))
+    ws.cell(row, _col(ws, hdr, "Где искать")).value = "постановление № 2384-ПП, п. 1.3.17"
+    out = tmp_path / "эксперт.xlsx"
+    wb.save(out)
+    r = next(x for x in read_remarks(out) if x.key == "3")
+    assert r.where_to_search == "постановление № 2384-ПП, п. 1.3.17" and is_queued(r)
+    msg = remark_message(r)
+    assert "эксперт подсказал, где искать: постановление № 2384-ПП, п. 1.3.17" in msg
+
+
+def test_questions_sheet_remarks_read(tmp_runs_dir, tmp_path):
+    from test_excel import _map_iter4, _request_iter4
+    path = build_excel(_map_iter4(), _request_iter4(), _buckets(with_failed=False), _passport(), "run_fq")
+    wb = load_workbook(path)
+    ws = wb["Вопросы органу"]
+    hdr = _find_header_row(ws, "Вопрос")
+    row = next(r for r in range(hdr + 1, ws.max_row + 1) if ws.cell(r, 1).value == "2")
+    ws.cell(row, _col(ws, hdr, "Оценка (1–5)")).value = 2
+    ws.cell(row, _col(ws, hdr, "Замечание")).value = "спросить про внештатных экспертов"
+    out = tmp_path / "эксперт.xlsx"
+    wb.save(out)
+    r = next(x for x in read_remarks(out) if x.sheet == "Вопросы органу")
+    assert r.key == "2" and r.score == 2 and is_queued(r)
+    assert "Вопросы органу, вопрос 2" in remark_message(r)
+
+
+def test_old_book_without_questions_sheet_still_read(tmp_runs_dir, tmp_path):
+    """Книги прогонов до 2.7 — без листа «Вопросы органу»: читаются как раньше."""
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), _passport(), "run_old")
+    wb = load_workbook(path)
+    del wb["Вопросы органу"]
+    out = tmp_path / "старый.xlsx"
+    wb.save(out)
+    assert read_remarks(out) == []

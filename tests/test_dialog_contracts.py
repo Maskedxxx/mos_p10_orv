@@ -55,8 +55,8 @@ def test_question_has_empty_plan():
     {"kind": "смена вердикта", "indicator": 13, "verdict": "нарушен", "rationale": "r", "reason": "x"},
     {"kind": "слить строки карты", "row_ids": [3], "hypothesis": "h", "reason": "x"},              # сливать нечего
     {"kind": "разделить позицию запроса", "num": "2", "parts": [{"metric": "m", "unit": "ед."}], "reason": "x"},
-    {"kind": "разделить позицию запроса", "num": "2", "parts": [{"metric": "m", "unit": "%"},
-                                                                {"metric": "k", "unit": "ед."}], "reason": "x"},  # процентов нет
+    {"kind": "разделить позицию запроса", "num": "2", "parts": [{"metric": "m", "unit": "суток"},
+                                                                {"metric": "k", "unit": "ед."}], "reason": "x"},  # «суток» убраны (2.7)
     {"kind": "правка текста", "sheet": "вердикт", "key": "3", "field": "гипотеза", "new_text": "t", "reason": "x"},  # поле не того листа
     {"kind": "правка текста", "sheet": "строка карты", "key": "3", "field": "как считать", "new_text": "t", "reason": "x"},  # эффект без номера
     {"kind": "перепроверить индикатор", "indicator": 3, "clarification": " ", "reason": "x"},     # пустое уточнение

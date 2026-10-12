@@ -30,6 +30,7 @@ from app import versions
 from app.config import NO_DATA_TEXT_FAMILY
 from app.contracts import (
     ActPassport, AddMapRow, AppendRequest, BuildHypotheses, Buckets, DataRequest, DeleteMapRow, DeleteRequestItem,
+    MarkNotTracked,
     EditText, HypothesisMap, HypothesisSet, JournalEntry, MapRow, MergeMapRows, Operation, RecheckIndicator,
     RequestItem, RunMeta, RunProgress, SetVerdict, SplitRequestItem, Verdict, VersionState,
 )
@@ -142,7 +143,8 @@ def _add_once(values: list, value) -> None:
 
 
 def _needs_request(row: MapRow) -> bool:
-    return any(dp.source == "запрос органу" for dp in row.data)
+    # 2.7 (Ж2): вопрос органу словами — тоже позиция бланка (лист «Вопросы органу»)
+    return any(dp.source in ("запрос органу", "вопрос органу") for dp in row.data)
 
 
 # ---- операции без модели -------------------------------------------------
@@ -310,6 +312,45 @@ def _merge_map_rows(ctx: _Ctx, op: MergeMapRows) -> Change:
                   " | ".join(r.hypothesis for r in rows), op.hypothesis)
 
 
+def _norm(text: str) -> str:
+    return " ".join(text.lower().split())
+
+
+def _mark_not_tracked(ctx: _Ctx, op: MarkNotTracked) -> Change:
+    """
+    Ж3 (2.7): эксперт сказал, что такую цифру не ведёт никто. Источник цифры — «нигде
+    не ведётся»; цифра уходит из позиций бланка, позиция без единой цифры удаляется
+    (у органа нечего спрашивать). «Как считать» переписывает следующая операция плана —
+    «правка текста» (промпт диалога).
+    """
+    row = _row(ctx, op.row_id)
+    key = _norm(op.metric)
+    idx = next((i for i, dp in enumerate(row.data) if _norm(dp.metric) == key), None)
+    if idx is None:
+        raise OperationError(f"в строке {op.row_id} нет цифры «{op.metric}»")
+    old = row.data[idx]
+    data = [dp.model_dump() for dp in row.data]
+    data[idx] = {**data[idx], "source": "нигде не ведётся", "where": None}
+    _set_rows(ctx, [r for r in ctx.hyp_map.rows if r.row_id != op.row_id] + [_valid(MapRow, row, data=data)])
+    items, dropped = [], []
+    for it in ctx.request.items:
+        sources = [s for s in it.sources if not (s.row_id == op.row_id and _norm(s.metric) == key)]
+        if len(sources) == len(it.sources):
+            items.append(it)
+        elif not sources:
+            dropped.append(it.num)
+            ctx.state.marks.stale_items.pop(it.num, None)
+        else:
+            items.append(_valid(RequestItem, it, for_rows=sorted({s.row_id for s in sources}),
+                                sources=[s.model_dump() for s in sources]))
+    _set_items(ctx, items)
+    ctx.state.marks.edited_items = [n for n in ctx.state.marks.edited_items if n not in dropped]
+    _add_once(ctx.state.marks.edited_rows, op.row_id)
+    gone = f"; из бланка убрана позиция № {', '.join(dropped)}" if dropped else ""
+    return Change(f"Карта гипотез, стр. {op.row_id}", f"цифра помечена: нигде не ведётся{gone}",
+                  f"{old.metric} — {old.source}", "нигде не ведётся")
+
+
 def _delete_request_item(ctx: _Ctx, op: DeleteRequestItem) -> Change:
     item = _item(ctx, op.num)
     _set_items(ctx, [it for it in ctx.request.items if it.num != op.num])
@@ -433,6 +474,7 @@ _CODE_OPS: dict[str, Callable[[_Ctx, object], Change]] = {
     "удалить строку карты": _delete_map_row,
     "добавить строку карты": _add_map_row,
     "слить строки карты": _merge_map_rows,
+    "пометить: нигде не ведётся": _mark_not_tracked,
     "удалить позицию запроса": _delete_request_item,
     "разделить позицию запроса": _split_request_item,
 }

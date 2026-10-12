@@ -259,10 +259,11 @@ def test_all_field_names_across_all_models_are_latin():
     # Защита от того, что рекурсия случайно не дошла до части моделей
     # (13: + PairDecision — решение по кандидату на слияние, узел [5], ОС 2026-09-04;
     #  14: + SourceRef — происхождение позиции запроса, узел [6], ОС 2026-09-04)
-    assert len(all_models) == 57   # v2: + ActPassport с 24 вложенными, + PairDecision, + SourceRef;
+    assert len(all_models) == 59   # v2: + ActPassport с 24 вложенными, + PairDecision, + SourceRef;
     # итерация 3: + DialogTurn, 10 операций диалога и SplitPart;
     # 2.5: + строгие ответы с выжимкой — VerdictOutput, HypothesisSetOutput, HypothesisOutput,
-    # EffectOutput, MergeOutput, MapRowOutput
+    # EffectOutput, MergeOutput, MapRowOutput;
+    # 2.7: + DataItemOutput — показатель в ответе модели без пометки эксперта (Ж3), + MarkNotTracked
 
     for model_cls in all_models:
         for field_name in model_cls.model_fields:
@@ -368,7 +369,10 @@ def _item(**kw) -> dict:
     _item(kind="перечень или реестр", unit="ед."),                          # перечень с единицей
     _item(for_rows=[2]),                                                     # for_rows ≠ sources
     _item(breakdown=["по основаниям отказа, предусмотренным пунктом 5.3"]),  # разрез без перечисления
-    _item(unit="%"),                                                         # процентов нет
+    _item(unit="суток"),                                                     # «суток» убраны (2.7, АИ)
+    _item(kind="открытый вопрос", metric="В каких случаях?", unit="ед."),   # у вопроса нет единицы
+    _item(kind="открытый вопрос", metric="В каких случаях?", unit=None, clause=None),  # вопрос без пункта
+    _item(kind="открытый вопрос", metric="В каких случаях?", unit=None, clause="п. 1", breakdown=["а: б"]),  # и без разрезов
 ])
 def test_request_item_violations_rejected(item):
     with pytest.raises(ValidationError):
@@ -519,3 +523,84 @@ def test_output_schema_marks_briefs_required():
     assert {"how_to_calculate_brief", "expected_trend_brief"} <= set(eff["required"])
     row = next(d for d in MergeOutput.model_json_schema()["$defs"].values() if "row_id" in d.get("properties", {}))
     assert {"hypothesis_brief", "grounds_brief"} <= set(row["required"])
+
+
+# ---- 2.7 (итерация 4): гипотезы — Е, Г, Ж1, Ж2, Ж3 ----
+
+
+@pytest.mark.parametrize("group", ["бизнес", "граждане", "город", "бизнес и граждане", "бизнес и город",
+                                   "граждане и город", "бизнес, граждане и город"])
+def test_affected_any_combination_of_groups(group):
+    """Е: «кого задевает» — любое сочетание трёх групп; «бизнес и граждане» — прежним словом."""
+    assert Effect(affected=group, metric="m", how_to_calculate="c", expected_trend="рост").affected == group
+
+
+def test_effect_descriptions_iter4():
+    """Г и Е: инструкции модели к полям эффекта."""
+    how = Effect.model_fields["how_to_calculate"].description
+    assert "прошивка (только если акт её требует)" in how and "бумага и печать" in how
+    aff = Effect.model_fields["affected"].description
+    assert "Сочетание ставь, когда одна и та же цифра касается сразу нескольких групп" in aff
+
+
+def test_data_item_question_and_not_tracked_sources():
+    """Ж2, Ж3: вопрос органу и «нигде не ведётся» — без where, как запрос органу."""
+    assert DataItem(metric="В каких случаях привлекаются внештатные эксперты?", source="вопрос органу").where is None
+    assert DataItem(metric="число погибших по видам нарушений", source="нигде не ведётся").where is None
+    for src in ("вопрос органу", "нигде не ведётся"):
+        with pytest.raises(ValidationError):
+            DataItem(metric="x", source=src, where="сайт")
+
+
+def test_data_item_source_description_allows_complaints_and_questions():
+    """Ж1: жалобы и суды — у органа; Ж2: вопрос органу — с условиями."""
+    d = DataItem.model_fields["source"].description
+    assert "число жалоб и судебных споров по применению акта" in d
+    assert "(их ищут в открытых источниках)" not in d
+    assert "«вопрос органу»" in d
+
+
+def test_model_cannot_answer_not_tracked():
+    """Ж3: «нигде не ведётся» ставит только эксперт — в ответах моделей гипотез и слияния его нет."""
+    from app.contracts import HypothesisSetOutput, MergeOutput
+    bad = {"metric": "x", "source": "нигде не ведётся"}
+    with pytest.raises(ValidationError):
+        HypothesisSetOutput(indicator=1, name="н", violation_kind="издержки",
+                            why_this_many="w", hypotheses=[_hyp_out(data=[bad])])
+    with pytest.raises(ValidationError):
+        MergeOutput(rows=[_row_out(1, data=[bad])])
+    assert MergeOutput(rows=[_row_out(1, data=[{"metric": "вопрос?", "source": "вопрос органу"}])])
+    # в хранимой строке карты значение допустимо — его ставит операция диалога
+    assert MapRow(**{**_row(1, [1]), "data": [bad]})
+
+
+# ---- 2.7 (итерация 4): запрос — АИ, АЛ, Ж2 ----
+
+
+@pytest.mark.parametrize("unit", ["чел.", "листов", "%"])
+def test_request_new_units(unit):
+    """АИ: «чел.», «листов», «%» — допустимые единицы; процент — по исключению из инструкции."""
+    assert RequestItem(**_item(unit=unit)).unit == unit
+
+
+def test_request_unit_instruction_and_clause_instruction():
+    metric = RequestItem.model_fields["metric"].description
+    assert "Долю или процент обычно не запрашивай" in metric and "Доли и проценты не запрашиваются" not in metric
+    clause = RequestItem.model_fields["clause"].description
+    assert "Если у строки несколько пунктов, выбери тот, о котором именно этот показатель" in clause
+
+
+def test_open_question_item():
+    """Ж2: открытый вопрос — без единицы и разрезов, пункт и строка карты обязательны."""
+    it = RequestItem(**_item(kind="открытый вопрос", metric="В каких случаях привлекаются внештатные эксперты?",
+                             unit=None, clause="п. 2.7.1.2"))
+    assert it.kind == "открытый вопрос"
+
+
+def test_fresh_numbering_orders_questions_last():
+    """Ж2: в ответе модели сначала показатели, затем перечни, затем вопросы."""
+    q = _item(num="2", kind="открытый вопрос", metric="В каких случаях?", unit=None, clause="п. 1")
+    lst = _item(num="2", kind="перечень или реестр", metric="перечень отказов (п. 1)", unit=None)
+    assert RequestOutput(items=[_item(num="1"), {**lst}, {**q, "num": "3"}], years=[2025])
+    with pytest.raises(ValidationError):
+        RequestOutput(items=[_item(num="1"), {**q}, {**lst, "num": "3"}], years=[2025])

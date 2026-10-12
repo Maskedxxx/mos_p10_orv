@@ -77,10 +77,13 @@ _CENTER_TOP = Alignment(horizontal="center", vertical="top")
 _THIN = Side(style="thin", color="BFBFBF")
 _BORDER = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
 _EXPERT_FILL = PatternFill("solid", fgColor="FFF2CC")   # клетки для оценки экспертами (пул 3, п. 6.1)
+# 2.7 (итерация 4, В): строки «нет данных» на листе «Вердикты» — эксперту нужна доп. проверка
+_NO_DATA_FILL = PatternFill("solid", fgColor="FDE9D9")
 
 _SHEET_HOWTO = "Как заполнять"   # лист-инструкция для эксперта, первый в книге (пул 3, 6.2)
 _SHEET_MAP = "Карта гипотез"
 _SHEET_REQUEST = "Запрос показателей"
+_SHEET_QUESTIONS = "Вопросы органу"   # 2.7 (итерация 4, Ж2): вопросы словами — отдельным бланком
 _SHEET_VERDICTS = "Вердикты"   # пул 3 (письмо заказчика 2026-09-04, п. 4): на листе
                                # ВСЕ индикаторы, не только соблюдённые; имя — из письма.
                                # История: «Проверенные индикаторы» → «Нарушений не найдено» (7.1)
@@ -158,13 +161,21 @@ def _passport_header_line(passport: ActPassport | None) -> str | None:
     return " ".join(parts) + f" ({r.authority})"
 
 
-def _row_to_request_nums(request: DataRequest) -> dict[int, list[str]]:
+_KIND_QUESTION = "открытый вопрос"
+
+
+def _row_to_request_nums(request: DataRequest, *, questions: bool = False) -> dict[int, list[str]]:
     """
-    row_id строки карты -> номера показателей запроса, которые на неё ссылаются
+    row_id строки карты -> номера позиций запроса, которые на неё ссылаются
     (RequestItem.for_rows). Основа обратных ссылок в колонке «Данные».
+
+    questions=False — позиции листа «Запрос показателей» (цифры и перечни),
+    True — открытые вопросы листа «Вопросы органу» (2.7, Ж2).
     """
     mapping: dict[int, list[str]] = {}
     for item in request.items:
+        if (item.kind == _KIND_QUESTION) != questions:
+            continue
         for row_id in item.for_rows:
             mapping.setdefault(row_id, []).append(item.num)
     return mapping
@@ -312,7 +323,7 @@ def _render_effect_cell(effects: list[Effect]) -> str:
     return "\n\n".join(blocks)
 
 
-def _render_map_data_cell(data: list[DataItem], nums: list[str]) -> str:
+def _render_map_data_cell(data: list[DataItem], nums: list[str], question_nums: list[str] | None = None) -> str:
     """
     Показатели строки карты двумя подписанными группами (фиксы N 2 и N 3).
 
@@ -329,8 +340,12 @@ def _render_map_data_cell(data: list[DataItem], nums: list[str]) -> str:
     приписывал каждому показателю весь список номеров строки, и оба показателя
     получали «N 1, 2» — сноска указывала в никуда.
     """
+    # 2.7 (итерация 4): ещё две группы — вопросы органу словами (Ж2, свой лист бланка)
+    # и цифры, которые по слову эксперта нигде не ведутся (Ж3, ни в запрос, ни в открытые)
     internal = [dp for dp in data if dp.source == "запрос органу"]
-    external = [dp for dp in data if dp.source != "запрос органу"]
+    questions = [dp for dp in data if dp.source == "вопрос органу"]
+    external = [dp for dp in data if dp.source == "открытый"]
+    not_tracked = [dp for dp in data if dp.source == "нигде не ведётся"]
 
     blocks: list[str] = []
 
@@ -340,6 +355,12 @@ def _render_map_data_cell(data: list[DataItem], nums: list[str]) -> str:
             head += f" (лист «{_SHEET_REQUEST}», № {', '.join(nums)})"
         blocks.append("\n".join([f"{head}:"] + [f"— {dp.metric}" for dp in internal]))
 
+    if questions:
+        head = "Вопрос органу"
+        if question_nums:
+            head += f" (лист «{_SHEET_QUESTIONS}», № {', '.join(question_nums)})"
+        blocks.append("\n".join([f"{head}:"] + [f"— {dp.metric}" for dp in questions]))
+
     if external:
         lines = ["Открытые источники (берём сами, у органа не запрашиваем):"]
         for dp in external:
@@ -347,6 +368,9 @@ def _render_map_data_cell(data: list[DataItem], nums: list[str]) -> str:
             if dp.where:
                 lines.append(f"  — {dp.where.strip()}")   # адрес источника подстрокой
         blocks.append("\n".join(lines))
+
+    if not_tracked:
+        blocks.append("\n".join(["Нигде не ведётся (отметил эксперт):"] + [f"— {dp.metric}" for dp in not_tracked]))
 
     return "\n\n".join(blocks)
 
@@ -427,7 +451,8 @@ def _indicator_key(value) -> int | None:
 
 
 _EXPERT_SCORE_COLUMNS = (["Оценка (1–5)", "Замечание"], [12, 40])
-_EXPERT_VERDICT_COLUMNS = (["Согласны?", "Если нет — какой верный", "Замечание"], [12, 30, 40])
+# 2.7 (итерация 4, В): «Где искать» — эксперт подсказывает, где лежат сведения для «нет данных»
+_EXPERT_VERDICT_COLUMNS = (["Согласны?", "Если нет — какой верный", "Замечание", "Где искать"], [12, 30, 40, 40])
 
 
 def _format_map_sheet(ws: Worksheet, header_row: int) -> None:
@@ -574,6 +599,7 @@ def _render_map_sheet(
     wb: Workbook, hyp_map: HypothesisMap, row_to_nums: dict[int, list[str]],
     passport: ActPassport | None, buckets: Buckets, caption: str,
     unverified_ids: dict[int, int], marks: Marks | None = None,
+    row_to_question_nums: dict[int, list[str]] | None = None,
 ) -> None:
     """
     Лист «Карта гипотез»: опциональная шапка-реквизиты (одна строка) + 5 колонок.
@@ -600,7 +626,7 @@ def _render_map_sheet(
             _indicators_label(row.indicators),
             _points(row.hypothesis_brief, row.hypothesis),
             _render_effect_cell(row.effects),
-            _render_map_data_cell(row.data, nums),
+            _render_map_data_cell(row.data, nums, (row_to_question_nums or {}).get(row.row_id, [])),
             _render_basis_cell(
                 row.proof or _first_verdict_proof(verdicts),
                 row.clause,                       # пункт карты вердиктом не подменяется
@@ -704,7 +730,8 @@ def _render_request_sheet(
         for i, breakdown in enumerate(item.breakdown, start=1):
             ws.append([f"{item.num}.{i}", breakdown, "", "", *year_cells])
 
-    counters = [it for it in request.items if it.kind != _KIND_LIST]
+    # открытые вопросы — на своём листе (2.7, Ж2), здесь только цифры и перечни
+    counters = [it for it in request.items if it.kind not in (_KIND_LIST, _KIND_QUESTION)]
     lists = [it for it in request.items if it.kind == _KIND_LIST]
     for item in counters:
         _append_item(item, empty_years)
@@ -719,6 +746,35 @@ def _render_request_sheet(
             _append_item(item, dash_years)
 
     _format_request_sheet(ws, header_row)
+    if marks is not None:
+        _append_marks_column(ws, header_row, _item_key, marks.edited_items, marks.stale_items)
+    _append_expert_columns(ws, header_row, *_EXPERT_SCORE_COLUMNS)
+
+
+def _render_questions_sheet(
+    wb: Workbook, request: DataRequest, hyp_map: HypothesisMap, caption: str, marks: Marks | None = None,
+) -> None:
+    """
+    Лист «Вопросы органу» (2.7, итерация 4, Ж2): № | Вопрос | Пункт акта | Строки карты.
+
+    Владимир (файл 4, правило 3.1): открытые вопросы — «отдельный бланк, если следует из
+    гипотез и непонятно из текста акта / открытых данных». Лист создаётся всегда: эксперт
+    видит, что вопросов нет, а не гадает, куда делся бланк.
+    """
+    ws = wb.create_sheet(_SHEET_QUESTIONS)
+    _render_caption(ws, caption)
+    header_row = ws.max_row + 1
+    ws.append(["№", "Вопрос", "Пункт акта", "Строки карты"])
+    row_indicators = {row.row_id: row.indicators for row in hyp_map.rows}
+    questions = [it for it in request.items if it.kind == _KIND_QUESTION]
+    if not questions:
+        ws.append(["", "вопросов нет", "", ""])
+    for item in questions:
+        ws.append([item.num, item.metric, item.clause or "",
+                   _render_source_rows_cell(item.for_rows, row_indicators)])
+    _format_listing_sheet(ws, {"A": 8, "B": 70, "C": 16, "D": 26}, header_row)
+    for row in ws.iter_rows(min_row=header_row + 1, max_col=1):
+        row[0].alignment = _CENTER_TOP
     if marks is not None:
         _append_marks_column(ws, header_row, _item_key, marks.edited_items, marks.stale_items)
     _append_expert_columns(ws, header_row, *_EXPERT_SCORE_COLUMNS)
@@ -786,6 +842,11 @@ def _render_verdicts_sheet(
             _where_details(v, hyp_map, unverified_ids),
         ])
     _format_listing_sheet(ws, {"A": 34, "B": 16, "C": 60, "D": 52, "E": 30}, header_row)
+    # 2.7 (итерация 4, В): «нет данных» — заливкой по всей строке вердикта (без колонок эксперта)
+    for row in ws.iter_rows(min_row=header_row + 1, max_col=5):
+        if row[1].value == "нет данных":
+            for c in row:
+                c.fill = _NO_DATA_FILL
     if marks is not None:
         _append_marks_column(ws, header_row, _indicator_key, marks.edited_verdicts, marks.stale_verdicts)
     _append_expert_columns(ws, header_row, *_EXPERT_VERDICT_COLUMNS)
@@ -855,6 +916,7 @@ def build_excel(
     years = request.years or compute_years(num_years=REQUEST_YEARS_DEPTH)
     unverified = _unverified_row_ids(hypothesis_map, buckets, unverified_ids)
     row_to_nums = _row_to_request_nums(request)
+    row_to_question_nums = _row_to_request_nums(request, questions=True)
 
     # Числитель подписей считается по факту прогона, знаменатель — из конфига:
     # 12 индикаторов задаёт методика, зашивать это число в текст нельзя.
@@ -870,7 +932,7 @@ def build_excel(
         f"{len(map_indicators)} из {total}. По каждому построена гипотеза: "
         f"что не так, чем мерить эффект, какие данные нужны — либо отмечено, "
         f"что нужна ручная проверка.",
-        unverified, marks,
+        unverified, marks, row_to_question_nums,
     )
     _render_request_sheet(
         wb, request, years, hypothesis_map,
@@ -878,11 +940,19 @@ def build_excel(
         "три последних завершённых года.",
         marks,
     )
+    _render_questions_sheet(
+        wb, request, hypothesis_map,
+        "Вопросы органу словами — то, что нельзя запросить числом или перечнем. Каждый вопрос "
+        "вытекает из гипотезы карты (строка) и пункта акта.",
+        marks,
+    )
     n_verdicts = sum(len(b) for b in (buckets.violated, buckets.no_data, buckets.checked, buckets.failed))
     _render_verdicts_sheet(
         wb, buckets, hypothesis_map,
         f"Все индикаторы с вердиктами — {n_verdicts} из {total}. По нарушенным и «нет данных» "
-        f"подробности на листе «{_SHEET_MAP}», по сбоям — на листе «{_SHEET_FAILED}».",
+        f"подробности на листе «{_SHEET_MAP}», по сбоям — на листе «{_SHEET_FAILED}». "
+        f"Подсвечены индикаторы, по которым сведений для вердикта не нашлось ни в Гаранте, "
+        f"ни в интернете. Если знаете, где они лежат, — напишите в графе «Где искать».",
         unverified, marks,
     )
     _render_failed_sheet(

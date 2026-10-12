@@ -113,6 +113,10 @@ def _build_document(
     return "\n".join(parts)
 
 
+# Источники показателей карты, которые уходят органу: цифры и (2.7, Ж2) вопросы словами
+_TO_AUTHORITY = ("запрос органу", "вопрос органу")
+
+
 def _norm(text: str) -> str:
     return " ".join(text.lower().split())
 
@@ -132,7 +136,7 @@ def _check_coverage(hyp_map: HypothesisMap, request: DataRequest, logger) -> Non
         return
     internal = {
         (row.row_id, _norm(dp.metric)): dp.metric
-        for row in hyp_map.rows for dp in row.data if dp.source == "запрос органу"
+        for row in hyp_map.rows for dp in row.data if dp.source in _TO_AUTHORITY
     }
     where: dict[tuple[int, str], list[str]] = {}
     for item in request.items:
@@ -173,7 +177,7 @@ def _rows_with_internal_data(hyp_map: HypothesisMap) -> set[int]:
     """
     return {
         row.row_id for row in hyp_map.rows
-        if any(dp.source == "запрос органу" for dp in row.data)
+        if any(dp.source in _TO_AUTHORITY for dp in row.data)
     }
 
 
