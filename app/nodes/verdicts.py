@@ -35,6 +35,7 @@ from app.config import (
     ALLOWED_TOOLS_WEB,
     CACHE_WARMUP_S,
     COMPARISON_REGIONS,
+    SEARCH_LIMITS,
     all_indicators,
     get_indicator,
     prompt_path,
@@ -64,14 +65,17 @@ def _build_document(document_md: str, passport_block_text: str) -> str:
 # подставляется здесь — из настроек прогона, по умолчанию COMPARISON_REGIONS конфига.
 _REGIONS_LABEL = "{{РЕГИОНЫ_СРАВНЕНИЯ}}"
 _REGIONS_COUNT_LABEL = "{{ЧИСЛО_РЕГИОНОВ}}"
+# Потолок заходов поиска в интернете (Л): из настроек прогона, по умолчанию SEARCH_LIMITS
+_LIMIT_LABEL = "{{ПОТОЛОК_ЗАХОДОВ}}"
 
 
-def fill_prompt_labels(prompt_text: str, regions: list[str] | None = None) -> str:
-    """Подставить в текст промпта список регионов сравнения и их число (цифрами)."""
+def fill_prompt_labels(prompt_text: str, regions: list[str] | None = None, limit: int | None = None) -> str:
+    """Подставить в текст промпта регионы сравнения, их число (цифрами) и потолок заходов поиска."""
     regions = list(regions) if regions else list(COMPARISON_REGIONS)
-    return (prompt_text
+    text = (prompt_text
             .replace(_REGIONS_LABEL, ", ".join(regions))
             .replace(_REGIONS_COUNT_LABEL, str(len(regions))))
+    return text.replace(_LIMIT_LABEL, str(limit)) if limit is not None else text
 
 
 def _error_verdict(indicator_number: int, name: str, error_text: str, attempts: int) -> Verdict:
@@ -95,6 +99,7 @@ def _run_one_indicator(
     extra_instruction: str | None = None,
     trace_prefix: str = "",
     regions: list[str] | None = None,
+    search_limits: dict[int, int] | None = None,
 ) -> tuple[int, Verdict, float]:
     """
     Прогнать одного агента-индикатора. Никогда не бросает исключение наружу — любой
@@ -111,7 +116,8 @@ def _run_one_indicator(
         indicator = get_indicator(n)
         name_fallback = indicator.name
 
-        prompt_text = fill_prompt_labels(prompt_path(n).read_text(encoding="utf-8"), regions)
+        limit = (search_limits or SEARCH_LIMITS).get(n, SEARCH_LIMITS.get(n))
+        prompt_text = fill_prompt_labels(prompt_path(n).read_text(encoding="utf-8"), regions, limit)
         instruction = append_task_clarification(prompt_text, extra_instruction)
         # 2.6: акт и паспорт — общий для всех 12 агентов текст — уходят в системный промпт,
         # чтобы агенты читали его из кэша друг у друга; в stdin ничего не идёт
@@ -183,6 +189,7 @@ def run_verdicts(
     trace_prefix: str = "",
     save: bool = True,
     regions: list[str] | None = None,
+    search_limits: dict[int, int] | None = None,
 ) -> list[Verdict]:
     """
     Параллельно прогнать агентов-индикаторов и собрать их вердикты (узел [2]).
@@ -205,7 +212,8 @@ def run_verdicts(
     ответов, возврат кандидата без записи 03_verdicts/NN.json (запись после
     «Принять»). Стоимость учитывается в meta всегда.
 
-    regions — регионы сравнения прогона для промптов 7, 8, 11 (None — COMPARISON_REGIONS).
+    regions — регионы сравнения прогона для промптов 7, 8, 11 (None — COMPARISON_REGIONS);
+    search_limits — потолки поиска прогона по индикаторам (None — SEARCH_LIMITS).
 
     Требует, чтобы meta.json прогона уже существовал (создаётся trace.new_run()
     выше по пайплайну) — суммарная стоимость ПРИБАВЛЯЕТСЯ к записанной (_add_cost_to_meta).
@@ -227,7 +235,7 @@ def run_verdicts(
         futures = [
             executor.submit(
                 _after, delays[n], _run_one_indicator, n, document_md, block, run_id, timeout_s,
-                max_budget_usd, extra_instruction, trace_prefix, regions,
+                max_budget_usd, extra_instruction, trace_prefix, regions, search_limits,
             )
             for n in nums
         ]

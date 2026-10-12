@@ -97,3 +97,28 @@ def test_passport_effective_year(valid_passport, date, status, expected):
 
 def test_passport_effective_year_none_without_passport():
     assert passport_effective_year(None) is None
+
+
+
+# ---- 2.7 (итерация 4, А): орган-разработчик ----
+
+
+def test_passport_agent_gets_garant_search(run_id, monkeypatch, valid_passport):
+    """Разработчика агент паспорта ищет и в Гаранте: кто издаёт приказы во исполнение акта."""
+    mock_call = Mock(return_value=_ok(ActPassport(**valid_passport)))
+    monkeypatch.setattr(passport_module, "call", mock_call)
+    passport_module.make_passport("текст", run_id)
+    assert mock_call.call_args.kwargs["mcp_tools"] == ["garant_search"]
+
+
+def test_developers_field_and_user_choice(valid_passport):
+    """Модель пишет разработчиков списком; выбор пользователя при загрузке важнее ответа модели."""
+    from app.contracts import Requisites
+    desc = Requisites.model_fields["developers"].description
+    assert "Не нашёл — пустой список, не угадывай" in desc
+    p = ActPassport(**valid_passport)
+    assert p.requisites.developers == []                       # паспорта до 2.7 читаются
+    p2 = passport_module.apply_user_developers(p, ["Департамент предпринимательства и инновационного развития города Москвы"])
+    d = p2.requisites.developers[0]
+    assert d.name.startswith("Департамент предпринимательства") and d.basis == "указан пользователем при загрузке"
+    assert passport_module.apply_user_developers(p, []) is p

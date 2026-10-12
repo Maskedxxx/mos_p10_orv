@@ -839,7 +839,7 @@ def test_howto_sheet_is_first_and_filled_by_service(tmp_runs_dir):
     for name in ("Карта гипотез", "Запрос показателей", "Вердикты"):
         assert f"«{name}»" in rules, name
     assert "Проверенные индикаторы" not in rules
-    assert ws.max_row - rows["Что нужно сделать"] == 6
+    assert ws.max_row - rows["Что нужно сделать"] == 7   # 2.7: + правило про «Где искать»
 
 
 def test_howto_sheet_without_passport_has_dash_for_act(tmp_runs_dir):
@@ -1277,3 +1277,46 @@ def test_verdicts_no_data_highlighted_and_where_to_search_column(tmp_runs_dir):
     other = next(r for r in rows if r[1].value == "нарушен")
     assert no_data[0].fill.fgColor.rgb != other[0].fill.fgColor.rgb
     assert "Где искать" in str(ws.cell(1, 1).value)
+
+
+
+def test_request_sheet_mandatory_block_and_origin(tmp_runs_dir):
+    """АМ: сначала «Обязательные показатели (тип акта: …)», затем «Показатели из гипотез»; в «Откуда» — код формы."""
+    req = DataRequest(items=[
+        RequestItem(num="1", kind="показатель по годам", metric="Общее количество заявок, поданных на получение поддержки",
+                    unit="ед.", mandatory=["ГП-1"]),
+        RequestItem(num="2", kind="показатель по годам", metric="число заявок (пункт 5.1.4)", unit="ед.", clause="5.1.4",
+                    for_rows=[1], sources=[SourceRef(row_id=1, metric="число заявок")]),
+    ], years=[2023, 2024, 2025])
+    wb = load_workbook(build_excel(_map(), req, _buckets(with_failed=False), _passport(), "run_m",
+                                   act_types=["господдержка"]))
+    rows = [[c.value for c in r] for r in wb["Запрос показателей"].iter_rows()]
+    labels = [r[1] for r in rows]
+    i_m = labels.index("Обязательные показатели (тип акта: господдержка)")
+    i_h = labels.index("Показатели из гипотез")
+    assert i_m < labels.index("Общее количество заявок, поданных на получение поддержки, ед.") < i_h
+    assert next(r for r in rows if r[0] == "1")[2] == "обязательный (ГП-1)"
+    howto = wb["Как заполнять"]
+    tip = next(howto.cell(r, 2).value for r in range(1, howto.max_row + 1) if howto.cell(r, 1).value == "Тип акта")
+    assert tip == "господдержка"
+
+
+
+def test_developers_in_map_header_and_request_caption(tmp_runs_dir):
+    """А: разработчик — в шапке карты; лист запроса — «Заполняет: …» вместо общей фразы."""
+    from app.contracts import Developer
+    p = _passport()
+    p = p.model_copy(update={"requisites": p.requisites.model_copy(update={"developers": [
+        Developer(name="Департамент предпринимательства и инновационного развития города Москвы",
+                  scope="приложение 1", clauses="п. 1.5 приложения 1", basis="приём заявок поручен департаменту"),
+    ]})})
+    wb = load_workbook(build_excel(_map(), _request(), _buckets(with_failed=False), p, "run_dev"))
+    head = str(wb["Карта гипотез"].cell(1, 1).value)
+    assert "Разработчик: Департамент предпринимательства и инновационного развития города Москвы (приложение 1;" in head
+    cap = str(wb["Запрос показателей"].cell(1, 1).value)
+    assert cap.startswith("Заполняет: Департамент предпринимательства")
+
+
+def test_request_caption_without_developers_unchanged(tmp_runs_dir):
+    wb = load_workbook(build_excel(_map(), _request(), _buckets(with_failed=False), _passport(), "run_nodev"))
+    assert str(wb["Запрос показателей"].cell(1, 1).value).startswith("Данные, которых нет в открытом доступе. Заполняет орган-разработчик")

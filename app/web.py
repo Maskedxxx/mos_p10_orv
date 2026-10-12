@@ -82,7 +82,8 @@ from starlette.responses import Response
 
 from app import config, dialog, feedback, operations, trace, versions
 from app.actions import Who, log_action, session_label
-from app.config import ACCEPTED_EXTENSIONS, all_indicators
+from app.config import ACCEPTED_EXTENSIONS, COMPARISON_REGIONS, SEARCH_LIMIT_MAX, SEARCH_LIMITS, all_indicators
+from app.mandatory_indicators import ACT_TYPES, NO_TYPE
 from app.contracts import (
     Buckets, DataRequest, HypothesisMap, Marks, NodeState, NodeStatus, Operation, RunMeta, RunProgress, RunStatus,
 )
@@ -187,6 +188,48 @@ def input_filename(act_filename: str) -> str:
     if suffix not in ACCEPTED_EXTENSIONS:
         suffix = ".docx"
     return f"{INPUT_STEM}{suffix}"
+
+
+# ---- 2.7 (итерация 4): тип акта и «Настройки прогона» на странице загрузки ----
+
+
+def toggle_act_type(selected: set[str], changed: str, checked: bool) -> set[str]:
+    """
+    Галочки типа акта (АМ): можно несколько; «нет подходящего типа» исключает остальные
+    и снимается, когда отмечен любой тип — иначе «нет типа» стоял бы рядом с «господдержкой».
+    """
+    if not checked:
+        return selected - {changed}
+    if changed == NO_TYPE:
+        return {NO_TYPE}
+    return (selected - {NO_TYPE}) | {changed}
+
+
+def parse_regions(text: str) -> list[str]:
+    """Регионы сравнения (К) из поля страницы: по строке на регион, без пустых и повторов."""
+    seen: list[str] = []
+    for line in text.splitlines():
+        name = line.strip().strip(",;").strip()
+        if name and name not in seen:
+            seen.append(name)
+    return seen
+
+
+def clamp_limits(values: dict[int, object]) -> dict[int, int]:
+    """Потолки поиска (Л) из полей страницы: целые от 1 до SEARCH_LIMIT_MAX; пусто — значение по умолчанию."""
+    out: dict[int, int] = {}
+    for n, default in SEARCH_LIMITS.items():
+        try:
+            value = int(values.get(n)) if values.get(n) not in (None, "") else default
+        except (TypeError, ValueError):
+            value = default
+        out[n] = min(max(value, 1), SEARCH_LIMIT_MAX)
+    return out
+
+
+def can_start(has_file: bool, act_types: set[str], regions: list[str]) -> bool:
+    """Кнопка «Проанализировать»: файл принят, выбран хотя бы один тип акта, регионов сравнения не ноль."""
+    return has_file and bool(act_types) and bool(regions)
 
 
 def validate_upload(filename: str, size: int) -> str | None:
@@ -1662,6 +1705,26 @@ def page_index(request: Request) -> None:
     who = _who(request)
     _layout(who)
     pending: dict[str, object] = {}
+    act_types: set[str] = set()
+    type_boxes: dict[str, ui.checkbox] = {}
+    limit_inputs: dict[int, ui.number] = {}
+
+    def refresh_start() -> None:
+        """Кнопка активна, только когда есть файл, тип акта и регионы сравнения (2.7)."""
+        regions = parse_regions(regions_box.value or "")
+        if can_start("data" in pending, act_types, regions):
+            start.enable()
+        else:
+            start.disable()
+
+    def on_type(changed: str, checked: bool) -> None:
+        """Отметка типа акта: «нет подходящего типа» снимает остальные и наоборот."""
+        nonlocal act_types
+        act_types = toggle_act_type(act_types, changed, checked)
+        for name, box in type_boxes.items():
+            if box.value != (name in act_types):
+                box.set_value(name in act_types)
+        refresh_start()
 
     async def handle_upload(event: UploadEventArguments) -> None:
         """Принять файл: проверить и запомнить содержимое до нажатия кнопки."""
@@ -1670,12 +1733,13 @@ def page_index(request: Request) -> None:
             ui.notify(error, type="negative")
             upload.reset()
             chosen.set_text("")
-            start.disable()
+            pending.clear()
+            refresh_start()
             return
         pending["name"] = event.file.name
         pending["data"] = await event.file.read()
         chosen.set_text(f"Выбран файл: {event.file.name}")
-        start.enable()
+        refresh_start()
 
     def handle_rejected(_: UiEventArguments) -> None:
         """Файл не прошёл проверку ещё в браузере (расширение или размер)."""
@@ -1691,11 +1755,18 @@ def page_index(request: Request) -> None:
         if not isinstance(name, str) or not isinstance(data, bytes):
             ui.notify("Сначала выберите файл акта", type="warning")
             return
-        run_id = trace.new_run(name)
+        regions = parse_regions(regions_box.value or "")
+        if not act_types or not regions:
+            ui.notify("Отметьте тип акта и оставьте хотя бы один регион сравнения", type="warning")
+            return
+        types = [t for t in ACT_TYPES if t in act_types]          # порядок — как на странице
+        limits = clamp_limits({n: box.value for n, box in limit_inputs.items()})
+        run_id = trace.new_run(name, act_types=types, comparison_regions=regions, search_limits=limits)
         input_name = input_filename(name)
         trace.save_bytes(run_id, input_name, data)
         QUEUE.submit(run_id, trace.run_dir(run_id) / input_name)
-        log_action(who, "старт прогона", run_id, file=name, size=len(data))
+        log_action(who, "старт прогона", run_id, file=name, size=len(data), act_types=types,
+                   regions=regions, search_limits=limits)
         ui.navigate.to(f"/run/{run_id}")
 
     with ui.column().classes("w-full items-center p-8"):
@@ -1721,6 +1792,27 @@ def page_index(request: Request) -> None:
                 .classes("w-full")
             )
             chosen = ui.label("").classes("text-sm text-primary")
+
+            # 2.7 (АМ): тип акта — от него зависят обязательные показатели бланка
+            ui.label("Тип акта (можно несколько)").classes("text-sm font-medium")
+            for name in ACT_TYPES:
+                type_boxes[name] = ui.checkbox(
+                    name, on_change=lambda e, n=name: on_type(n, bool(e.value)),
+                ).classes("text-sm")
+
+            # 2.7 (К, Л): «Настройки прогона» — по умолчанию из конфига, хранятся в прогоне
+            with ui.expansion("Настройки прогона").classes("w-full text-sm"):
+                ui.label("Регионы сравнения — по строке на регион").classes("text-sm")
+                regions_box = ui.textarea(
+                    value="\n".join(COMPARISON_REGIONS), on_change=lambda _: refresh_start(),
+                ).props("outlined autogrow").classes("w-full")
+                ui.label(f"Потолок заходов поиска в интернете (от 1 до {SEARCH_LIMIT_MAX})").classes("text-sm")
+                names = {ind.number: ind.name for ind in all_indicators()}
+                for n, default in SEARCH_LIMITS.items():
+                    limit_inputs[n] = ui.number(
+                        label=f"{n}. {names.get(n, '')}", value=default, min=1, max=SEARCH_LIMIT_MAX, step=1,
+                    ).classes("w-full")
+
             start = ui.button("Проанализировать", on_click=start_run).props("unelevated")
             start.disable()
 

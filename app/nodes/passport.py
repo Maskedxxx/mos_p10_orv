@@ -25,7 +25,7 @@ import json
 import re
 
 from app.config import ALLOWED_TOOLS_TEXT, PASSPORT_TIMEOUT_S, PROMPT_PASSPORT
-from app.contracts import ActPassport
+from app.contracts import ActPassport, Developer
 from app.logger import get_run_logger
 from app.nodes.hypotheses import _add_cost_to_meta
 from app.runner import call
@@ -64,6 +64,8 @@ def make_passport(
         allowed_tools=ALLOWED_TOOLS_TEXT,
         timeout_s=timeout_s,
         max_budget_usd=max_budget_usd,
+        # 2.7 (А): кто издаёт приказы во исполнение акта — подсказка, какой орган ведёт процедуру
+        mcp_tools=["garant_search"],
     )
     _add_cost_to_meta(run_id, result.cost_usd)
 
@@ -82,6 +84,18 @@ def make_passport(
         passport.control.state, result.cost_usd,
     )
     return passport
+
+
+def apply_user_developers(passport: ActPassport, names: list[str]) -> ActPassport:
+    """
+    Выбор пользователя при загрузке важнее ответа модели (2.7, А, решение владельца 12.10).
+    Модель о выборе не знает — ей это не нужно; пометка «указан пользователем» — для Excel.
+    """
+    if not names:
+        return passport
+    developers = [Developer(name=n, scope="весь акт", basis="указан пользователем при загрузке") for n in names]
+    requisites = passport.requisites.model_copy(update={"developers": developers})
+    return passport.model_copy(update={"requisites": requisites})
 
 
 def passport_json(passport: ActPassport) -> str:

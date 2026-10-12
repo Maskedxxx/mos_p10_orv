@@ -199,9 +199,12 @@ class Fakes:
         max_budget_usd=None,
         on_verdict=None,
         passport=None,
+        regions=None,
+        search_limits=None,
     ) -> list[Verdict]:
         self._record("verdicts:start")
         self.passport_seen["verdicts"] = passport
+        self.passport_seen["verdicts_settings"] = (regions, search_limits)
         self._maybe_fail("verdicts")
         result: list[Verdict] = []
         for n, value in _VERDICT_PLAN:
@@ -303,7 +306,8 @@ class Fakes:
         self._record("request:end")
         return value
 
-    def excel(self, hypothesis_map, request, buckets, passport, run_id: str):
+    def excel(self, hypothesis_map, request, buckets, passport, run_id: str, **kwargs):
+        self.passport_seen["excel_act_types"] = kwargs.get("act_types")
         self._record("excel:start")
         self.passport_seen["excel"] = passport
         self._maybe_fail("excel")
@@ -671,3 +675,21 @@ def test_meta_finished_at_the_end(fakes, act_file):
     meta = load_json(fakes.run_id, "meta.json", RunMeta)
     assert meta.status == "finished"
     assert meta.finished_at is not None
+
+
+def test_run_settings_reach_nodes(fakes, act_file):
+    """2.7: тип акта и настройки прогона из meta.json доходят до вердиктов, запроса и Excel."""
+    from app.trace import update_meta
+    update_meta(fakes.run_id, act_types=["господдержка"], comparison_regions=["Казань"], search_limits={3: 30})
+    run_pipeline(act_file, fakes.run_id)
+    assert fakes.passport_seen["verdicts_settings"] == (["Казань"], {3: 30})
+    assert fakes.passport_seen["excel_act_types"] == ["господдержка"]
+
+
+def test_user_developer_replaces_model_answer(fakes, act_file):
+    """А: орган-разработчик, выбранный при загрузке, — в паспорте для всех следующих шагов."""
+    from app.trace import update_meta
+    update_meta(fakes.run_id, developers=["Департамент культуры города Москвы"])
+    run_pipeline(act_file, fakes.run_id)
+    seen = fakes.passport_seen["verdicts"]
+    assert [d.name for d in seen.requisites.developers] == ["Департамент культуры города Москвы"]

@@ -418,3 +418,64 @@ def test_coverage_counts_questions_to_authority(run_id, tmp_prompt, monkeypatch)
     build_request(hyp_map, run_id)
     log_text = (run_dir(run_id) / "run.log").read_text(encoding="utf-8")
     assert "не вошёл ни в одну позицию" in log_text and "В каких случаях привлекаются эксперты?" in log_text
+
+
+
+# ---- 2.7 (итерация 4, АМ): обязательные показатели по типу акта ----
+
+
+def test_mandatory_block_goes_to_model_and_missing_code_is_appended(run_id, tmp_prompt, monkeypatch):
+    """Блок обязательных показателей уходит модели; пропущенный ею — код дописывает дословно (Р4)."""
+    from app.mandatory_indicators import MANDATORY
+    hyp_map = _map([_row2(1, [("число заявок", "запрос органу")])])
+    gp1 = MANDATORY["господдержка"][0]
+    # модель взяла только ГП-1 (склеив с показателем карты) — остальные 19 должен дописать код
+    req = DataRequest(items=[_item("1", gp1.metric, [1], [(1, "число заявок")], unit="ед.", mandatory=[gp1.code])],
+                      years=[2025])
+    mock_call = Mock(return_value=_ok_call_result(req))
+    monkeypatch.setattr(request_module, "call", mock_call)
+    out = build_request(hyp_map, run_id, act_types=["господдержка"])
+    assert "## ОБЯЗАТЕЛЬНЫЕ ПОКАЗАТЕЛИ (JSON)" in mock_call.call_args.args[1]
+    codes = [c for it in out.items for c in it.mandatory]
+    assert sorted(codes) == sorted(i.code for i in MANDATORY["господдержка"])
+    gp18 = next(it for it in out.items if "ГП-18" in it.mandatory)
+    assert gp18.metric == MANDATORY["господдержка"][17].metric and gp18.unit == "листов"
+    assert [it.num for it in out.items] == [str(i) for i in range(1, len(out.items) + 1)]
+    kinds = [it.kind for it in out.items]
+    assert kinds.index("перечень или реестр") > max(i for i, k in enumerate(kinds) if k == "показатель по годам")
+    log_text = (run_dir(run_id) / "run.log").read_text(encoding="utf-8")
+    assert "дописан кодом" in log_text
+
+
+def test_mandatory_first_within_kind(run_id, tmp_prompt, monkeypatch):
+    """Порядок: внутри рода сначала обязательные, затем из гипотез."""
+    hyp_map = _map([_row2(1, [("число отказов", "запрос органу")])])
+    req = DataRequest(items=[_item("1", "число отказов (п. 2)", [1], [(1, "число отказов")], unit="ед.")], years=[2025])
+    monkeypatch.setattr(request_module, "call", Mock(return_value=_ok_call_result(req)))
+    out = build_request(hyp_map, run_id, act_types=["предоставление госуслуги"])
+    counters = [it for it in out.items if it.kind == "показатель по годам"]
+    assert counters[-1].metric == "число отказов (п. 2)" and all(it.mandatory for it in counters[:-1])
+
+
+def test_mandatory_without_map_still_builds_blank(run_id, tmp_prompt, monkeypatch):
+    """Карта пуста, но тип акта выбран — бланк из обязательных показателей; модель не нужна."""
+    mock_call = Mock()
+    monkeypatch.setattr(request_module, "call", mock_call)
+    out = build_request(_map([]), run_id, act_types=["обязательные требования"])
+    assert len(out.items) == 19 and not mock_call.called
+
+
+def test_model_failure_keeps_mandatory(run_id, tmp_prompt, monkeypatch):
+    hyp_map = _map([_row2(1, [("число заявок", "запрос органу")])])
+    monkeypatch.setattr(request_module, "call", Mock(return_value=_failed_call_result()))
+    out = build_request(hyp_map, run_id, act_types=["господдержка"])
+    assert len(out.items) == 20
+
+
+def test_no_act_type_no_mandatory_block(run_id, tmp_prompt, monkeypatch):
+    hyp_map = _map([_row2(1, [("число заявок", "запрос органу")])])
+    req = DataRequest(items=[_item("1", "число заявок (п. 1)", [1], [(1, "число заявок")], unit="ед.")], years=[2025])
+    mock_call = Mock(return_value=_ok_call_result(req))
+    monkeypatch.setattr(request_module, "call", mock_call)
+    out = build_request(hyp_map, run_id, act_types=["нет подходящего типа"])
+    assert "ОБЯЗАТЕЛЬНЫЕ ПОКАЗАТЕЛИ" not in mock_call.call_args.args[1] and len(out.items) == 1

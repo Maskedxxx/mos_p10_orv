@@ -192,3 +192,15 @@ def test_write_failure_leaves_previous_file_untouched(tmp_runs_dir, valid_run_me
 
     assert path.read_text(encoding="utf-8") == original
     assert [p.name for p in (tmp_runs_dir / run_id).iterdir()] == ["meta.json"]
+
+
+
+def test_new_run_keeps_user_settings(tmp_runs_dir):
+    """2.7: тип акта и настройки прогона — в meta.json; старый meta.json без них читается."""
+    from app.contracts import RunMeta
+    from app.trace import load_json, new_run
+    rid = new_run("акт.docx", act_types=["господдержка"], comparison_regions=["Казань"], search_limits={3: 30})
+    meta = load_json(rid, "meta.json", RunMeta)
+    assert meta.act_types == ["господдержка"] and meta.comparison_regions == ["Казань"] and meta.search_limits == {3: 30}
+    old = RunMeta(run_id="r", act_filename="a", started_at="t", status="finished")
+    assert old.act_types == [] and old.comparison_regions is None and old.search_limits is None

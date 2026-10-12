@@ -307,3 +307,23 @@ def test_iter4_dialog_prompt():
     assert "«пометить: нигде не ведётся»" in text
     assert MarkNotTracked.model_fields["kind"].annotation.__args__[0] == "пометить: нигде не ведётся"
     assert "эксперт подсказал, где искать" in text and "«Вопросы органу»" in text
+
+
+
+def test_iter4_request_prompt_mandatory_block():
+    """АМ: агент запроса знает блок обязательных показателей; средние формы — как есть."""
+    text = " ".join(PROMPT_REQUEST.read_text(encoding="utf-8").split())
+    assert "<обязательные_показатели>" in text and "## ОБЯЗАТЕЛЬНЫЕ ПОКАЗАТЕЛИ (JSON)" in text
+    assert "Не переделывай их в счётчики" in text
+    from app.nodes.request import MANDATORY_HEADER
+    assert MANDATORY_HEADER == "## ОБЯЗАТЕЛЬНЫЕ ПОКАЗАТЕЛИ (JSON)"
+
+
+def test_iter4_developer_in_prompts():
+    """А: гипотезы, запрос и индикатор 10 берут разработчика из requisites.developers; паспорт ищет его в Гаранте."""
+    for path in (PROMPT_HYPOTHESES_VIOLATED, PROMPT_HYPOTHESES_NO_DATA, PROMPT_REQUEST, prompt_path(10)):
+        text = path.read_text(encoding="utf-8")
+        assert "requisites.developers" in text, path.name
+    passport = " ".join(PROMPT_PASSPORT.read_text(encoding="utf-8").split())
+    assert "Единственное исключение — орган-разработчик (developers)" in passport
+    assert "Correspondents(<topic> 0)" in passport

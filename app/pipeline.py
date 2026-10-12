@@ -89,7 +89,7 @@ from app.nodes.hypotheses import (
 from app.nodes.merge import merge_map
 from app.nodes.request import build_request
 from app.nodes.sort import sort_verdicts
-from app.nodes.passport import make_passport, passport_effective_year
+from app.nodes.passport import apply_user_developers, make_passport, passport_effective_year
 from app.nodes.verdicts import run_verdicts
 from app.trace import load_json, new_run, save_json, update_meta
 
@@ -398,6 +398,17 @@ def _finish(
     )
 
 
+def _run_settings(run_id: str) -> RunMeta:
+    """
+    Выбор пользователя при загрузке (2.7): тип акта, регионы сравнения, потолки поиска.
+    Нет meta.json или полей (прогон до 2.7) — значения по умолчанию.
+    """
+    try:
+        return load_json(run_id, "meta.json", RunMeta)
+    except Exception:
+        return RunMeta(run_id=run_id, act_filename="—", started_at="—", status="—")
+
+
 def run_pipeline(
     docx_path: str | Path,
     run_id: str | None = None,
@@ -442,6 +453,11 @@ def run_pipeline(
             )
             if passport is None:
                 raise RuntimeError("модель не вернула паспорт акта")
+            # 2.7 (А): разработчик, выбранный при загрузке, важнее ответа модели
+            user_developers = _run_settings(run_id).developers
+            if user_developers:
+                passport = apply_user_developers(passport, user_developers)
+                save_json(run_id, "02_passport.json", passport)
     except Exception as exc:
         empty = _build_summary([], HypothesisMap(), DataRequest(), None)
         return _finish(progress, run_id, "сбой", empty, f"паспорт акта: {type(exc).__name__}: {exc}")
@@ -449,12 +465,15 @@ def run_pipeline(
     # [2] двенадцать вердиктов параллельно, барьер внутри узла; готовность
     # каждого индикатора приходит колбэком по ходу — для счётчика "7 из 12"
     verdicts: list[Verdict] = []
+    settings = _run_settings(run_id)
     try:
         with _node(progress, "verdicts"):
             progress.indicators_started()
             verdicts = run_verdicts(
                 document_md, run_id,
                 passport=passport,
+                regions=settings.comparison_regions,
+                search_limits=settings.search_limits,
                 timeout_s=timeout_s,
                 max_budget_usd=max_budget_usd,
                 on_verdict=progress.indicator_done,
@@ -505,6 +524,7 @@ def run_pipeline(
                 passport=passport.model_dump(mode="json"),
                 effective_year=passport_effective_year(passport),
                 timeout_s=timeout_s, max_budget_usd=max_budget_usd,
+                act_types=settings.act_types,
             )
     except Exception:
         pass
@@ -513,7 +533,8 @@ def run_pipeline(
     # прогон; промежуточные артефакты при этом остаются на диске
     try:
         with _node(progress, "excel"):
-            excel_path = build_excel(hypothesis_map, request, buckets, passport, run_id)
+            excel_path = build_excel(hypothesis_map, request, buckets, passport, run_id,
+                                     act_types=settings.act_types)
     except Exception as exc:
         summary = _build_summary(verdicts, hypothesis_map, request, None)
         return _finish(progress, run_id, "сбой", summary, f"{type(exc).__name__}: {exc}")

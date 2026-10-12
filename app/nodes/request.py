@@ -41,7 +41,8 @@ from __future__ import annotations
 import json
 
 from app.config import ALLOWED_TOOLS_TEXT, PROMPT_REQUEST, REQUEST_YEARS_DEPTH
-from app.contracts import DataRequest, HypothesisMap, RequestOutput
+from app.contracts import DataRequest, HypothesisMap, RequestItem, RequestOutput
+from app.mandatory_indicators import mandatory_for
 from app.logger import get_run_logger
 from app.nodes.excel import compute_years
 from app.nodes.hypotheses import _add_cost_to_meta
@@ -77,6 +78,7 @@ def _build_document(
     document_md: str | None = None,
     passport: dict | None = None,
     existing: DataRequest | None = None,
+    mandatory: list[dict] | None = None,
 ) -> str:
     """
     Собрать документ для stdin: текст акта, паспорт, карта гипотез, годы бланка —
@@ -109,8 +111,43 @@ def _build_document(
         ]
         parts.append(f"{EXISTING_BLANK_HEADER}\n\n```json\n{json.dumps(blank, ensure_ascii=False, indent=2)}\n```\n")
     parts.append("## КАРТА ГИПОТЕЗ (JSON)\n\n" f"```json\n{rows_json}\n```\n")
+    if mandatory:
+        # 2.7 (АМ): обязательные показатели выбранных типов акта — дословно из формы Владимира
+        parts.append(f"{MANDATORY_HEADER}\n\n```json\n{json.dumps(mandatory, ensure_ascii=False, indent=2)}\n```\n")
     parts.append("## ГОДЫ БЛАНКА (JSON)\n\n" f"```json\n{json.dumps(years)}\n```\n")
     return "\n".join(parts)
+
+
+MANDATORY_HEADER = "## ОБЯЗАТЕЛЬНЫЕ ПОКАЗАТЕЛИ (JSON)"
+_KIND_RANK = {"показатель по годам": 0, "перечень или реестр": 1, "открытый вопрос": 2}
+
+
+def _mandatory_item(entry: dict) -> RequestItem:
+    """Обязательный показатель, который модель не включила, — позицией дословно из формы (Р4)."""
+    note = f"Разбивка из формы: {entry['breakdown']}" if entry["breakdown"] else None
+    return RequestItem(num="0", kind=entry["kind"], metric=entry["metric"], unit=entry["unit"],
+                       note=note, mandatory=list(entry["codes"]))
+
+
+def _ensure_mandatory(request: DataRequest, mandatory: list[dict], logger) -> DataRequest:
+    """
+    Каждый обязательный код — хотя бы в одной позиции. Пропущенный моделью показатель
+    код дописывает дословно (решение владельца Р4, 12.10: «всегда добавляются» иначе
+    не гарантировать) и пишет предупреждение.
+    """
+    covered = {c for it in request.items for c in it.mandatory}
+    added = [_mandatory_item(e) for e in mandatory if not set(e["codes"]) & covered]
+    for it in added:
+        logger.warning("request: обязательный показатель %s не вошёл в ответ модели — дописан кодом дословно",
+                       ", ".join(it.mandatory))
+    return request.model_copy(update={"items": request.items + added}) if added else request
+
+
+def _order_and_number(request: DataRequest) -> DataRequest:
+    """Порядок бланка: по родам (показатели → перечни → вопросы), внутри рода сначала обязательные; номера подряд."""
+    ordered = sorted(request.items, key=lambda it: (_KIND_RANK[it.kind], 0 if it.mandatory else 1))
+    items = [it.model_copy(update={"num": str(i)}) for i, it in enumerate(ordered, start=1)]
+    return request.model_copy(update={"items": items})
 
 
 # Источники показателей карты, которые уходят органу: цифры и (2.7, Ж2) вопросы словами
@@ -227,6 +264,7 @@ def build_request(
     existing: DataRequest | None = None,
     trace_prefix: str = "",
     save: bool = True,
+    act_types: list[str] | None = None,
 ) -> DataRequest:
     """
     Узел [6] — собрать запрос показателей одним вызовом модели по готовой карте.
@@ -243,10 +281,23 @@ def build_request(
     ни одна из них не роняет узел. Артефакты: сырой ответ сохраняет runner.call
     под именем 07_request.raw.json, готовый запрос — здесь под именем
     07_request.json. Стоимость прибавляется к уже записанной в meta.json.
+
+    act_types (2.7, АМ) — типы акта, выбранные при загрузке: их обязательные показатели
+    уходят модели отдельным блоком и гарантированно попадают в бланк (пропущенные
+    дописывает код). Только для нового бланка — в режиме дополнения не используются.
     """
     logger = get_run_logger(run_id).getChild("07_request")
     # Годы дополняемого бланка не пересчитываются от сегодняшней даты — они уже в нём
     years = existing.years if existing is not None else _request_years(effective_year)
+    mandatory = mandatory_for(act_types or []) if existing is None else []
+
+    if not hypothesis_map.rows and mandatory:
+        # Карта пуста, но тип акта выбран — бланк из одних обязательных показателей, модель не нужна
+        logger.info("request: строк карты нет — бланк из %d обязательных показателей", len(mandatory))
+        value = _order_and_number(_ensure_mandatory(DataRequest(items=[], years=years), mandatory, logger))
+        if save:
+            save_json(run_id, "07_request.json", value)
+        return value
 
     if not hypothesis_map.rows:
         # Карта пуста (все индикаторы соблюдены/не применимы) либо новых строк нет —
@@ -258,7 +309,7 @@ def build_request(
         return value
 
     instruction = PROMPT_REQUEST.read_text(encoding="utf-8")
-    document = _build_document(hypothesis_map, years, document_md, passport, existing)
+    document = _build_document(hypothesis_map, years, document_md, passport, existing, mandatory)
 
     result = call(
         instruction,
@@ -277,6 +328,8 @@ def build_request(
             result.error, "бланк без изменений" if existing is not None else "пустой запрос, годы по умолчанию",
         )
         value = existing if existing is not None else DataRequest(items=[], years=years)
+        if mandatory:
+            value = _order_and_number(_ensure_mandatory(value, mandatory, logger))
     else:
         # Годы — только от кода: модель их переписывает из входа, но решает не она
         value = result.value.model_copy(update={"years": years})
@@ -285,6 +338,8 @@ def build_request(
         _check_coverage(hypothesis_map, value, logger)
         if existing is not None:
             value = _append(existing, value)
+        elif mandatory:
+            value = _order_and_number(_ensure_mandatory(value, mandatory, logger))
 
     if save:
         save_json(run_id, "07_request.json", value)

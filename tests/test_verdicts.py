@@ -554,3 +554,16 @@ def test_region_labels_filled_from_run_list(run_id, tmp_prompts_dir, monkeypatch
     monkeypatch.setattr(verdicts_module, "call", mock_call)
     run_verdicts("текст", run_id, indicators=[11], regions=["Санкт-Петербург", "Казань"])
     assert mock_call.call_args_list[0].args[0] == "Начинай с 2 субъектов сравнения: Санкт-Петербург, Казань."
+
+
+
+def test_search_limit_label_filled_per_indicator(run_id, tmp_prompts_dir, monkeypatch):
+    """Л: потолок заходов — из настроек прогона, иначе из SEARCH_LIMITS конфига."""
+    from app.config import SEARCH_LIMITS
+    (tmp_prompts_dir / "02_indicator_03.md").write_text("ПОТОЛОК — {{ПОТОЛОК_ЗАХОДОВ}} ЗАХОДОВ.", encoding="utf-8")
+    mock_call = Mock(side_effect=_default_side_effect)
+    monkeypatch.setattr(verdicts_module, "call", mock_call)
+    run_verdicts("текст", run_id, indicators=[3])
+    assert mock_call.call_args_list[0].args[0] == f"ПОТОЛОК — {SEARCH_LIMITS[3]} ЗАХОДОВ."
+    run_verdicts("текст", run_id, indicators=[3], search_limits={3: 40})
+    assert mock_call.call_args_list[1].args[0] == "ПОТОЛОК — 40 ЗАХОДОВ."

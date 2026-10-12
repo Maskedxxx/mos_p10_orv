@@ -98,8 +98,21 @@ def run_dir(run_id: str) -> Path:
     return RUNS_DIR / run_id
 
 
-def new_run(act_filename: str) -> str:
-    """Создать папку прогона и стартовый meta.json. Возвращает run_id."""
+def new_run(
+    act_filename: str,
+    *,
+    act_types: list[str] | None = None,
+    comparison_regions: list[str] | None = None,
+    search_limits: dict[int, int] | None = None,
+    developers: list[str] | None = None,
+) -> str:
+    """
+    Создать папку прогона и стартовый meta.json. Возвращает run_id.
+
+    2.7 (итерация 4): выбор пользователя при загрузке — тип акта (АМ) и «Настройки
+    прогона» (регионы сравнения — К, потолки поиска — Л) — хранится в meta.json и
+    действует во всём прогоне и в диалоге по нему.
+    """
     run_id = _generate_run_id()
     path = run_dir(run_id)
     path.mkdir(parents=True, exist_ok=False)
@@ -112,6 +125,10 @@ def new_run(act_filename: str) -> str:
         cost_usd=0.0,
         status="started",
         current_node=None,
+        act_types=list(act_types or []),
+        comparison_regions=comparison_regions,
+        search_limits=search_limits,
+        developers=list(developers or []),
     )
     save_json(run_id, "meta.json", meta)
     return run_id

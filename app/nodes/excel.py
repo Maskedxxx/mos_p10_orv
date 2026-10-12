@@ -158,7 +158,21 @@ def _passport_header_line(passport: ActPassport | None) -> str | None:
         parts.append(r.number)
     if r.date:
         parts.append(f"от {r.date}")
-    return " ".join(parts) + f" ({r.authority})"
+    line = " ".join(parts) + f" ({r.authority})"
+    if r.developers:
+        # 2.7 (А): разработчик — откуда взят: выбор пользователя или пункты акта, по которым определён
+        line += ". Разработчик: " + "; ".join(_developer_label(d) for d in r.developers)
+    return line
+
+
+def _developer_label(d) -> str:
+    """«Департамент … (приложение 1; определено моделью по п. 1.5)» или «… (указан пользователем)»."""
+    if d.basis == "указан пользователем при загрузке":
+        how = "указан пользователем"
+    else:
+        how = f"определено моделью по {d.clauses}" if d.clauses else "определено моделью"
+    scope = f"{d.scope}; " if d.scope and d.scope != "весь акт" else ""
+    return f"{d.name} ({scope}{how})"
 
 
 _KIND_QUESTION = "открытый вопрос"
@@ -539,6 +553,7 @@ _MONTHS_RU = ("января", "февраля", "марта", "апреля", "�
 def _render_howto_sheet(
     wb: Workbook, passport: ActPassport | None,
     analyzed_at: datetime.datetime | None = None, version: int | None = None,
+    act_types: list[str] | None = None,
 ) -> None:
     """
     Лист «Как заполнять» — первый в книге, инструкция эксперту по образцу шаблона
@@ -559,12 +574,14 @@ def _render_howto_sheet(
     rendered = f"{moment.day} {_MONTHS_RU[moment.month - 1]} {moment.year}, {moment:%H:%M}"
     act = _passport_header_line(passport) or "—"
     rules = [
-        f"Пройдите три листа: «{_SHEET_MAP}», «{_SHEET_REQUEST}», «{_SHEET_VERDICTS}».",
+        f"Пройдите четыре листа: «{_SHEET_MAP}», «{_SHEET_REQUEST}», «{_SHEET_QUESTIONS}», «{_SHEET_VERDICTS}».",
         "Оранжевые столбцы справа — ваши. Синие столбцы менять не нужно.",
-        f"На листах «{_SHEET_MAP}» и «{_SHEET_REQUEST}» поставьте оценку от 1 до 5: "
+        f"На листах «{_SHEET_MAP}», «{_SHEET_REQUEST}» и «{_SHEET_QUESTIONS}» поставьте оценку от 1 до 5: "
         "щёлкните по ячейке и выберите значение из выпадающего списка.",
         f"На листе «{_SHEET_VERDICTS}» оценки нет. Там ответ «да» или «нет» на вопрос "
         "«Согласны?» — тоже из списка; если «нет», напишите рядом верный вердикт.",
+        f"Если на листе «{_SHEET_VERDICTS}» знаете, где лежат сведения для подсвеченного индикатора "
+        "(«нет данных»), — напишите это в графе «Где искать»: сервис проверит индикатор заново.",
         "Замечание пишите своими словами. Одно «неверно» нам не поможет — нужно, что именно не так.",
         "Готовый файл пришлите обратно. Имя файла не меняйте — по нему видно, о каком акте речь.",
     ]
@@ -574,6 +591,8 @@ def _render_howto_sheet(
         ("Заполнено сервисом", None, "section"),
         ("Акт", act, "row"),
         ("Разобран", rendered, "row"),
+        # 2.7 (АМ): по типу акта в бланк идут обязательные показатели формы
+        ("Тип акта", ", ".join(act_types) if act_types else "не указан", "row"),
     ] + ([("Версия файла", f"{version} — после правок в диалоге; исходный разбор сервиса — версия 0", "row")]
          if version else []) + [
         (None, None, "blank"),
@@ -664,7 +683,9 @@ def _format_request_sheet(ws: Worksheet, header_row: int) -> None:
             c.alignment = _CENTER
 
 
-def _render_source_rows_cell(for_rows: list[int], row_indicators: dict[int, list[int]]) -> str:
+def _render_source_rows_cell(
+    for_rows: list[int], row_indicators: dict[int, list[int]], mandatory: list[str] | None = None,
+) -> str:
     """
     Обратная ссылка на карту: «стр. N — инд. M», каждая на своей строке клетки.
 
@@ -673,7 +694,8 @@ def _render_source_rows_cell(for_rows: list[int], row_indicators: dict[int, list
     строк уже посчитаны узлом [6] в RequestItem.for_rows, индикаторы берутся
     из самой карты по row_id.
     """
-    lines = []
+    # 2.7 (АМ): обязательный показатель по типу акта — первой строкой, с кодом формы
+    lines = [f"обязательный ({', '.join(mandatory)})"] if mandatory else []
     for row_id in for_rows:
         nums = row_indicators.get(row_id)
         if nums is None:
@@ -701,7 +723,7 @@ def _request_metric_label(item: RequestItem) -> str:
 
 def _render_request_sheet(
     wb: Workbook, request: DataRequest, years: list[int], hyp_map: HypothesisMap,
-    caption: str, marks: Marks | None = None,
+    caption: str, marks: Marks | None = None, act_types: list[str] | None = None,
 ) -> None:
     """
     Лист «Запрос показателей»: № | Показатель | три года (пустые клетки).
@@ -722,7 +744,7 @@ def _render_request_sheet(
     def _append_item(item, year_cells) -> None:
         ws.append([
             item.num, _request_metric_label(item),
-            _render_source_rows_cell(item.for_rows, row_indicators),
+            _render_source_rows_cell(item.for_rows, row_indicators, item.mandatory),
             item.clause or "",
             *year_cells,
         ])
@@ -733,7 +755,17 @@ def _render_request_sheet(
     # открытые вопросы — на своём листе (2.7, Ж2), здесь только цифры и перечни
     counters = [it for it in request.items if it.kind not in (_KIND_LIST, _KIND_QUESTION)]
     lists = [it for it in request.items if it.kind == _KIND_LIST]
-    for item in counters:
+    mandatory_counters = [it for it in counters if it.mandatory]
+    if mandatory_counters:
+        # 2.7 (АМ): сначала обязательные показатели по типу акта, затем — из гипотез
+        types = ", ".join(t for t in (act_types or []) if t) or "не указан"
+        ws.append(["", f"Обязательные показатели (тип акта: {types})", "", "", *[""] * len(years)])
+    for item in mandatory_counters:
+        _append_item(item, empty_years)
+    other_counters = [it for it in counters if not it.mandatory]
+    if mandatory_counters and other_counters:
+        ws.append(["", "Показатели из гипотез", "", "", *[""] * len(years)])
+    for item in other_counters:
         _append_item(item, empty_years)
     if lists:
         # ОС экспертов (2026-09-04, Г2): «перечень — это надо не в этой таблице»,
@@ -895,6 +927,7 @@ def build_excel(
     marks: Marks | None = None,
     unverified_ids: dict[int, int] | None = None,
     analyzed_at: datetime.datetime | None = None,
+    act_types: list[str] | None = None,
 ) -> Path:
     """
     Узел [7] — собрать единый .xlsx из готовых карты, запроса и куч вердиктов.
@@ -909,7 +942,9 @@ def build_excel(
     бланка без годов.
 
     version, journal, marks, unverified_ids, analyzed_at — для версий диалогового
-    режима (план итерации 3, шаг 1.5); без них книга прежняя.
+    режима (план итерации 3, шаг 1.5); без них книга прежняя. act_types (2.7, АМ) —
+    тип акта, выбранный при загрузке: строка на листе «Как заполнять» и подзаголовок
+    обязательных показателей на листе запроса.
     """
     logger = get_run_logger(run_id).getChild("08_excel")
 
@@ -925,7 +960,7 @@ def build_excel(
     map_indicators |= {v.indicator for v in _unverified_verdicts(hypothesis_map, buckets)}
 
     wb = Workbook()
-    _render_howto_sheet(wb, passport, analyzed_at, version)   # первый лист — инструкция эксперту
+    _render_howto_sheet(wb, passport, analyzed_at, version, act_types)   # первый лист — инструкция эксперту
     _render_map_sheet(
         wb, hypothesis_map, row_to_nums, passport, buckets,
         f"Индикаторы, по которым найдено нарушение или не хватило данных — "
@@ -934,11 +969,18 @@ def build_excel(
         f"что нужна ручная проверка.",
         unverified, marks, row_to_question_nums,
     )
-    _render_request_sheet(
-        wb, request, years, hypothesis_map,
+    # 2.7 (А): бланк адресован разработчику — называем его, если он определён
+    developers = passport.requisites.developers if passport is not None else []
+    request_caption = (
+        "Заполняет: " + "; ".join(f"{d.name}" + (f" ({d.scope})" if d.scope and d.scope != "весь акт" else "")
+                                  for d in developers)
+        + ". Данные, которых нет в открытом доступе, три последних завершённых года."
+        if developers else
         "Данные, которых нет в открытом доступе. Заполняет орган-разработчик, "
-        "три последних завершённых года.",
-        marks,
+        "три последних завершённых года."
+    )
+    _render_request_sheet(
+        wb, request, years, hypothesis_map, request_caption, marks, act_types,
     )
     _render_questions_sheet(
         wb, request, hypothesis_map,

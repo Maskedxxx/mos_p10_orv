@@ -388,8 +388,10 @@ def _passport_dict(ctx: _Ctx) -> dict | None:
 
 def _prepare_recheck(ctx: _Ctx, op: RecheckIndicator, prefix: str) -> Candidate:
     start = _meta_cost(ctx.run_id)
+    meta = load_json(ctx.run_id, "meta.json", RunMeta)   # настройки прогона — те же, что при разборе (2.7)
     new = run_verdicts(ctx.document_md, ctx.run_id, passport=ctx.passport, indicators=[op.indicator],
-                       extra_instruction=op.clarification, trace_prefix=prefix, save=False)[0]
+                       extra_instruction=op.clarification, trace_prefix=prefix, save=False,
+                       regions=meta.comparison_regions, search_limits=meta.search_limits)[0]
     cost = _meta_cost(ctx.run_id) - start
     if new.verdict == "ошибка":
         raise OperationError(f"перепроверка не удалась: {new.rationale[:300]}")
@@ -560,7 +562,8 @@ def _commit(ctx: _Ctx, op: Operation, change: Change, cost: float) -> StepResult
         analyzed = datetime.datetime.fromisoformat(meta.finished_at) if meta.finished_at else None
         excel = build_excel(ctx.hyp_map, ctx.request, buckets, ctx.passport, run_id, version=n,
                             journal=versions.read_journal(run_id) + [entry], marks=state.marks,
-                            unverified_ids=state.unverified_ids, analyzed_at=analyzed)
+                            unverified_ids=state.unverified_ids, analyzed_at=analyzed,
+                            act_types=meta.act_types)
         versions.commit(run_id, state, [entry])
         _refresh_progress(run_id, ctx, excel)
     except Exception:
