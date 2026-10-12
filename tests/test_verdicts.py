@@ -574,3 +574,14 @@ def test_search_limit_label_filled_per_indicator(run_id, tmp_prompts_dir, monkey
     assert mock_call.call_args_list[0].args[0] == f"ПОТОЛОК — {SEARCH_LIMITS[3]} ЗАХОДОВ."
     run_verdicts("текст", run_id, indicators=[3], search_limits={3: 40})
     assert mock_call.call_args_list[1].args[0] == "ПОТОЛОК — 40 ЗАХОДОВ."
+
+
+
+def test_indicator_3_gets_longer_timeout(run_id, tmp_prompts_dir, monkeypatch):
+    """Индикатор 3 проверяет статус каждой ссылки в правовой базе — ему таймаут больше общего (живая проверка 12.10)."""
+    from app.config import INDICATOR_TIMEOUT_S
+    mock_call = Mock(side_effect=_default_side_effect)
+    monkeypatch.setattr(verdicts_module, "call", mock_call)
+    run_verdicts("текст", run_id, indicators=[3, 4], timeout_s=900)
+    by_n = {_n_from_trace_name(c.kwargs["trace_name"]): c.kwargs["timeout_s"] for c in mock_call.call_args_list}
+    assert by_n[3] == INDICATOR_TIMEOUT_S[3] > 900 and by_n[4] == 900

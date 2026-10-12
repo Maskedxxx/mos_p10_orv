@@ -33,6 +33,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from app.config import (
     CACHE_WARMUP_S,
     COMPARISON_REGIONS,
+    INDICATOR_TIMEOUT_S,
     SEARCH_LIMITS,
     all_indicators,
     get_indicator,
@@ -130,7 +131,7 @@ def _run_one_indicator(
             run_id=run_id,
             trace_name=f"{trace_prefix}03_verdicts/{n:02d}.raw.json",
             allowed_tools=allowed_tools,
-            timeout_s=timeout_s,
+            timeout_s=max(timeout_s, INDICATOR_TIMEOUT_S.get(n, 0)),   # 2.7: индикатору 3 — больше
             max_budget_usd=max_budget_usd,
             shared_context=shared,
             mcp_tools=garant_tools or None,
