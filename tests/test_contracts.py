@@ -698,3 +698,49 @@ def test_indicator02_reasoning_before_choice():
     from app.contracts import Indicator02Output
     order = list(Indicator02Output.model_json_schema()["properties"])
     assert order.index("submissions") < order.index("rationale") < order.index("verdict")
+
+
+# ---- Индикатор 3: таблица ссылок акта и рубрика вердикта (13.10, разбор узлов) ----
+
+
+def _ref(status: str) -> dict:
+    return {"kind": "акт", "name": "закон № 1", "clause": "п. 1", "found": "в базе", "status": status}
+
+
+def _ind03(verdict: str, refs: list) -> dict:
+    extra = {"missing_data": "статус закона № 1"} if verdict == "нет данных" else {}
+    return {"indicator": 3, "name": "актуальность законодательства", "references": refs,
+            "rationale": "полный разбор", "verdict": verdict, "rationale_brief": _B, **extra}
+
+
+@pytest.mark.parametrize("verdict, refs", [
+    ("нарушен", [_ref("устарело"), _ref("не проверено"), _ref("актуально")]),
+    ("нет данных", [_ref("не проверено"), _ref("актуально")]),
+    ("соблюдён", [_ref("актуально"), _ref("актуально")]),
+    ("не применимо", []),
+])
+def test_indicator03_verdict_follows_references(verdict, refs):
+    from app.contracts import Indicator03Output
+    assert Indicator03Output(**_ind03(verdict, refs)).verdict == verdict
+
+
+@pytest.mark.parametrize("verdict, refs", [
+    ("соблюдён", [_ref("актуально"), _ref("не проверено")]),   # непроверенная ссылка — не «соблюдён»
+    ("нет данных", [_ref("устарело"), _ref("не проверено")]),
+    ("нарушен", [_ref("актуально")]),
+    ("соблюдён", []),
+    ("нет данных", []),
+    ("не применимо", [_ref("актуально")]),
+])
+def test_indicator03_verdict_contradicting_references_rejected(verdict, refs):
+    from app.contracts import Indicator03Output
+    with pytest.raises(ValidationError):
+        Indicator03Output(**_ind03(verdict, refs))
+
+
+def test_indicator03_reasoning_before_choice():
+    from app.contracts import CheckedReference, Indicator03Output
+    order = list(Indicator03Output.model_json_schema()["properties"])
+    assert order.index("references") < order.index("rationale") < order.index("verdict")
+    ref = list(CheckedReference.model_json_schema()["properties"])
+    assert ref.index("found") < ref.index("status")   # сначала что показал источник, потом статус

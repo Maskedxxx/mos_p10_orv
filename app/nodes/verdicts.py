@@ -41,7 +41,7 @@ from app.config import (
     indicator_tools,
     prompt_path,
 )
-from app.contracts import ActPassport, Indicator01Output, Indicator02Output, Verdict, VerdictOutput
+from app.contracts import ActPassport, Indicator01Output, Indicator02Output, Indicator03Output, Verdict, VerdictOutput
 from app.logger import get_run_logger
 from app.runner import call
 from app.nodes.hypotheses import _add_cost_to_meta, _after, append_task_clarification
@@ -81,7 +81,7 @@ def fill_prompt_labels(prompt_text: str, regions: list[str] | None = None, limit
 
 # Свой контракт индикатора (13.10, разбор узлов): артефакт проверки и рубрика вердикта — в описаниях
 # полей, поля артефакта стоят перед разбором и вердиктом. Остальные индикаторы — общий VerdictOutput.
-INDICATOR_OUTPUT: dict[int, type] = {1: Indicator01Output, 2: Indicator02Output}
+INDICATOR_OUTPUT: dict[int, type] = {1: Indicator01Output, 2: Indicator02Output, 3: Indicator03Output}
 
 
 def _split_artifacts(value: Any) -> tuple[Verdict, dict[str, Any]]:

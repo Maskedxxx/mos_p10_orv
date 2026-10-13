@@ -754,6 +754,7 @@ def test_call_with_mcp_passes_token_and_proxy_only_in_env(tmp_runs_dir, valid_ve
     assert env["GARANT_TOKEN"] == "SECRET-TOKEN-123"
     assert env["HTTPS_PROXY"] == "http://p:1"
     assert env["NO_PROXY"] == "localhost,mcp.garant.ru"   # Гарант — мимо прокси, модель — через него
+    assert env["MAX_MCP_OUTPUT_TOKENS"] == "100000"       # большой ответ Гаранта — агенту, а не в файл
     assert env["FORCE_PROMPT_CACHING_5M"] == "1"
     assert env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1"
     assert "SECRET-TOKEN-123" not in " ".join(mock_run.call_args.args[0])
