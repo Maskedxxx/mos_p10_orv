@@ -17,8 +17,37 @@ from unittest.mock import Mock
 import pytest
 from pydantic import BaseModel, ConfigDict
 
+import sys
+import threading
+import time
+
+import app.runner as runner_mod
 from app.contracts import Verdict
 from app.runner import CallResult, _build_cmd, call, call_text
+from app.runner import _exec as _REAL_EXEC   # настоящий построчный запуск — до подмены фикстурой ниже
+
+
+@pytest.fixture(autouse=True)
+def _exec_via_subprocess_run(request, monkeypatch):
+    """
+    Переходник для тестов цикла попыток: запуск процесса (_exec, построчное чтение stream-json)
+    подменяется вызовом subprocess.run с теми же аргументами, что были до 2.7, — тесты подменяют
+    subprocess.run и проверяют команду, окружение, документ и таймаут. Сам _exec проверяется
+    на настоящем процессе — тесты «_exec» внизу файла; живой тест идёт через настоящий _exec.
+    """
+    if request.node.get_closest_marker("live"):
+        return
+
+    def fake(cmd, *, timeout_s, env, document, stream_path, attempt):
+        kwargs = {"capture_output": True, "text": True, "timeout": timeout_s}
+        if env is not None:
+            kwargs["env"] = env
+        if document is not None:
+            kwargs["input"] = document
+        else:
+            kwargs["stdin"] = subprocess.DEVNULL
+        return subprocess.run(cmd, **kwargs)
+    monkeypatch.setattr(runner_mod, "_exec", fake)
 
 
 # ---- Вспомогательные фабрики для мока subprocess.run ----
@@ -691,9 +720,11 @@ def test_mcp_tools_command_flags():
 
 
 def test_without_mcp_tools_isolation_unchanged():
-    """Без Гаранта команда побайтно прежняя (до 2.7): та же изоляция, тот же порядок флагов."""
+    """Без Гаранта команда прежняя (до 2.7): та же изоляция, тот же порядок флагов; формат вывода — построчный
+    (stream-json, мониторинг 2.7)."""
     from app.config import EFFORT, MODEL
-    expected = ["claude", "-p", "т", "--json-schema", "{}", "--output-format", "json", "--tools", "WebSearch",
+    expected = ["claude", "-p", "т", "--json-schema", "{}", "--output-format", "stream-json", "--verbose",
+                "--tools", "WebSearch",
                 "--allowedTools", "WebSearch", "--strict-mcp-config", "--safe-mode", "--permission-mode", "dontAsk",
                 "--model", MODEL, "--effort", EFFORT]
     assert _build_cmd("т", "{}", ["WebSearch"], None, None) == expected
@@ -828,3 +859,112 @@ def test_call_text_logs_agent_events(tmp_runs_dir, monkeypatch):
     call_text("и", None, run_id=rid, trace_name="dialog/turns/01.raw.json", allowed_tools=[])
     kinds = [e["event"] for e in read_events(rid) if e["event"].startswith("agent_")]
     assert kinds == ["agent_started", "agent_attempt", "agent_finished"]
+
+
+
+# ---- _exec: ход агента построчно (2.7, мониторинг, шаг 2) ----
+# Вместо claude — маленький скрипт на Python: печатает события stream-json с паузами,
+# читает stdin, умеет зависать. Так проверяется настоящий процесс, без модели.
+
+_FAKE_AGENT = r"""
+import json, sys, time
+mode = sys.argv[1]
+doc = sys.stdin.read() if mode != "nostdin" else ""
+def out(e):
+    print(json.dumps(e, ensure_ascii=False), flush=True)
+out({"type": "system", "subtype": "init", "doc_len": len(doc)})
+if mode == "hang":
+    time.sleep(30)
+if mode == "garbage":
+    print("это не JSON", flush=True)
+time.sleep(0.4)
+out({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "mcp__garant__garant_search"}]}})
+time.sleep(0.4)
+out({"type": "result", "subtype": "success", "result": "{}", "total_cost_usd": 0.01})
+print("предупреждение", file=sys.stderr)
+sys.exit(3 if mode == "fail" else 0)
+"""
+
+
+def _fake_cmd(mode: str) -> list[str]:
+    return [sys.executable, "-c", _FAKE_AGENT, mode]
+
+
+def test_exec_writes_each_event_while_agent_works(tmp_path):
+    """Событие попадает в файл хода сразу, пока агент ещё работает; в конце stdout — тот же список событий,
+    что был при --output-format json (итоговый .raw.json не меняется)."""
+    stream = tmp_path / "03.stream.jsonl"
+    box = {}
+    worker = threading.Thread(target=lambda: box.update(proc=_REAL_EXEC(
+        _fake_cmd("ok"), timeout_s=30, env=None, document="акт", stream_path=stream, attempt=1)))
+    worker.start()
+    deadline = time.monotonic() + 10
+    while not (stream.is_file() and stream.read_text(encoding="utf-8").strip()) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    seen_live = len(stream.read_text(encoding="utf-8").splitlines())
+    worker.join()
+    assert 1 <= seen_live < 3                       # первое событие видно до конца работы агента
+    proc = box["proc"]
+    events = json.loads(proc.stdout)
+    assert [e["type"] for e in events] == ["system", "assistant", "result"]
+    assert events[0]["doc_len"] == len("акт")       # документ дошёл через stdin
+    lines = [json.loads(line) for line in stream.read_text(encoding="utf-8").splitlines()]
+    assert [ln["event"]["type"] for ln in lines] == ["system", "assistant", "result"]
+    assert all(ln["attempt"] == 1 and ln["ts"] for ln in lines)
+    assert proc.returncode == 0 and "предупреждение" in proc.stderr
+
+
+def test_exec_timeout_keeps_partial_trace(tmp_path):
+    """Зависший агент убивается по таймауту; что он успел сделать — и в файле хода, и в TimeoutExpired."""
+    stream = tmp_path / "03.stream.jsonl"
+    started = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired) as exc_info:
+        _REAL_EXEC(_fake_cmd("hang"), timeout_s=1, env=None, document=None, stream_path=stream, attempt=2)
+    assert time.monotonic() - started < 10
+    partial = json.loads(exc_info.value.output)
+    assert [e["type"] for e in partial] == ["system"]
+    lines = [json.loads(line) for line in stream.read_text(encoding="utf-8").splitlines()]
+    assert lines[0]["attempt"] == 2 and lines[0]["event"]["type"] == "system"
+
+
+def test_exec_appends_attempts_to_one_file(tmp_path):
+    """Повторная попытка того же агента дописывается в тот же файл хода со своим номером."""
+    stream = tmp_path / "03.stream.jsonl"
+    _REAL_EXEC(_fake_cmd("ok"), timeout_s=30, env=None, document="", stream_path=stream, attempt=1)
+    _REAL_EXEC(_fake_cmd("ok"), timeout_s=30, env=None, document="", stream_path=stream, attempt=2)
+    attempts = [json.loads(line)["attempt"] for line in stream.read_text(encoding="utf-8").splitlines()]
+    assert attempts == [1, 1, 1, 2, 2, 2]
+
+
+def test_exec_non_json_line_returns_raw_text(tmp_path):
+    """Строка не JSON — stdout отдаётся как есть: цикл попыток увидит «вывод не разбирается», как раньше."""
+    stream = tmp_path / "s.jsonl"
+    proc = _REAL_EXEC(_fake_cmd("garbage"), timeout_s=30, env=None, document="", stream_path=stream, attempt=1)
+    assert "это не JSON" in proc.stdout
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(proc.stdout)
+    assert any(json.loads(line).get("text") == "это не JSON" for line in stream.read_text(encoding="utf-8").splitlines())
+
+
+def test_exec_passes_return_code(tmp_path):
+    """Код возврата процесса — как есть."""
+    proc = _REAL_EXEC(_fake_cmd("fail"), timeout_s=30, env=None, document="", stream_path=tmp_path / "s.jsonl",
+                      attempt=1)
+    assert proc.returncode == 3
+
+
+def test_call_streams_to_file_next_to_raw(tmp_runs_dir, valid_verdict_ok, monkeypatch):
+    """Цикл попыток передаёт _exec файл хода рядом с сырым ответом (03.stream.jsonl) и номер попытки;
+    команда — stream-json."""
+    seen = []
+    bad = _stdout_with_events(_result_event("не json", session_id="s-1"))
+
+    def fake(cmd, *, timeout_s, env, document, stream_path, attempt):
+        seen.append((cmd, stream_path, attempt))
+        return _proc(bad if attempt == 1 else _ok_stdout(valid_verdict_ok))
+    monkeypatch.setattr(runner_mod, "_exec", fake)
+    assert call("и", "док", Verdict, run_id="run_st", trace_name="03_verdicts/03.raw.json", allowed_tools=[]).ok
+    assert [a for _, _, a in seen] == [1, 2]
+    assert all(p == tmp_runs_dir / "run_st" / "03_verdicts" / "03.stream.jsonl" for _, p, _ in seen)
+    cmd = seen[0][0]
+    assert cmd[cmd.index("--output-format") + 1] == "stream-json" and "--verbose" in cmd

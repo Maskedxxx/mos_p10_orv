@@ -2,7 +2,7 @@
 Обёртка над `claude -p` — единая точка запуска модели для узлов пайплайна П-10.
 
 Берёт на себя: сборку команды, передачу документа через stdin, разбор вывода
-`--output-format json`, валидацию ответа и ретраи при сбоях. Про доменную логику
+`--output-format stream-json`, валидацию ответа и ретраи при сбоях. Про доменную логику
 (что делать с провалившимся результатом) ничего не знает — просто возвращает
 CallResult(ok=False, ...), решение остаётся за вызывающим узлом (например узел
 вердиктов сам соберёт Verdict со статусом "ошибка").
@@ -35,6 +35,14 @@ _run_attempt): все ретраятся полным повтором, БЕЗ -
 
 Сырой stdout сохраняется на КАЖДОЙ попытке через trace.save_raw (в обоих режимах) —
 прямое требование владельца: без сырых ответов нечем отлаживать сбои модели.
+
+Ход агента построчно (2.7, мониторинг). CLI запускается с `--output-format stream-json
+--verbose`: события (поиск, вызов Гаранта, ответ инструмента, итог) приходят по одному,
+пока агент работает, и каждое сразу пишется в файл хода рядом с сырым ответом
+(03_verdicts/03.stream.jsonl: время, номер попытки, событие). При обрыве по таймауту
+в нём остаётся всё, что агент успел. Проба 13.10 (CLI 2.1.292): события stream-json те же,
+что список при `--output-format json`, поэтому сырой ответ .raw.json собирается из них
+и остаётся прежнего вида — его читают диалог, трейсы и скрипты сравнения (см. _exec).
 
 Кэш (2.6). Общий для группы агентов текст (акт и паспорт) передаётся не в stdin,
 а файлом в системный промпт (--append-system-prompt-file, shared_context): кэш
@@ -73,7 +81,10 @@ import json
 import logging
 import os
 import subprocess
+import threading
 import time
+from datetime import datetime
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Generic, TypeVar
 
@@ -83,7 +94,7 @@ from app.config import (
     CLI_SETTINGS_FILE, EFFORT, GARANT_MCP_CONFIG, GARANT_NO_PROXY_HOST, GARANT_TOKEN_FILE, MODEL,
 )
 from app.logger import get_run_logger
-from app.trace import log_event, save_bytes, save_raw
+from app.trace import log_event, run_dir, save_bytes, save_raw
 
 # Тип модели ответа для call() — только pydantic-модели (--json-schema требует схему)
 ModelT = TypeVar("ModelT", bound=BaseModel)
@@ -198,7 +209,7 @@ def _build_cmd(
     # Инструменты Гаранта одобряются по полным именам; встроенные (--tools) — как раньше
     approved = allowed_tools + [_GARANT_TOOL_PREFIX + t for t in (mcp_tools or [])]
     cmd += [
-        "--output-format", "json",
+        "--output-format", "stream-json", "--verbose",
         "--tools", ",".join(allowed_tools),         # доступны ровно встроенные инструменты узла
         "--allowedTools", " ".join(approved),       # и они же (плюс Гарант) одобрены без запроса
         *(_MCP_ISOLATION_FLAGS if mcp_tools else _ISOLATION_FLAGS),
@@ -304,6 +315,103 @@ def _log_agent_finished(run_id: str, trace_name: str, result: "CallResult") -> N
               error=(result.error or "")[:500] or None)
 
 
+def _stream_path(run_id: str, trace_name: str) -> Path:
+    """Файл хода агента рядом с его сырым ответом: 03_verdicts/03.raw.json → 03_verdicts/03.stream.jsonl."""
+    return run_dir(run_id) / (trace_name.removesuffix(".raw.json") + ".stream.jsonl")
+
+
+def _as_stdout(lines: list[str]) -> str:
+    """
+    Строки stream-json → stdout прежнего вида (до 2.7 — `--output-format json`): JSON-список
+    тех же событий. Если хоть одна строка не JSON — текст как есть: цикл попыток увидит
+    «вывод не разбирается как JSON», как и раньше.
+    """
+    events = []
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            return "".join(lines)
+    return json.dumps(events, ensure_ascii=False)
+
+
+def _exec(
+    cmd: list[str],
+    *,
+    timeout_s: int,
+    env: dict[str, str] | None,
+    document: str | None,
+    stream_path: Path,
+    attempt: int,
+) -> subprocess.CompletedProcess:
+    """
+    Запустить claude -p и читать его вывод построчно: каждое событие сразу дописывается в файл
+    хода (время, попытка, событие — или text, если строка не JSON). Документ уходит в stdin
+    отдельным потоком, stderr читается своим — иначе большой документ и полный канал вывода
+    заперли бы друг друга.
+
+    Возвращает CompletedProcess со stdout прежнего вида (см. _as_stdout). Таймаут — процесс
+    убивается, бросается subprocess.TimeoutExpired с тем, что агент успел вывести (output),
+    как это делал subprocess.run.
+    """
+    proc = subprocess.Popen(
+        cmd, stdin=subprocess.PIPE if document is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", env=env,
+    )
+    lines: list[str] = []
+    stderr_parts: list[str] = []
+    stream_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def feed() -> None:
+        # Документ в stdin; агент может закрыть вход раньше — это не сбой записи
+        try:
+            proc.stdin.write(document)
+        except (BrokenPipeError, OSError):
+            pass
+        finally:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+
+    def read_out() -> None:
+        # Каждая строка — в файл хода сразу (flush), чтобы её было видно до конца работы агента
+        with open(stream_path, "a", encoding="utf-8") as f:
+            for line in proc.stdout:
+                lines.append(line)
+                if not line.strip():
+                    continue
+                entry: dict[str, Any] = {"ts": datetime.now().isoformat(timespec="milliseconds"), "attempt": attempt}
+                try:
+                    entry["event"] = json.loads(line)
+                except json.JSONDecodeError:
+                    entry["text"] = line.rstrip("\n")
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                f.flush()
+
+    def read_err() -> None:
+        stderr_parts.append(proc.stderr.read())
+
+    threads = [threading.Thread(target=read_out, daemon=True), threading.Thread(target=read_err, daemon=True)]
+    if document is not None:
+        threads.append(threading.Thread(target=feed, daemon=True))
+    for t in threads:
+        t.start()
+    try:
+        proc.wait(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        for t in threads:
+            t.join(timeout=10)
+        raise subprocess.TimeoutExpired(cmd, timeout_s, output=_as_stdout(lines)) from None
+    for t in threads:
+        t.join()
+    return subprocess.CompletedProcess(cmd, proc.returncode, _as_stdout(lines), "".join(stderr_parts))
+
+
 def _run_attempt(
     cmd: list[str],
     document: str | None,
@@ -312,6 +420,7 @@ def _run_attempt(
     run_id: str,
     trace_name: str,
     env: dict[str, str] | None = None,
+    attempt: int = 1,
 ) -> _AttemptOutcome:
     """
     Выполнить один запуск процесса claude -p: собрать kwargs, запустить, сохранить
@@ -323,16 +432,9 @@ def _run_attempt(
     решает вызывающая функция.
     """
     attempt_started = time.monotonic()
-    run_kwargs: dict[str, Any] = {"capture_output": True, "text": True, "timeout": timeout_s}
-    if env is not None:
-        run_kwargs["env"] = env
-    if send_document and document is not None:
-        run_kwargs["input"] = document
-    else:
-        run_kwargs["stdin"] = subprocess.DEVNULL
-
     try:
-        proc = subprocess.run(cmd, **run_kwargs)
+        proc = _exec(cmd, timeout_s=timeout_s, env=env, document=document if send_document else None,
+                     stream_path=_stream_path(run_id, trace_name), attempt=attempt)
     except FileNotFoundError as exc:
         raise RuntimeError(f"бинарь 'claude' не найден: {exc}") from exc
     except subprocess.TimeoutExpired as exc:
@@ -473,7 +575,7 @@ def call(
 
         cmd = _build_cmd(message, schema_json, allowed_tools, resume_session_id, max_budget_usd, model, system_file,
                          mcp_tools)
-        outcome = _run_attempt(cmd, document, send_document, timeout_s, run_id, trace_name, env)
+        outcome = _run_attempt(cmd, document, send_document, timeout_s, run_id, trace_name, env, attempt)
 
         session_id = outcome.session_id or session_id
         cost_total += outcome.cost_usd
@@ -592,7 +694,7 @@ def call_text(
         attempts_made = attempt
 
         cmd = _build_cmd(instruction, None, allowed_tools, None, max_budget_usd)
-        outcome = _run_attempt(cmd, document, True, timeout_s, run_id, trace_name)
+        outcome = _run_attempt(cmd, document, True, timeout_s, run_id, trace_name, attempt=attempt)
 
         session_id = outcome.session_id or session_id
         cost_total += outcome.cost_usd
