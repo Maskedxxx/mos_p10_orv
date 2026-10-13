@@ -26,6 +26,10 @@ def short_tool(name: str) -> str:
 
 def error_kind(text: str) -> str:
     """Вид ошибки инструмента — по тексту ответа (как в разборе живой проверки 12.10)."""
+    if "does not match required schema" in text or "could not be parsed as JSON" in text:
+        return SCHEMA_RETRY
+    if "No such tool available" in text:
+        return "нет такого инструмента"
     if "denied because" in text or "Permission to use" in text:
         return "не разрешён агенту"
     if "transport dropped" in text or "session expired" in text or "ECONNRESET" in text:

@@ -33,6 +33,8 @@ def _agent_events(ok: bool = True) -> list[dict]:
         res(4, "Output does not match required schema: /x", True),
         use(5, "WebFetch", {"url": "https://mos.ru"}),
         res(5, "timeout of 60000ms exceeded", True),
+        use(6, "mcp__garant__garant_entry_text", {"topic": 1}),
+        res(6, "<tool_use_error>Error: No such tool available: mcp__garant__garant_entry_text</tool_use_error>", True),
     ]
     if ok:
         events.append({"type": "result", "subtype": "success", "total_cost_usd": 0.37, "num_turns": 20,
@@ -70,7 +72,8 @@ def test_report_shows_agents_tools_and_problems(tmp_runs_dir):
     assert "garant_search×1" in line and "garant_document_redactions×1" in line and "StructuredOutput" not in line.split("⚠")[0]
     assert "обрыв связи×1" in line and "не разрешён агенту×1" in line
     problems = text.split("== Проблемы")[1]
-    assert "агент 03_verdicts/03: ошибки инструментов {'обрыв связи': 1, 'таймаут': 1}" in problems   # запрет и схема — не проблемы
+    assert ("агент 03_verdicts/03: ошибки инструментов {'обрыв связи': 1, 'таймаут': 1, 'нет такого инструмента': 1}"
+            in problems)   # запрет изоляцией и ответ не по схеме — не проблемы
     assert "узел sort: сломалось" in problems
     assert "Excel не собран" in problems
     assert "обязательных 1" in text and "'открытый вопрос': 1" in text
@@ -101,6 +104,7 @@ def test_watch_merges_journal_and_agent_stream(tmp_runs_dir, capsys):
     assert "агент 03_verdicts/03" in out and "→ garant_search query=152-ПП" in out
     assert "⚠ ошибка инструмента (обрыв связи)" in out
     assert "итог: success · $0.37 · ходов 20 · 760 с" in out
+    assert "⚠ ошибка инструмента (ответ не прошёл проверку CLI (модель исправила))" in out
 
 
 def test_watch_reads_only_new_complete_lines(tmp_runs_dir):
