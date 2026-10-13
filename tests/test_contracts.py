@@ -651,3 +651,50 @@ def test_indicator01_verdict_contradicting_documents_rejected(verdict, docs):
     from app.contracts import Indicator01Output
     with pytest.raises(ValidationError):
         Indicator01Output(**_ind01(verdict, docs))
+
+
+# ---- Индикатор 2: таблица подач документов и рубрика вердикта (13.10, разбор узлов) ----
+
+
+def _sub(method: str) -> dict:
+    return {"what": "заявление", "clause": "п. 1", "method": method}
+
+
+def _ind02(verdict: str, subs: list) -> dict:
+    extra = {"missing_data": "порядок в акте Б"} if verdict == "нет данных" else {}
+    return {"indicator": 2, "name": "электронная подача документов", "submissions": subs,
+            "rationale": "полный разбор", "verdict": verdict, "rationale_brief": _B, **extra}
+
+
+@pytest.mark.parametrize("verdict, subs", [
+    ("нарушен", [_sub("только на бумаге"), _sub("только электронно")]),
+    ("нарушен", [_sub("способ не назван")]),                     # решение владельца 13.10
+    ("нарушен", [_sub("электронно, но обязательна бумага")]),
+    ("нарушен", [_sub("электронно, но не для всех заявителей")]),
+    ("соблюдён", [_sub("только электронно"), _sub("электронно или на бумаге — на выбор")]),
+    ("не применимо", []),
+    ("нет данных", []),
+])
+def test_indicator02_verdict_follows_submissions(verdict, subs):
+    from app.contracts import Indicator02Output
+    assert Indicator02Output(**_ind02(verdict, subs)).verdict == verdict
+
+
+@pytest.mark.parametrize("verdict, subs", [
+    ("соблюдён", [_sub("способ не назван")]),
+    ("нарушен", [_sub("только электронно")]),
+    ("не применимо", [_sub("только электронно")]),
+    ("соблюдён", []),
+    ("нет данных", [_sub("только на бумаге")]),
+    ("нет данных", [_sub("только электронно")]),   # подачи в тексте есть и все электронные — «соблюдён»
+])
+def test_indicator02_verdict_contradicting_submissions_rejected(verdict, subs):
+    from app.contracts import Indicator02Output
+    with pytest.raises(ValidationError):
+        Indicator02Output(**_ind02(verdict, subs))
+
+
+def test_indicator02_reasoning_before_choice():
+    from app.contracts import Indicator02Output
+    order = list(Indicator02Output.model_json_schema()["properties"])
+    assert order.index("submissions") < order.index("rationale") < order.index("verdict")
