@@ -837,3 +837,48 @@ def test_indicator05_reasoning_before_choice():
     assert order.index("refusals") < order.index("rationale") < order.index("verdict")
     row = list(DocumentRefusal.model_json_schema()["properties"])
     assert row.index("fix_where") < row.index("fix")
+
+
+# ---- Индикатор 6: таблица требований, срок действия, рубрика вердикта (13.10, разбор узлов) ----
+
+
+def _req6(kind: str) -> dict:
+    return {"requirement": "соблюдать расстояние", "clause": "п. 1", "basis": "норма акта", "kind": kind}
+
+
+def _ind06(verdict: str, rows: list, term: str | None, term_check: str) -> dict:
+    return {"indicator": 6, "name": "наличие срока действия требования", "requirements": rows, "term": term,
+            "term_check": term_check, "rationale": "полный разбор", "verdict": verdict, "rationale_brief": _B}
+
+
+@pytest.mark.parametrize("verdict, rows, term, term_check", [
+    ("нарушен", [_req6("устанавливает сам")], None, "срока нет"),
+    ("нарушен", [_req6("устанавливает сам")], "действует до 2040 г. (п. 5)", "больше 6 лет без объяснения"),
+    ("соблюдён", [_req6("устанавливает сам"), _req6("разъясняет")], "действует до 2030 г. (п. 5)", "до 6 лет"),
+    ("не применимо", [_req6("разъясняет"), _req6("не обязательное требование")], None, "срока нет"),
+    ("не применимо", [], None, "срока нет"),
+])
+def test_indicator06_verdict_follows_requirements_and_term(verdict, rows, term, term_check):
+    from app.contracts import Indicator06Output
+    assert Indicator06Output(**_ind06(verdict, rows, term, term_check)).verdict == verdict
+
+
+@pytest.mark.parametrize("verdict, rows, term, term_check", [
+    ("соблюдён", [_req6("устанавливает сам")], None, "срока нет"),
+    ("нарушен", [_req6("разъясняет")], None, "срока нет"),
+    ("нарушен", [_req6("устанавливает сам")], "действует до 2030 г.", "до 6 лет"),
+    ("нарушен", [_req6("устанавливает сам")], "действует до 2030 г.", "срока нет"),   # term и оценка расходятся
+    ("нарушен", [_req6("устанавливает сам")], None, "до 6 лет"),
+])
+def test_indicator06_verdict_contradicting_table_rejected(verdict, rows, term, term_check):
+    from app.contracts import Indicator06Output
+    with pytest.raises(ValidationError):
+        Indicator06Output(**_ind06(verdict, rows, term, term_check))
+
+
+def test_indicator06_reasoning_before_choice():
+    from app.contracts import ActRequirement, Indicator06Output
+    order = list(Indicator06Output.model_json_schema()["properties"])
+    assert order.index("requirements") < order.index("term") < order.index("term_check") < order.index("rationale") < order.index("verdict")
+    row = list(ActRequirement.model_json_schema()["properties"])
+    assert row.index("basis") < row.index("kind")
