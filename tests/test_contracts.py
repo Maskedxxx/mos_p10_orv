@@ -927,3 +927,46 @@ def test_indicator07_reasoning_before_choice():
     assert order.index("procedures") < order.index("repeats") < order.index("rationale") < order.index("verdict")
     row = list(RepeatedStep.model_json_schema()["properties"])
     assert row.index("difference") < row.index("outcome")
+
+
+# ---- Индикатор 8: таблица документов пакета, рубрика вердикта (13.10, разбор узлов) ----
+
+
+def _doc8(mark: str) -> dict:
+    return {"name": "гарантийное письмо", "clause": "п. 1", "made_by": "сам заявитель", "overlap": "нет", "mark": mark}
+
+
+def _ind08(verdict: str, rows: list) -> dict:
+    return {"indicator": 8, "name": "оптимальный пакет документов", "documents": rows,
+            "rationale": "полный разбор", "verdict": verdict, "rationale_brief": _B}
+
+
+@pytest.mark.parametrize("verdict, rows", [
+    ("нарушен", [_doc8("повторяет другой"), _doc8("сам, нужен")]),
+    ("нарушен", [_doc8("не сам без причины")]),
+    ("соблюдён", [_doc8("сам, нужен")]),
+    ("не применимо", []),
+])
+def test_indicator08_verdict_follows_documents(verdict, rows):
+    from app.contracts import Indicator08Output
+    assert Indicator08Output(**_ind08(verdict, rows)).verdict == verdict
+
+
+@pytest.mark.parametrize("verdict, rows", [
+    ("соблюдён", [_doc8("повторяет другой")]),
+    ("нарушен", [_doc8("сам, нужен")]),
+    ("соблюдён", []),
+    ("не применимо", [_doc8("сам, нужен")]),
+])
+def test_indicator08_verdict_contradicting_documents_rejected(verdict, rows):
+    from app.contracts import Indicator08Output
+    with pytest.raises(ValidationError):
+        Indicator08Output(**_ind08(verdict, rows))
+
+
+def test_indicator08_reasoning_before_choice():
+    from app.contracts import Indicator08Output, PackageDocument
+    order = list(Indicator08Output.model_json_schema()["properties"])
+    assert order.index("documents") < order.index("rationale") < order.index("verdict")
+    row = list(PackageDocument.model_json_schema()["properties"])
+    assert row.index("made_by") < row.index("mark") and row.index("overlap") < row.index("mark")

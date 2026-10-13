@@ -247,7 +247,7 @@ _ITER4_ADDED = {
     5: ["исправить в той же заявке"],   # 13.10 — рубрика в контракте
     6: ["247-ФЗ", "устанавливает сам", "дата вступления в силу"],   # 13.10 — рубрика в контракте
     7: ["явный повтор"],   # Ш — 13.10 в контракте: «повторно проходит то же согласование», «второй этап»
-    8: ["{{РЕГИОНЫ_СРАВНЕНИЯ}}"],
+    8: ["повторяет другой"],   # Я — 13.10 в контракте: «отдельное согласие, когда оно уже дано в заявлении»
     9: ["Как оценить формулировку на однозначность"],
     10: ["доклад о виде государственного контроля (надзора) (ст. 30)"],
     11: ["Сроки исполнения обязанности — твой предмет", "Срок подачи заявки — твой предмет",
@@ -275,11 +275,11 @@ def test_iter4_indicator_prompt_edits(n):
 
 @pytest.mark.parametrize("path", INDICATOR_PROMPTS + NODE_PROMPTS + [PROMPT_PASSPORT], ids=lambda p: p.name)
 def test_region_labels_only_in_comparison_prompts(path):
-    """К: метки регионов — только в промптах 8, 11 (7 — с 13.10 только текст акта); после подстановки меток не остаётся."""
+    """К: метки регионов — только в промпте 11 (7, 8 — с 13.10 только текст акта); после подстановки меток не остаётся."""
     from app.nodes.verdicts import fill_prompt_labels
     text = path.read_text(encoding="utf-8")
     has = "{{РЕГИОНЫ_СРАВНЕНИЯ}}" in text or "{{ЧИСЛО_РЕГИОНОВ}}" in text
-    assert has == (path.name in {"02_indicator_08.md", "02_indicator_11.md"})
+    assert has == (path.name == "02_indicator_11.md")
     assert "{{" not in fill_prompt_labels(text, limit=5)   # потолок подставляется всегда (узел вердиктов)
 
 
@@ -353,7 +353,7 @@ def test_iter4_garant_in_indicator_prompts():
         named = set(re.findall(r"garant_[a-z_]+", text))
         assert named <= set(tools), (n, named - set(tools))   # агент не зовёт то, чего у него нет
         assert "{{" not in fill_prompt_labels(text, limit=7)
-    for n in (3, 4, 8, 9, 10, 11, 12):
+    for n in (3, 4, 9, 10, 11, 12):
         assert "{{ПОТОЛОК_ЗАХОДОВ}} ЗАХОДОВ ПОИСКА В ИНТЕРНЕТЕ" in prompt_path(n).read_text(encoding="utf-8"), n
     t3 = prompt_path(3).read_text(encoding="utf-8").lower()
     assert "высокий риск" not in t3 and "низкий риск" not in t3 and "garant_find_hyperlinks" in t3
