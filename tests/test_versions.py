@@ -104,3 +104,16 @@ def test_recover_after_crash_mid_step(rid):
     (run_dir(rid) / "07_request.json").write_text("{}", encoding="utf-8")   # сбой посреди шага
     assert versions.recover(rid) is True
     assert json.loads((run_dir(rid) / "07_request.json").read_text(encoding="utf-8"))["items"][0]["num"] == "1"
+
+
+
+def test_version_commit_and_restore_are_logged(rid):
+    """Журнал сессии (2.7): новая версия и возврат к версии — события с номером и тем, что изменено."""
+    from app.trace import read_events
+    state = versions.ensure_v0(rid)
+    versions.commit(rid, state, [_entry(1)])
+    versions.restore(rid, 0)
+    created = [e for e in read_events(rid) if e["event"] == "version_created"]
+    assert [e["version"] for e in created] == [0, 1]
+    assert created[1]["changes"] == ["правка: Карта гипотез, стр. 1"]
+    assert [e["version"] for e in read_events(rid) if e["event"] == "version_restored"] == [0]

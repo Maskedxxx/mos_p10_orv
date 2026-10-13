@@ -40,7 +40,7 @@ from app.contracts import (
 )
 from app.nodes.hypotheses import _add_cost_to_meta
 from app.pipeline import run_pipeline
-from app.trace import load_json, new_run, run_dir, save_json, save_text
+from app.trace import load_json, new_run, read_events, run_dir, save_json, save_text
 
 
 def _minimal_passport_dict() -> dict:
@@ -693,3 +693,36 @@ def test_user_developer_replaces_model_answer(fakes, act_file):
     run_pipeline(act_file, fakes.run_id)
     seen = fakes.passport_seen["verdicts"]
     assert [d.name for d in seen.requisites.developers] == ["Департамент культуры города Москвы"]
+
+
+
+# ---- Журнал сессии: граф узлов (2.7, мониторинг) ----
+
+
+def test_events_journal_records_node_graph(fakes, act_file):
+    """Каждый узел — старт с входами и конец с выходами, длительностью и стоимостью; вход узла — выход
+    более раннего узла (или загруженный акт и настройки прогона), так что граф читается из журнала целиком."""
+    run_pipeline(act_file, fakes.run_id)
+    ev = read_events(fakes.run_id)
+    order = ["convert", "passport", "verdicts", "sort", "hypotheses", "merge", "request", "excel"]
+    started = [e for e in ev if e["event"] == "node_started"]
+    finished = {e["node"]: e for e in ev if e["event"] == "node_finished"}
+    assert [e["node"] for e in started] == order and list(finished) == order
+    assert all(e["who"] == f"узел {e['node']}" for e in started)
+    produced = {"00_input", "meta.json"}
+    for e in started:
+        assert set(e["inputs"]) <= produced, (e["node"], set(e["inputs"]) - produced)
+        produced |= set(finished[e["node"]]["outputs"])
+    assert finished["verdicts"]["outputs"] == ["03_verdicts/"] and finished["passport"]["cost_usd"] >= 0
+    assert finished["excel"]["duration_s"] >= 0
+    done = [e for e in ev if e["event"] == "run_finished"]
+    assert len(done) == 1 and done[0]["status"] == "готов" and "cost_usd" in done[0]
+    assert any(e["event"] == "artifact" and e["path"] == "03_verdicts/01.json" for e in ev)
+
+
+def test_events_journal_records_node_failure(fakes, act_file):
+    """Сбой узла — событие с текстом причины; прогон идёт дальше, как и раньше."""
+    fakes.fail = {"sort"}
+    run_pipeline(act_file, fakes.run_id)
+    failed = [e for e in read_events(fakes.run_id) if e["event"] == "node_failed"]
+    assert [e["node"] for e in failed] == ["sort"] and "заглушка узла sort упала" in failed[0]["error"]

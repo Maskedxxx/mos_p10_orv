@@ -796,3 +796,35 @@ def test_call_with_mcp_without_token_file_fails_clearly(tmp_runs_dir, valid_verd
     monkeypatch.setattr(subprocess, "run", Mock())
     with pytest.raises(RuntimeError, match="токеном Гаранта"):
         call("и", "док", Verdict, run_id="run_nt", trace_name="a.raw.json", allowed_tools=[], mcp_tools=["garant_search"])
+
+
+
+# ---- Журнал сессии: вызовы агентов (2.7, мониторинг) ----
+
+
+def test_call_logs_agent_start_attempts_and_finish(tmp_runs_dir, valid_verdict_ok, garant_files, monkeypatch):
+    """Вызов агента в журнале сессии: старт (модель, инструменты, Гарант), каждая попытка с исходом, итог."""
+    from app.trace import new_run, read_events
+    rid = new_run("акт.docx")
+    bad = _stdout_with_events(_result_event("{\"verdict\": \"x\"}", session_id="sess-9", cost=0.02, num_turns=4))
+    monkeypatch.setattr(subprocess, "run", Mock(side_effect=[_proc(bad), _proc(_ok_stdout(valid_verdict_ok))]))
+    call("и", "док", Verdict, run_id=rid, trace_name="03_verdicts/03.raw.json",
+         allowed_tools=["WebSearch"], mcp_tools=["garant_search"], timeout_s=900)
+    ev = [e for e in read_events(rid) if e["event"].startswith("agent_")]
+    assert [e["event"] for e in ev] == ["agent_started", "agent_attempt", "agent_attempt", "agent_finished"]
+    assert all(e["who"] == "агент 03_verdicts/03" for e in ev)
+    start = ev[0]
+    assert start["tools"] == ["WebSearch"] and start["garant"] == ["garant_search"] and start["timeout_s"] == 900
+    assert [(e["attempt"], e["outcome"]) for e in ev[1:3]] == [(1, "validation_error"), (2, "ok")]
+    assert ev[1]["cost_usd"] == 0.02 and ev[1]["turns"] == 4 and ev[1]["error"]
+    assert ev[3]["ok"] is True and ev[3]["attempts"] == 2
+
+
+def test_call_text_logs_agent_events(tmp_runs_dir, monkeypatch):
+    """Текстовый вызов (диалог) — те же события агента."""
+    from app.trace import new_run, read_events
+    rid = new_run("акт.docx")
+    monkeypatch.setattr(subprocess, "run", Mock(return_value=_proc(_stdout_with_events(_result_event("ответ")))))
+    call_text("и", None, run_id=rid, trace_name="dialog/turns/01.raw.json", allowed_tools=[])
+    kinds = [e["event"] for e in read_events(rid) if e["event"].startswith("agent_")]
+    assert kinds == ["agent_started", "agent_attempt", "agent_finished"]

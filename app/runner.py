@@ -83,7 +83,7 @@ from app.config import (
     CLI_SETTINGS_FILE, EFFORT, GARANT_MCP_CONFIG, GARANT_NO_PROXY_HOST, GARANT_TOKEN_FILE, MODEL,
 )
 from app.logger import get_run_logger
-from app.trace import save_bytes, save_raw
+from app.trace import log_event, save_bytes, save_raw
 
 # Тип модели ответа для call() — только pydantic-модели (--json-schema требует схему)
 ModelT = TypeVar("ModelT", bound=BaseModel)
@@ -270,13 +270,38 @@ def _log_attempt(
     cost_usd: float,
     num_turns: int | None,
     outcome: str,
+    *,
+    run_id: str,
+    error: str | None,
 ) -> None:
-    """Единая строка лога попытки: артефакт, номер, длительность, стоимость, ходы, исход."""
+    """Единая строка лога попытки: артефакт, номер, длительность, стоимость, ходы, исход — и событие журнала сессии."""
     turns = str(num_turns) if num_turns is not None else "-"
     logger.info(
         "call: artifact=%s attempt=%d/%d duration=%.1fs cost=$%.4f turns=%s outcome=%s",
         trace_name, attempt, max_attempts, duration_s, cost_usd, turns, outcome,
     )
+    log_event(run_id, "agent_attempt", who=_agent_label(trace_name), trace=trace_name, attempt=attempt,
+              max_attempts=max_attempts, outcome=outcome, duration_s=round(duration_s, 1), cost_usd=cost_usd,
+              turns=num_turns, error=(error or "")[:500] or None)
+
+
+def _agent_label(trace_name: str) -> str:
+    """Кто в журнале сессии: «агент <артефакт без .raw.json>» — по нему видно узел и номер индикатора."""
+    return "агент " + trace_name.removesuffix(".raw.json")
+
+
+def _log_agent_started(run_id: str, trace_name: str, model: str, allowed_tools: list[str],
+                       mcp_tools: list[str] | None, timeout_s: int) -> None:
+    """Событие журнала: агент запущен — модель, встроенные инструменты, инструменты Гаранта, таймаут."""
+    log_event(run_id, "agent_started", who=_agent_label(trace_name), trace=trace_name, model=model,
+              tools=list(allowed_tools), garant=list(mcp_tools or []), timeout_s=timeout_s)
+
+
+def _log_agent_finished(run_id: str, trace_name: str, result: "CallResult") -> None:
+    """Событие журнала: итог вызова агента — успех, число попыток, стоимость, время, последняя ошибка."""
+    log_event(run_id, "agent_finished", who=_agent_label(trace_name), trace=trace_name, ok=result.ok,
+              attempts=result.attempts, cost_usd=result.cost_usd, duration_s=round(result.duration_s, 1),
+              error=(result.error or "")[:500] or None)
 
 
 def _run_attempt(
@@ -436,6 +461,7 @@ def call(
     env = {**os.environ, **_SHORT_CACHE_ENV} if short_cache_ttl else None
     if mcp_tools:
         env = {**(env if env is not None else os.environ), **_mcp_env()}
+    _log_agent_started(run_id, trace_name, model, allowed_tools, mcp_tools, timeout_s)
 
     # Состояние следующей попытки: что слать и слать ли документ в stdin
     message = instruction
@@ -463,7 +489,7 @@ def call(
             # нет события result, is_error) -> полный повтор без --resume
             last_error = outcome.error
             _log_attempt(logger, trace_name, attempt, max_attempts, outcome.duration_s,
-                         outcome.cost_usd, outcome.num_turns, outcome.kind)
+                         outcome.cost_usd, outcome.num_turns, outcome.kind, run_id=run_id, error=last_error)
             resume_session_id, message, send_document = None, instruction, True
             if _budget_exhausted(cost_total, max_budget_usd):
                 break
@@ -474,7 +500,7 @@ def call(
         except (json.JSONDecodeError, TypeError) as exc:
             last_error = f"поле result не разбирается как JSON: {exc}"
             _log_attempt(logger, trace_name, attempt, max_attempts, outcome.duration_s,
-                         outcome.cost_usd, outcome.num_turns, "result_json_error")
+                         outcome.cost_usd, outcome.num_turns, "result_json_error", run_id=run_id, error=last_error)
             if outcome.session_id is not None:
                 resume_session_id, message, send_document = (
                     outcome.session_id, _retry_message(last_error), False
@@ -491,7 +517,7 @@ def call(
         except ValidationError as exc:
             last_error = str(exc)
             _log_attempt(logger, trace_name, attempt, max_attempts, outcome.duration_s,
-                         outcome.cost_usd, outcome.num_turns, "validation_error")
+                         outcome.cost_usd, outcome.num_turns, "validation_error", run_id=run_id, error=last_error)
             if outcome.session_id is not None:
                 resume_session_id, message, send_document = (
                     outcome.session_id, _retry_message(last_error), False
@@ -505,11 +531,11 @@ def call(
         # Успех
         last_error = None
         _log_attempt(logger, trace_name, attempt, max_attempts, outcome.duration_s,
-                     outcome.cost_usd, outcome.num_turns, "ok")
+                     outcome.cost_usd, outcome.num_turns, "ok", run_id=run_id, error=last_error)
         break
 
     duration_total = time.monotonic() - started
-    return CallResult(
+    result = CallResult(
         value=value,
         ok=value is not None,
         attempts=attempts_made,
@@ -519,6 +545,8 @@ def call(
         permission_denials=permission_denials_total,
         duration_s=duration_total,
     )
+    _log_agent_finished(run_id, trace_name, result)
+    return result
 
 
 def call_text(
@@ -559,6 +587,7 @@ def call_text(
     attempts_made = 0
     permission_denials_total: list[Any] = []
 
+    _log_agent_started(run_id, trace_name, MODEL, allowed_tools, None, timeout_s)
     for attempt in range(1, max_attempts + 1):
         attempts_made = attempt
 
@@ -577,7 +606,7 @@ def call_text(
         if outcome.kind != "ok":
             last_error = outcome.error
             _log_attempt(logger, trace_name, attempt, max_attempts, outcome.duration_s,
-                         outcome.cost_usd, outcome.num_turns, outcome.kind)
+                         outcome.cost_usd, outcome.num_turns, outcome.kind, run_id=run_id, error=last_error)
             if _budget_exhausted(cost_total, max_budget_usd):
                 break
             continue
@@ -585,7 +614,7 @@ def call_text(
         if outcome.result_text is None or not outcome.result_text.strip():
             last_error = "пустой ответ модели"
             _log_attempt(logger, trace_name, attempt, max_attempts, outcome.duration_s,
-                         outcome.cost_usd, outcome.num_turns, "empty_response")
+                         outcome.cost_usd, outcome.num_turns, "empty_response", run_id=run_id, error=last_error)
             if _budget_exhausted(cost_total, max_budget_usd):
                 break
             continue
@@ -594,11 +623,11 @@ def call_text(
         value = outcome.result_text
         last_error = None
         _log_attempt(logger, trace_name, attempt, max_attempts, outcome.duration_s,
-                     outcome.cost_usd, outcome.num_turns, "ok")
+                     outcome.cost_usd, outcome.num_turns, "ok", run_id=run_id, error=last_error)
         break
 
     duration_total = time.monotonic() - started
-    return CallResult(
+    result = CallResult(
         value=value,
         ok=value is not None,
         attempts=attempts_made,
@@ -608,3 +637,5 @@ def call_text(
         permission_denials=permission_denials_total,
         duration_s=duration_total,
     )
+    _log_agent_finished(run_id, trace_name, result)
+    return result

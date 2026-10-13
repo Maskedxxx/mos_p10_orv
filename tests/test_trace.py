@@ -169,6 +169,7 @@ def test_no_temporary_files_left_after_writes(tmp_runs_dir, valid_run_meta):
     names = {path.name for path in (tmp_runs_dir / run_id).rglob("*") if path.is_file()}
     assert names == {
         "01_document.md", "meta.json", "01.raw.json", "01.raw.attempt2.json",
+        "events.jsonl",   # журнал сессии (2.7) — тоже часть трейса, не временный файл
     }
     assert not [name for name in names if name.endswith(".tmp")]
 

@@ -24,7 +24,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from app.contracts import Buckets, DataRequest, HypothesisMap, JournalEntry, VersionState
-from app.trace import load_json, run_dir, save_bytes, save_json
+from app.trace import load_json, log_event, run_dir, save_bytes, save_json
 
 VERSIONS = "versions"
 _STATE = f"{VERSIONS}/state.json"
@@ -79,6 +79,7 @@ def ensure_v0(run_id: str) -> VersionState:
     _snapshot(run_id, 0)
     save_json(run_id, _STATE, state)
     save_json(run_id, f"{VERSIONS}/v0/state.json", state)   # пометки версии — для отката
+    log_event(run_id, "version_created", version=0)
     return state
 
 
@@ -97,6 +98,7 @@ def commit(run_id: str, state: VersionState, entries: list[JournalEntry]) -> Ver
     new_state = state.model_copy(update={"current": n})
     save_json(run_id, _STATE, new_state)
     save_json(run_id, f"{VERSIONS}/v{n}/state.json", new_state)   # пометки версии — для отката
+    log_event(run_id, "version_created", version=n, changes=[f"{e.kind}: {e.target}" for e in entries])
     return new_state
 
 
@@ -120,6 +122,7 @@ def restore(run_id: str, n: int) -> None:
         (root / rel).unlink()
     for rel in artifact_files(snap):
         save_bytes(run_id, rel, (snap / rel).read_bytes())
+    log_event(run_id, "version_restored", version=n)
 
 
 def recover(run_id: str) -> bool:

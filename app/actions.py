@@ -20,6 +20,7 @@ from dataclasses import dataclass
 
 from app import config
 from app.logger import app_logger
+from app.trace import log_event
 
 ACTIONS_FILE = "actions.jsonl"
 _lock = threading.Lock()   # страница одна на процесс, обработчики и фоновые действия пишут из разных потоков
@@ -51,3 +52,7 @@ def log_action(who: Who, action: str, run_id: str | None = None, **details) -> N
                 f.write(line + "\n")
     except OSError:
         app_logger.exception("журнал действий: не записано «%s» (%s)", action, who.session)
+    # Действие по прогону — ещё и в журнал его сессии (events.jsonl): там вся картина по акту
+    if run_id:
+        log_event(run_id, "user_action", who="пользователь", action=action, session=who.session,
+                  **{k: v for k, v in details.items() if v is not None})

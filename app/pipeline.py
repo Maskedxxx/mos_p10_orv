@@ -91,7 +91,7 @@ from app.nodes.request import build_request
 from app.nodes.sort import sort_verdicts
 from app.nodes.passport import apply_user_developers, make_passport, passport_effective_year
 from app.nodes.verdicts import run_verdicts
-from app.trace import load_json, new_run, save_json, update_meta
+from app.trace import load_json, log_event, new_run, save_json, update_meta
 
 # Имя файла состояния выполнения в папке прогона
 PROGRESS_FILE = "progress.json"
@@ -109,6 +109,22 @@ _NODES: list[tuple[str, str]] = [
     ("request", "Запрос показателей"),
     ("excel", "Итоговый Excel"),
 ]
+
+
+# Граф узлов для журнала сессии (2.7, мониторинг): что узел берёт на вход и что пишет — по коду
+# run_pipeline ниже. «00_input» — загруженный акт, meta.json — настройки прогона; папка со слешем
+# в конце — все файлы в ней. Вход каждого узла — выход более раннего (проверяет тест журнала).
+NODE_GRAPH: dict[str, tuple[list[str], list[str]]] = {
+    "convert": (["00_input"], ["01_document.md"]),
+    "passport": (["01_document.md", "meta.json"], ["02_passport.json"]),
+    "verdicts": (["01_document.md", "02_passport.json", "meta.json"], ["03_verdicts/"]),
+    "sort": (["03_verdicts/"], ["04_buckets.json"]),
+    "hypotheses": (["04_buckets.json", "01_document.md", "02_passport.json"], ["05_hypotheses/"]),
+    "merge": (["05_hypotheses/", "01_document.md"], ["06_map.json"]),
+    "request": (["06_map.json", "01_document.md", "02_passport.json", "meta.json"], ["07_request.json"]),
+    "excel": (["06_map.json", "07_request.json", "04_buckets.json", "02_passport.json", "meta.json"],
+              ["08_result.xlsx"]),
+}
 
 
 def _now() -> str:
@@ -184,6 +200,7 @@ class _Progress:
             self._cost_base[key] = _cost_now(self._run_id)
             self._save()
         self._logger.info("узел %s: старт", key)
+        log_event(self._run_id, "node_started", who=f"узел {key}", node=key, inputs=NODE_GRAPH[key][0])
 
     def node_finished(self, key: str) -> None:
         """Пометить узел готовым, посчитать длительность и его вклад в стоимость."""
@@ -208,6 +225,12 @@ class _Progress:
             node.cost_usd = round(total_cost - self._cost_base[key], 6)
             self._state.total_cost_usd = round(total_cost, 6)
             self._save()
+        if status == "готов":
+            log_event(self._run_id, "node_finished", who=f"узел {key}", node=key, outputs=NODE_GRAPH[key][1],
+                      duration_s=node.duration_s, cost_usd=node.cost_usd)
+        else:
+            log_event(self._run_id, "node_failed", who=f"узел {key}", node=key, error=error,
+                      duration_s=node.duration_s, cost_usd=node.cost_usd)
 
     # ---- индикаторы узла [2] ----
 
@@ -260,6 +283,8 @@ class _Progress:
             self._state.summary = summary
             self._state.total_cost_usd = round(_cost_now(self._run_id), 6)
             self._save()
+        log_event(self._run_id, "run_finished", status=status, cost_usd=self._state.total_cost_usd,
+                  summary=summary.model_dump(mode="json"))
 
     @property
     def total_cost_usd(self) -> float:

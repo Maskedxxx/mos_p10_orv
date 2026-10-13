@@ -15,6 +15,7 @@
     08_result.xlsx
     run.log
     meta.json
+    events.jsonl                               журнал сессии (2.7): одно событие — одна строка
 
 Требование владельца: сырой ответ (`save_raw`) сохраняется ВСЕГДА, включая упавшие
 попытки — иначе нечем отлаживать. Повторная попытка с тем же именем не затирает
@@ -26,6 +27,12 @@ os.replace. Иначе читатель, работающий параллель
 "поток пишет / поток читает и парсит" до правки: 182 319 битых чтений из 200 739
 (90,8%). Правка сделана во всём модуле разом, а не только для progress.json:
 стоит она ничего, а читателей артефактов со временем станет больше.
+
+Журнал сессии events.jsonl (2.7, мониторинг): одна строка — одно событие — время, кто
+(система, узел, агент, помощник, пользователь), что произошло, подробности. В одном файле —
+создание сессии, каждый записанный артефакт (save_*), узлы пайплайна со входами и выходами
+(граф), вызовы агентов с попытками, реплики чата, версии, действия пользователя. Файл
+только дописывается; сбой записи журнала работу не останавливает.
 """
 
 from __future__ import annotations
@@ -33,6 +40,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any, TypeVar
@@ -43,6 +51,13 @@ from app.config import RUNS_DIR
 from app.contracts import RunMeta
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
+
+EVENTS_FILE = "events.jsonl"
+# Служебные файлы, которые пишутся часто (каждое изменение прогресса, статус диалога), и снимки
+# версий (о них — событие version_created): как артефакты не журналируются, иначе шум
+_NOT_ARTIFACTS = {"meta.json", "progress.json", "dialog/status.json", EVENTS_FILE}
+_NOT_ARTIFACT_DIRS = ("versions/",)
+_events_lock = threading.Lock()   # события приходят из потоков индикаторов, веток гипотез и страницы
 
 
 def _generate_run_id() -> str:
@@ -98,6 +113,41 @@ def run_dir(run_id: str) -> Path:
     return RUNS_DIR / run_id
 
 
+def log_event(run_id: str, event: str, *, who: str = "система", **fields: Any) -> None:
+    """
+    Дописать событие в журнал сессии runs/<run_id>/events.jsonl.
+
+    Журнал — наблюдение, а не работа: нет папки прогона или запись не удалась — событие
+    пропускается, вызывающий код идёт дальше.
+    """
+    path = run_dir(run_id)
+    if not path.is_dir():
+        return
+    entry = {"ts": datetime.now().isoformat(timespec="milliseconds"), "event": event, "who": who, **fields}
+    line = json.dumps(entry, ensure_ascii=False, default=str)
+    try:
+        with _events_lock, open(path / EVENTS_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+
+
+def read_events(run_id: str) -> list[dict]:
+    """Прочитать журнал сессии целиком (для проверок и инструментов мониторинга)."""
+    path = run_dir(run_id) / EVENTS_FILE
+    if not path.is_file():
+        return []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+
+
+def _log_artifact(run_id: str, path: Path) -> None:
+    """Событие «записан артефакт»: путь относительно папки прогона и размер."""
+    rel = path.relative_to(run_dir(run_id)).as_posix()
+    if rel in _NOT_ARTIFACTS or rel.startswith(_NOT_ARTIFACT_DIRS):
+        return
+    log_event(run_id, "artifact", path=rel, bytes=path.stat().st_size)
+
+
 def new_run(
     act_filename: str,
     *,
@@ -131,6 +181,8 @@ def new_run(
         developers=list(developers or []),
     )
     save_json(run_id, "meta.json", meta)
+    log_event(run_id, "session_created", act_filename=act_filename, act_types=meta.act_types,
+              comparison_regions=comparison_regions, search_limits=search_limits, developers=meta.developers)
     return run_id
 
 
@@ -139,6 +191,7 @@ def save_text(run_id: str, relname: str, text: str) -> Path:
     path = run_dir(run_id) / relname
     path.parent.mkdir(parents=True, exist_ok=True)
     _write_atomic(path, text)
+    _log_artifact(run_id, path)
     return path
 
 
@@ -150,6 +203,7 @@ def save_bytes(run_id: str, relname: str, data: bytes) -> Path:
     path = run_dir(run_id) / relname
     path.parent.mkdir(parents=True, exist_ok=True)
     _write_bytes_atomic(path, data)
+    _log_artifact(run_id, path)
     return path
 
 
@@ -163,6 +217,7 @@ def save_json(run_id: str, relname: str, obj: BaseModel | Any) -> Path:
 
     data = obj.model_dump(mode="json") if isinstance(obj, BaseModel) else obj
     _write_atomic(path, json.dumps(data, ensure_ascii=False, indent=2))
+    _log_artifact(run_id, path)
     return path
 
 
@@ -187,6 +242,7 @@ def save_raw(run_id: str, relname: str, raw: str) -> Path:
             attempt += 1
 
     _write_atomic(path, raw)
+    _log_artifact(run_id, path)
     return path
 
 

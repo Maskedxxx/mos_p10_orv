@@ -26,7 +26,7 @@ from app.config import ALLOWED_TOOLS_TEXT, DIALOG_MODEL, PROMPT_DIALOG
 from app.contracts import DialogTurn, Operation, Remark
 from app.nodes.hypotheses import _add_cost_to_meta
 from app.runner import call
-from app.trace import run_dir, save_bytes
+from app.trace import log_event, run_dir, save_bytes
 
 CHAT = "dialog/chat.jsonl"
 REMARKS = "dialog/remarks.json"   # очередь замечаний из файла эксперта
@@ -35,6 +35,8 @@ STATUS = "dialog/status.json"     # что идёт по прогону прям
 SERVER_ID = f"{os.getpid()}-{int(time.time())}"
 HISTORY_MESSAGES = 16       # сколько последних реплик чата уходит модели
 _ROLES = ("пользователь", "ассистент", "сервис")
+# Кто в журнале сессии (events.jsonl) для каждой роли чата
+_CHAT_WHO = {"пользователь": "пользователь", "ассистент": "помощник", "сервис": "система"}
 
 
 @dataclass
@@ -60,6 +62,10 @@ def append_chat(run_id: str, role: str, text: str, **extra) -> dict:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    # Журнал сессии: роль и начало текста (полный текст — в chat.jsonl)
+    log_event(run_id, "chat", who=_CHAT_WHO[role], role=role, text=text[:300],
+              plan_steps=len(extra["plan"]) if "plan" in extra else None,
+              **{k: v for k, v in extra.items() if k in ("cost_usd", "session", "mark", "version")})
     return entry
 
 
