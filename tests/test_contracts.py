@@ -792,3 +792,48 @@ def test_indicator04_reasoning_before_choice():
     assert order.index("compared") < order.index("rationale") < order.index("verdict")
     row = list(ComparedRequirement.model_json_schema()["properties"])
     assert row.index("comparison") < row.index("relation")   # сначала сравнение, потом вывод
+
+
+# ---- Индикатор 5: таблица отказов из-за документов, рубрика вердикта (13.10, разбор узлов) ----
+
+
+def _ref5(fix: str) -> dict:
+    return {"ground": "неполный комплект", "clause": "п. 1", "consequence": "отказ в приёме", "fix": fix}
+
+
+def _ind05(verdict: str, rows: list) -> dict:
+    extra = {"missing_data": "порядок в акте Б"} if verdict == "нет данных" else {}
+    return {"indicator": 5, "name": "возможность доработки пакета документов", "refusals": rows,
+            "rationale": "полный разбор", "verdict": verdict, "rationale_brief": _B, **extra}
+
+
+@pytest.mark.parametrize("verdict, rows", [
+    ("нарушен", [_ref5("только подать заново"), _ref5("исправить в той же заявке")]),
+    ("нарушен", [_ref5("исправить нельзя")]),
+    ("соблюдён", [_ref5("исправить в той же заявке")]),
+    ("не применимо", []),
+    ("нет данных", []),
+])
+def test_indicator05_verdict_follows_refusals(verdict, rows):
+    from app.contracts import Indicator05Output
+    assert Indicator05Output(**_ind05(verdict, rows)).verdict == verdict
+
+
+@pytest.mark.parametrize("verdict, rows", [
+    ("соблюдён", [_ref5("только подать заново")]),
+    ("нарушен", [_ref5("исправить в той же заявке")]),
+    ("соблюдён", []),
+    ("нет данных", [_ref5("исправить в той же заявке")]),
+])
+def test_indicator05_verdict_contradicting_refusals_rejected(verdict, rows):
+    from app.contracts import Indicator05Output
+    with pytest.raises(ValidationError):
+        Indicator05Output(**_ind05(verdict, rows))
+
+
+def test_indicator05_reasoning_before_choice():
+    from app.contracts import DocumentRefusal, Indicator05Output
+    order = list(Indicator05Output.model_json_schema()["properties"])
+    assert order.index("refusals") < order.index("rationale") < order.index("verdict")
+    row = list(DocumentRefusal.model_json_schema()["properties"])
+    assert row.index("fix_where") < row.index("fix")

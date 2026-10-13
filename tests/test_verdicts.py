@@ -211,15 +211,13 @@ def test_tools_follow_route_for_all_twelve_indicators(run_id, tmp_prompts_dir, m
 
     assert set(seen_tools) == set(range(1, 13))
     for n in range(1, 13):
-        if n == 5:
-            assert seen_tools[n] == ["WebFetch"]
-        elif n in {1, 2, 6}:   # 1, 2 — без инструментов с 13.10: только текст акта
+        if n in {1, 2, 5, 6}:   # 1, 2, 5 — без инструментов с 13.10: только текст акта
             assert seen_tools[n] == [] and seen_garant[n] is None
         else:
             assert seen_tools[n] == ["WebSearch", "WebFetch"]
     assert "garant_find_hyperlinks" in seen_garant[3]
-    # выгрузка статьи — только у 4 и 5 (Р8; у 1 и 2 инструментов нет с 13.10)
-    assert {n for n in range(1, 13) if seen_garant[n] and "garant_export_block_html" in seen_garant[n]} == {4, 5}
+    # выгрузка статьи — только у 4 (Р8; у 1, 2, 5 инструментов нет с 13.10)
+    assert {n for n in range(1, 13) if seen_garant[n] and "garant_export_block_html" in seen_garant[n]} == {4}
     assert "garant_sutyazhnik" in seen_garant[10]
 
 
@@ -488,7 +486,7 @@ def test_indicator_answer_uses_strict_contract_with_brief(run_id, tmp_prompts_di
     from app.contracts import VerdictOutput
     mock = Mock(side_effect=_default_side_effect)
     monkeypatch.setattr(verdicts_module, "call", mock)
-    run_verdicts("текст акта", run_id, indicators=[5])   # 13.10: у 1–4 свои контракты, 5 — общий
+    run_verdicts("текст акта", run_id, indicators=[6])   # 13.10: у 1–5 свои контракты, 6 — общий
     assert mock.call_args.args[2] is VerdictOutput
 
 
@@ -514,6 +512,8 @@ def test_indicator01_uses_own_contract_and_saves_checked_documents(run_id, tmp_p
     assert INDICATOR_OUTPUT[3] is Indicator03Output   # 13.10: и у индикатора 3
     from app.contracts import Indicator04Output
     assert INDICATOR_OUTPUT[4] is Indicator04Output   # и у индикатора 4
+    from app.contracts import Indicator05Output
+    assert INDICATOR_OUTPUT[5] is Indicator05Output   # и у индикатора 5
     assert load_json(run_id, "03_verdicts/01.json", Verdict).verdict == "нарушен"
     checks = json.loads((run_dir(run_id) / "03_verdicts/01.checks.json").read_text(encoding="utf-8"))
     assert checks["checked_documents"][0]["held_by_state"] is True
@@ -549,7 +549,7 @@ def test_group_leaders_start_before_followers(run_id, tmp_prompts_dir, monkeypat
 
     monkeypatch.setattr(verdicts_module, "call", Mock(side_effect=_effect))
     result = run_verdicts("текст акта", run_id)
-    # группы кэша: 1–4 — свои контракты (13.10); 5 — страница и Гарант; 6 — без инструментов;
+    # группы кэша: 1–5 — свои контракты (13.10); 6 — без инструментов;
     # остальные — интернет и Гарант, лидер 7
     leaders = {1, 2, 3, 4, 5, 6, 7}
     assert len(result) == 12
