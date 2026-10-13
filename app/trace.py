@@ -53,6 +53,8 @@ from app.contracts import RunMeta
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
 EVENTS_FILE = "events.jsonl"
+# Итог закрытой сессии (2.7, app/sessions.py): есть файл — сессия закрыта, журнал больше не пишется
+SESSION_SUMMARY_FILE = "session_summary.json"
 # Служебные файлы, которые пишутся часто (каждое изменение прогресса, статус диалога), и снимки
 # версий (о них — событие version_created): как артефакты не журналируются, иначе шум
 _NOT_ARTIFACTS = {"meta.json", "progress.json", "dialog/status.json", EVENTS_FILE}
@@ -118,11 +120,12 @@ def log_event(run_id: str, event: str, *, who: str = "система", **fields:
     Дописать событие в журнал сессии runs/<run_id>/events.jsonl.
 
     Журнал — наблюдение, а не работа: нет папки прогона или запись не удалась — событие
-    пропускается, вызывающий код идёт дальше.
+    пропускается, вызывающий код идёт дальше. Закрытая сессия (есть session_summary.json)
+    журнал не пополняет.
     """
     path = run_dir(run_id)
-    if not path.is_dir():
-        return
+    if not path.is_dir() or (path / SESSION_SUMMARY_FILE).exists():
+        return   # нет прогона или сессия закрыта — её папка больше не меняется
     entry = {"ts": datetime.now().isoformat(timespec="milliseconds"), "event": event, "who": who, **fields}
     line = json.dumps(entry, ensure_ascii=False, default=str)
     try:

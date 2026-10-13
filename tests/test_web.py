@@ -26,7 +26,10 @@ from pathlib import Path
 
 import pytest
 
+from datetime import datetime
+
 from app import config, trace, web
+from app.actions import Who
 from app.contracts import NodeState, RunMeta, RunProgress, RunSummary
 
 # ---- вспомогательное ----
@@ -1006,3 +1009,76 @@ def test_parse_regions_and_clamp_limits():
     limits = clamp_limits({3: 999, 4: 0, 7: "абв", 8: None, 11: 12.0})
     assert limits[3] == SEARCH_LIMIT_MAX and limits[4] == 1 and limits[7] == SEARCH_LIMITS[7]
     assert limits[8] == SEARCH_LIMITS[8] and limits[11] == 12 and set(limits) == set(SEARCH_LIMITS)
+
+
+# ---- 2.7: конец сессии (мониторинг, шаг 3) ----
+
+
+def _ready_run(rid: str, status: str = "готов") -> RunProgress:
+    from test_versions import _write_run
+    _write_run(rid)
+    progress = RunProgress.model_validate({"run_id": rid, "act_filename": "a.docx", "status": status,
+                                           "started_at": "2026-10-13T10:00:00", "nodes": []})
+    trace.save_json(rid, "progress.json", progress)
+    trace.save_json(rid, "meta.json", RunMeta(run_id=rid, act_filename="a.docx", started_at="2026-10-13T10:00:00",
+                                              status="finished"))
+    return progress
+
+
+def test_dialog_unavailable_for_closed_session(tmp_runs_dir):
+    """Закрытая сессия: панель диалога не показывается — вместо неё строка «Сессия закрыта …»."""
+    from app import sessions
+    rid = "20261013_100000_aaaaaa"
+    ready = _ready_run(rid)
+    assert web.dialog_unavailable(rid, ready) is None
+    sessions.close_session(rid, by="таймер", now=datetime(2026, 10, 13, 12, 0))
+    text = web.dialog_unavailable(rid, ready)
+    assert text.startswith("Сессия закрыта 13.10.2026 12:00") and "простой" in text and "скачать" in text
+
+
+def test_dialog_jobs_refuse_closed_session(tmp_runs_dir):
+    """Сервер отклоняет действие диалога по закрытой сессии, даже если окно его прислало."""
+    from app import sessions
+    rid = "20261013_100000_bbbbbb"
+    _ready_run(rid)
+    sessions.close_session(rid, by="пользователь")
+
+    async def scenario():
+        jobs = web.DialogJobs()
+        assert jobs.start(rid, jobs.turn(rid, "ещё")) is False
+
+    asyncio.run(scenario())
+
+
+def test_close_by_user(tmp_runs_dir, tmp_path, monkeypatch):
+    """Кнопка «Завершить работу»: нельзя, пока идёт разбор или действие чата; иначе — действие в журнал и закрытие."""
+    from types import SimpleNamespace
+    from app import sessions
+    monkeypatch.setattr(config, "LOGS_DIR", tmp_path / "logs")
+    who = Who(session="s-aaaaaa")
+    running = "20261013_100000_cccccc"
+    _ready_run(running, status="идёт")
+    assert "Разбор ещё идёт" in web.close_by_user(who, running, SimpleNamespace(busy=lambda r: False))
+    rid = "20261013_100000_dddddd"
+    _ready_run(rid)
+    assert "действие в чате" in web.close_by_user(who, rid, SimpleNamespace(busy=lambda r: True))
+    assert not sessions.is_closed(rid)
+    assert web.close_by_user(who, rid, SimpleNamespace(busy=lambda r: False)) is None
+    assert sessions.is_closed(rid)
+    events = trace.read_events(rid)
+    assert [e["event"] for e in events[-2:]] == ["user_action", "session_closed"]
+    assert events[-2]["action"] == "завершить работу" and events[-1]["by"] == "пользователь"
+    assert web.close_by_user(who, rid, SimpleNamespace(busy=lambda r: False)) == "Сессия уже закрыта."
+
+
+def test_close_idle_sessions_skips_busy_dialog(tmp_runs_dir, monkeypatch):
+    """Фоновое закрытие по простою: сессия, по которой идёт действие диалога, не закрывается."""
+    from types import SimpleNamespace
+    from app import sessions
+    a, b = "20261013_100000_eeeeee", "20261013_100000_ffffff"
+    _ready_run(a)
+    _ready_run(b)
+    monkeypatch.setattr(sessions, "idle_sessions", lambda now: [a, b])
+    closed = web.close_idle_sessions(datetime(2026, 10, 13, 12, 0), SimpleNamespace(busy=lambda r: r == b))
+    assert closed == [a] and sessions.is_closed(a) and not sessions.is_closed(b)
+    assert json.loads((trace.run_dir(a) / sessions.SESSION_SUMMARY_FILE).read_text(encoding="utf-8"))["closed_by"] == "таймер"

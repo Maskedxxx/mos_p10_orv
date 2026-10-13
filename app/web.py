@@ -80,7 +80,7 @@ from nicegui.storage import Storage
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.responses import Response
 
-from app import config, dialog, feedback, operations, trace, versions
+from app import config, dialog, feedback, operations, sessions, trace, versions
 from app.actions import Who, log_action, session_label
 from app.config import ACCEPTED_EXTENSIONS, COMPARISON_REGIONS, SEARCH_LIMIT_MAX, SEARCH_LIMITS, all_indicators
 from app.mandatory_indicators import ACT_TYPES, NO_TYPE
@@ -481,8 +481,24 @@ DIALOG_READ_ONLY = "Этот прогон правят в другом окне 
 _OPERATION = TypeAdapter(Operation)
 
 
+def session_closed_text(run_id: str) -> str | None:
+    """Строка «Сессия закрыта …» для страницы; None — сессия открыта (2.7, конец сессии)."""
+    if not sessions.is_closed(run_id):
+        return None
+    try:
+        summary = json.loads((trace.run_dir(run_id) / sessions.SESSION_SUMMARY_FILE).read_text(encoding="utf-8"))
+        when = format_moment(parse_moment(summary.get("closed_at")))
+        by = "кнопкой «Завершить работу»" if summary.get("closed_by") == "пользователь" else "сама — простой больше часа"
+    except (OSError, ValueError):
+        when, by = "—", "причина не прочитана"
+    return f"Сессия закрыта {when} ({by}): чат и правки недоступны, Excel можно скачать."
+
+
 def dialog_unavailable(run_id: str, progress: RunProgress | None) -> str | None:
-    """Почему диалог по прогону недоступен; None — доступен (завершён без сбоя, артефакты v2.4+)."""
+    """Почему диалог по прогону недоступен; None — доступен (сессия открыта, завершён без сбоя, артефакты v2.4+)."""
+    closed = session_closed_text(run_id)
+    if closed is not None:
+        return closed
     if progress is None or progress.status != "готов":
         return "Диалог доступен после успешного завершения прогона."
     try:
@@ -717,8 +733,8 @@ class DialogJobs:
             item[2].set_result(accepted)
 
     def start(self, run_id: str, job: Coroutine) -> bool:
-        """Запустить действие, если по прогону ничего не идёт; False — занято."""
-        if self.busy(run_id):
+        """Запустить действие, если по прогону ничего не идёт и сессия открыта; False — занято или закрыта."""
+        if self.busy(run_id) or sessions.is_closed(run_id):
             job.close()
             return False
         self._tasks[run_id] = asyncio.get_running_loop().create_task(job)
@@ -806,6 +822,56 @@ class DialogJobs:
 
 
 DIALOG_JOBS = DialogJobs()
+
+
+# ---- Конец сессии (2.7, мониторинг): кнопка и закрытие по простою ----
+
+def close_by_user(who: Who, run_id: str, jobs: DialogJobs = DIALOG_JOBS) -> str | None:
+    """Кнопка «Завершить работу»: None — сессия закрыта; иначе — почему сейчас нельзя."""
+    if sessions.is_closed(run_id):
+        return "Сессия уже закрыта."
+    progress = read_progress(run_id)
+    if progress is None or progress.status not in ("готов", "сбой"):
+        return "Разбор ещё идёт — завершить работу можно после него."
+    if jobs.busy(run_id):
+        return "Идёт действие в чате — дождитесь его конца."
+    log_action(who, "завершить работу", run_id)
+    sessions.close_session(run_id, by="пользователь")
+    return None
+
+
+def close_idle_sessions(now: datetime, jobs: DialogJobs = DIALOG_JOBS) -> list[str]:
+    """Закрыть сессии без событий дольше SESSION_IDLE_S; по которым идёт действие диалога — не трогать."""
+    closed = []
+    for rid in sessions.idle_sessions(now):
+        if jobs.busy(rid):
+            continue
+        if sessions.close_session(rid, by="таймер", now=now):
+            app_logger.info("сессия %s закрыта по простою", rid)
+            closed.append(rid)
+    return closed
+
+
+_IDLE_CHECK_S = 60   # как часто проверять простой сессий
+_idle_task: asyncio.Task | None = None   # ссылка на фоновую задачу — иначе её может собрать сборщик мусора
+
+
+async def _close_idle_loop() -> None:
+    """Фоновая проверка простоя раз в минуту; сбой проверки пишется в лог сервиса и не останавливает её."""
+    while True:
+        await asyncio.sleep(_IDLE_CHECK_S)
+        try:
+            close_idle_sessions(datetime.now())
+        except Exception:
+            app_logger.exception("проверка простоя сессий не удалась")
+
+
+def _start_idle_loop() -> None:
+    global _idle_task
+    _idle_task = asyncio.get_running_loop().create_task(_close_idle_loop())
+
+
+nicegui_app.on_startup(_start_idle_loop)
 
 # ======================================================================
 # Логика: вход по паролю
@@ -1304,6 +1370,32 @@ class _RunView:
                         "text-sm text-gray-600"
                     )
 
+                # Конец сессии (2.7): закрыта — строка; открыта — кнопка с подтверждением
+                closed = session_closed_text(self._run_id)
+                if closed is not None:
+                    ui.label(closed).classes("text-sm text-gray-700")
+                else:
+                    ui.button("Завершить работу", icon="task_alt", on_click=self._confirm_close).props("outline")
+
+    def _confirm_close(self) -> None:
+        """Подтверждение конца сессии: закрытие нельзя отменить — поэтому спрашиваем."""
+        with ui.dialog() as box, ui.card():
+            ui.label("Завершить работу с актом?").classes("text-lg font-medium")
+            ui.label("Сессия закроется насовсем: чат и правки станут недоступны, Excel останется для скачивания.")\
+                .classes("text-sm text-gray-700")
+            with ui.row().classes("w-full justify-end gap-2"):
+                ui.button("Отмена", on_click=box.close).props("flat")
+                ui.button("Завершить", on_click=lambda: self._close(box)).props("unelevated")
+        box.open()
+
+    def _close(self, box: ui.dialog) -> None:
+        box.close()
+        error = close_by_user(self._who, self._run_id)
+        if error is not None:
+            ui.notify(error, type="warning")
+            return
+        ui.navigate.reload()   # страница заново: без панели чата, со строкой «Сессия закрыта»
+
 
 class _DialogView:
     """
@@ -1420,7 +1512,11 @@ class _DialogView:
             # нужна сразу — иначе первая секунда кнопок молча не работает
             return
         rid = self._run_id
-        self._editable = DIALOG_LOCK.acquire(rid, self._client_id, time.monotonic())
+        # Сессия закрылась (кнопкой в другом окне или по простою) — панель только для просмотра
+        closed = session_closed_text(rid)
+        self._editable = closed is None and DIALOG_LOCK.acquire(rid, self._client_id, time.monotonic())
+        if closed is not None:
+            _RunView._set_text(self._lock_note, closed)
         chat = dialog.read_chat(rid)
         busy = DIALOG_JOBS.busy(rid)
         waiting = DIALOG_JOBS.waiting(rid)
