@@ -126,6 +126,15 @@ def _brief(description: str):
     return Field(min_length=1, max_length=4, description=description)
 
 
+def _check_missing_data(verdict: str, missing_data: str | None) -> None:
+    """missing_data обязано быть заполнено при «нет данных» и пусто при любом другом вердикте."""
+    if verdict == "нет данных":
+        if missing_data is None or not missing_data.strip():
+            raise ValueError('при verdict == "нет данных" поле missing_data обязано быть заполнено')
+    elif missing_data is not None:
+        raise ValueError('поле missing_data допустимо только при verdict == "нет данных"')
+
+
 class Verdict(BaseModel):
     """Вердикт по одному индикатору из 12 (узел [2] пайплайна)."""
 
@@ -133,16 +142,16 @@ class Verdict(BaseModel):
 
     indicator: int = Field(ge=1, le=12, description="Номер индикатора из задания, 1–12.")
     name: str = Field(description="Название индикатора, как в задании.")
-    verdict: VerdictValue = Field(
-        description=(
-            "Вердикт по индикатору: «нарушен», «соблюдён», «не применимо» или «нет данных». "
-            "«ошибка» ставит только код при сбое вызова — сам не ставь."
-        )
-    )
     rationale: str = Field(
         description=(
             "Полный разбор: как проверял, что нашёл и почему такой вердикт — всё, что нужно "
             "для анализа. В Excel не идёт: эксперт видит rationale_brief."
+        )
+    )
+    verdict: VerdictValue = Field(
+        description=(
+            "Вердикт по индикатору: «нарушен», «соблюдён», «не применимо» или «нет данных». "
+            "«ошибка» ставит только код при сбое вызова — сам не ставь."
         )
     )
     missing_data: str | None = Field(
@@ -181,16 +190,7 @@ class Verdict(BaseModel):
         """missing_data осмысленно ТОЛЬКО при verdict == "нет данных" и обязано
         быть заполнено в этом случае; при других вердиктах должно быть None
         (включая verdict == "ошибка" — причина ошибки пишется в rationale)."""
-        if self.verdict == "нет данных":
-            if self.missing_data is None or not self.missing_data.strip():
-                raise ValueError(
-                    'при verdict == "нет данных" поле missing_data обязано быть заполнено'
-                )
-        else:
-            if self.missing_data is not None:
-                raise ValueError(
-                    'поле missing_data допустимо только при verdict == "нет данных"'
-                )
+        _check_missing_data(self.verdict, self.missing_data)
         return self
 
 
@@ -200,6 +200,155 @@ class VerdictOutput(Verdict):
     model_config = ConfigDict(title="Verdict")
 
     rationale_brief: list[BriefPoint] = _brief(_RATIONALE_BRIEF)
+
+
+# ---- Индикатор 1: свой контракт — таблица проверенных документов и рубрика вердикта (13.10) ----
+# Рубрика: 4_документы/Рубрика_индикатор_01.md. Узел вердиктов сохраняет вердикт прежнего вида (Verdict),
+# таблицу документов — рядом, в 03_verdicts/01.checks.json.
+
+
+class CheckedDocument(_Base):
+    """Один документ, который заявитель подаёт, и два ответа по нему: есть ли он у государства
+    и запрашивает ли его орган сам."""
+
+    name: str = Field(description="Название документа так, как оно дано в акте.")
+    clause: str = Field(
+        description=(
+            "Пункт, где документ назван; один документ в нескольких приложениях — "
+            "пункты через «;»."
+        )
+    )
+    held_by_state: bool = Field(
+        description=(
+            "Есть ли документ у государства. true — документ выдаёт госорган или "
+            "госучреждение, либо сведения из него ведутся в государственном реестре или "
+            "системе: например, выписка из реестра юрлиц или недвижимости, справка "
+            "налогового органа, справка о судимости, лицензия, разрешение органа. Требование "
+            "«заверить» или «подписать» такой документ не делает его документом заявителя. "
+            "false — документ составляет или подписывает сам заявитель: заявление, анкета, "
+            "расчёт, план, гарантийное письмо, согласие, фотографии; договоры с контрагентами; "
+            "внутренние документы организации; документ, удостоверяющий личность, при личном "
+            "обращении."
+        )
+    )
+    held_by: str | None = Field(
+        default=None,
+        description=(
+            "При held_by_state = true — какой орган или реестр. При false — null."
+        ),
+    )
+    requested_by_body: bool = Field(
+        description=(
+            "Запрашивает ли орган документ сам. true — акт прямо говорит, что орган "
+            "запрашивает этот документ или сведения из него сам: межведомственный запрос, "
+            "«запрашивается самостоятельно», «заявитель вправе не представлять». Оговорка "
+            "на весь перечень или раздел действует на каждый его документ. «Орган вправе "
+            "проверить сведения», если документ всё равно обязателен для заявителя, — "
+            "не оговорка. false — такой оговорки к документу нет."
+        )
+    )
+    requested_where: str | None = Field(
+        default=None,
+        description="При requested_by_body = true — пункт оговорки. При false — null.",
+    )
+
+
+class Indicator01Output(BaseModel):
+    """Индикатор 1 «Межведомственное взаимодействие»: заставляет ли акт заявителя приносить
+    документ, который у государства уже есть, не сказав, что орган запрашивает его сам.
+    Сначала заполни checked_documents по всему документу, потом разбор, потом вердикт."""
+
+    model_config = ConfigDict(extra="forbid", title="Verdict")
+
+    indicator: int = Field(ge=1, le=12, description="Номер индикатора из задания, 1–12.")
+    name: str = Field(description="Название индикатора, как в задании.")
+    checked_documents: list[CheckedDocument] = Field(
+        default_factory=list,
+        description=(
+            "Артефакт. Одна запись — один документ, названный в акте, который заявитель обязан "
+            "или вправе подать органу власти, его учреждению или организации, принимающей "
+            "документы по поручению органа. Включать: все такие документы из текста "
+            "и приложений, включая заявление; перечень в приложении — каждый документ перечня; "
+            "одинаковый документ в нескольких приложениях — одна запись. Не включать: что орган "
+            "выдаёт заявителю; обмен между органами; документы, которые заявитель ведёт у себя "
+            "и никуда не подаёт; документы, которые заявитель отдаёт частной организации для неё "
+            "самой (исполнителю, контрагенту); документ, получатель которого в акте не назван "
+            "(«по месту требования», «по запросу»). Перечень вынесен в другой акт, которого нет "
+            "в тексте, — его документы сюда не попадают."
+        ),
+    )
+    rationale: str = Field(
+        description="Разбор: как проверял, что нашёл, почему такой вердикт."
+    )
+    verdict: Literal["нарушен", "соблюдён", "не применимо", "нет данных"] = Field(
+        description=(
+            "Вердикт следует только из checked_documents. "
+            "«нарушен» — есть хотя бы один документ с held_by_state = true и "
+            "requested_by_body = false; ставится, даже если часть перечня вынесена в другой акт. "
+            "«соблюдён» — checked_documents не пуст, и у каждого документа held_by_state = false "
+            "или requested_by_body = true; не ставится, если checked_documents пуст. "
+            "«не применимо» — checked_documents пуст: заявитель не подаёт органу, его учреждению "
+            "или уполномоченной организации ни одного документа; не ставится, если документы "
+            "подаются, даже если все их составляет сам заявитель, — это «соблюдён». "
+            "«нет данных» — перечень документов вынесен в другой акт, которого нет в тексте, "
+            "и документа для «нарушен» нет; в missing_data — реквизиты этого акта и что в нём проверить."
+        )
+    )
+    missing_data: str | None = Field(
+        default=None,
+        description=(
+            "Только при вердикте «нет данных»: каких сведений не хватило для вывода. "
+            "При других вердиктах — null."
+        ),
+    )
+    proof: str | None = Field(
+        default=None,
+        description=(
+            "Дословная цитата. «нарушен» — требование документа, который есть у государства "
+            "и без оговорки. «соблюдён» — оговорка о запросе органом или пункт перечня "
+            "документов. «нет данных» — пункт, где акт отсылает к перечню в другом акте. "
+            "«не применимо» — null."
+        ),
+    )
+    clause: str | None = Field(
+        default=None,
+        description="Пункт, откуда цитата proof. «не применимо» — null.",
+    )
+    sources: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Только адреса страниц, на которых стоит вывод, по одному на элемент. "
+            "Рассуждения о том, что не открылось и не нашлось, — в rationale."
+        ),
+    )
+    attempts: int = Field(
+        default=1, ge=1,
+        description="Служебное: сколько попыток вызова понадобилось. Заполняет код — оставь 1.",
+    )
+    rationale_brief: list[BriefPoint] = _brief(_RATIONALE_BRIEF)
+
+    @model_validator(mode="after")
+    def _check_name_rationale_missing_data(self) -> "Indicator01Output":
+        _not_blank(self.name)
+        _not_blank(self.rationale)
+        _check_missing_data(self.verdict, self.missing_data)
+        return self
+
+    @model_validator(mode="after")
+    def _check_verdict_follows_documents(self) -> "Indicator01Output":
+        """Вердикт следует из таблицы документов (рубрика индикатора 1, раздел 4) — иначе ответ отвергается."""
+        violating = [d.name for d in self.checked_documents if d.held_by_state and not d.requested_by_body]
+        if violating:
+            allowed, why = {"нарушен"}, f"есть документ у государства без оговорки ({violating[0]})"
+        elif self.checked_documents:
+            allowed, why = {"соблюдён", "нет данных"}, "документы есть, но у каждого нет у государства или есть оговорка"
+        else:
+            allowed, why = {"не применимо", "нет данных"}, "checked_documents пуст"
+        if self.verdict not in allowed:
+            raise ValueError(f"вердикт «{self.verdict}» не следует из checked_documents: {why} — "
+                             f"допустимо: {', '.join(sorted(allowed))}")
+        return self
+
 
 
 class Buckets(BaseModel):

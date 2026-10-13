@@ -31,6 +31,10 @@ from app.config import (
 from app.contracts import ActPassport, DataRequest, DialogTurn, HypothesisMap, HypothesisSet, HypothesisSetOutput, MergeOutput
 
 INDICATOR_PROMPTS = [prompt_path(ind.number) for ind in all_indicators()]
+# 13.10 (разбор узлов): индикаторы со своим контрактом — правила в описаниях полей, промпт только направляет
+from app.nodes.verdicts import INDICATOR_OUTPUT  # noqa: E402
+RUBRIC_INDICATORS = set(INDICATOR_OUTPUT)
+OLD_STYLE_INDICATOR_PROMPTS = [prompt_path(n) for n in range(1, 13) if n not in RUBRIC_INDICATORS]
 NODE_PROMPTS = [PROMPT_HYPOTHESES_VIOLATED, PROMPT_HYPOTHESES_NO_DATA, PROMPT_MERGE, PROMPT_REQUEST, PROMPT_DIALOG]
 PASSPORT_ROOTS = "requisites|status|addressee|nature|requirements|procedure|documents|deadlines|references|allocation|control"
 KEY_RE = re.compile(r"\b(?:" + PASSPORT_ROOTS + r")(?:\.[a-z_]+)+")
@@ -98,6 +102,8 @@ def test_xml_tags_are_balanced(path):
 
 @pytest.mark.parametrize("path", INDICATOR_PROMPTS, ids=lambda p: p.name)
 def test_indicator_prompt_describes_passport_input(path):
+    if path in [prompt_path(n) for n in RUBRIC_INDICATORS]:
+        pytest.skip("рубрика в контракте: блока «паспорт» в промпте нет (13.10)")
     """Каждый индикатор знает, где лежит паспорт и как читать его состояния."""
     text = _read(path)
     assert "## ПАСПОРТ АКТА" in text
@@ -181,7 +187,7 @@ def _brief_block(path) -> str:
 def test_indicator_prompts_share_one_brief_block_and_key():
     """Блок выжимки одинаков во всех 12 промптах индикаторов — правило пишется одно на всех;
     ключ rationale_brief есть в примере ответа каждого."""
-    paths = [PROMPTS_DIR / f"02_indicator_{n:02d}.md" for n in range(1, 13)]
+    paths = [PROMPTS_DIR / f"02_indicator_{n:02d}.md" for n in range(1, 13) if n not in RUBRIC_INDICATORS]
     blocks = {_brief_block(p) for p in paths}
     assert len(blocks) == 1
     block = blocks.pop()
@@ -234,7 +240,7 @@ _ITER4_REMOVED = {
 }
 
 _ITER4_ADDED = {
-    1: ["включая МФЦ, и организация, которая принимает", "<границы>"],
+    1: ["организации, принимающей документы по поручению органа"],   # О — 13.10 в контракте
     2: ["<границы>"],
     3: ["Ссылка на акт без указания редакции"],
     4: ["<как_решать>", "В3. То же, но заявитель лишь ВПРАВЕ"],
@@ -253,6 +259,8 @@ _ITER4_ADDED = {
 @pytest.mark.parametrize("n", range(1, 13))
 def test_iter4_indicator_prompt_edits(n):
     text = prompt_path(n).read_text(encoding="utf-8")
+    if n in RUBRIC_INDICATORS:   # 13.10: правила — в описаниях полей контракта индикатора
+        text += json.dumps(INDICATOR_OUTPUT[n].model_json_schema(), ensure_ascii=False)
     for phrase in _ITER4_REMOVED.get(n, []):
         assert phrase not in text, f"промпт {n}: осталась убранная фраза «{phrase}»"
     for phrase in _ITER4_ADDED.get(n, []):
@@ -350,3 +358,15 @@ def test_iter4_garant_in_indicator_prompts():
     t3 = prompt_path(3).read_text(encoding="utf-8").lower()
     assert "высокий риск" not in t3 and "низкий риск" not in t3 and "garant_find_hyperlinks" in t3
     assert "<правовая_база>" not in prompt_path(6).read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("n", sorted(RUBRIC_INDICATORS))
+def test_rubric_indicator_prompt_only_points_to_contract(n):
+    """13.10: промпт индикатора с рубрикой в контракте — роль, суть, вход, инструменты; правил,
+    примеров и образца JSON в нём нет, модель заполняет ответ по описаниям полей схемы."""
+    text = prompt_path(n).read_text(encoding="utf-8")
+    assert "## ПОЛНЫЙ ТЕКСТ АКТА" in text and "## ПАСПОРТ АКТА" in text
+    assert "строго по описаниям полей схемы" in " ".join(text.split())
+    assert "<example>" not in text and "ФОРМАТ ОТВЕТА — строго JSON" not in text
+    assert "<паспорт>" not in text and "152-ПП" not in text
+

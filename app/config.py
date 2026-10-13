@@ -169,12 +169,13 @@ def web_indicators() -> list[Indicator]:
 
 # Гарант по индикаторам (2.7, итерация 4, Л и М; таблица 6.3 плана, решение Р8 12.10).
 # Порядок для всех: правовая база → точечно интернет → выгрузка одной статьи только там,
-# где вердикт зависит от точного текста (4; 1, 2, 5 — перечень в другом акте).
+# где вердикт зависит от точного текста (4; 2, 5 — перечень в другом акте).
+# 1 — без инструментов (13.10, разбор узлов): только текст акта; перечень в другом акте — «нет данных»
+# с реквизитами этого акта (Владимир: «рекомендации по смежным актам»).
 # 6 — Гарант не нужен. 12 — только поиск: нужен ли больше, покажут тесты; поиск держит его
 # в общей группе кэша (описания инструментов MCP одинаковы при любом списке разрешённых).
 _G_FIND = ("garant_search", "garant_document_redactions")
 INDICATOR_GARANT_TOOLS: dict[int, tuple[str, ...]] = {
-    1: (*_G_FIND, "garant_snippets", "garant_export_block_html"),
     2: (*_G_FIND, "garant_snippets", "garant_export_block_html"),
     3: ("garant_find_hyperlinks", *_G_FIND),
     4: (*_G_FIND, "garant_snippets", "garant_export_block_html"),
@@ -191,8 +192,8 @@ INDICATOR_GARANT_TOOLS: dict[int, tuple[str, ...]] = {
 # 12.10: 900 с не хватило на 152-ПП, 646-ПП, 2078-ПП (вызов обрывался по таймауту).
 INDICATOR_TIMEOUT_S: dict[int, int] = {3: 2700}
 
-# Индикаторам без интернета (1, 2, 5) — только открыть страницу акта, найденного в Гаранте (М)
-INDICATOR_EXTRA_TOOLS: dict[int, tuple[str, ...]] = {1: ("WebFetch",), 2: ("WebFetch",), 5: ("WebFetch",)}
+# Индикаторам без интернета (2, 5) — только открыть страницу акта, найденного в Гаранте (М)
+INDICATOR_EXTRA_TOOLS: dict[int, tuple[str, ...]] = {2: ("WebFetch",), 5: ("WebFetch",)}
 
 
 def indicator_tools(n: int) -> tuple[list[str], list[str]]:

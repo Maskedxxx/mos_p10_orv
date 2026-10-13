@@ -604,3 +604,50 @@ def test_fresh_numbering_orders_questions_last():
     assert RequestOutput(items=[_item(num="1"), {**lst}, {**q, "num": "3"}], years=[2025])
     with pytest.raises(ValidationError):
         RequestOutput(items=[_item(num="1"), {**q}, {**lst, "num": "3"}], years=[2025])
+
+
+# ---- Индикатор 1: артефакт проверенных документов и рубрика вердикта (13.10, разбор узлов) ----
+
+
+def _doc(held: bool, requested: bool) -> dict:
+    return {"name": "документ", "clause": "п. 1", "held_by_state": held, "requested_by_body": requested}
+
+
+def _ind01(verdict: str, docs: list, **kw) -> dict:
+    extra = {"missing_data": "перечень в акте Б"} if verdict == "нет данных" else {}
+    return {"indicator": 1, "name": "межведомственное взаимодействие", "checked_documents": docs,
+            "rationale": "полный разбор", "verdict": verdict, "rationale_brief": _B, **extra, **kw}
+
+
+def test_verdict_reasoning_before_choice():
+    """Сначала разбор, потом вердикт — модель пишет JSON по порядку полей (решение владельца 13.10)."""
+    from app.contracts import Indicator01Output
+    order = list(Verdict.model_json_schema()["properties"])
+    assert order.index("rationale") < order.index("verdict")
+    order = list(Indicator01Output.model_json_schema()["properties"])
+    assert order.index("checked_documents") < order.index("rationale") < order.index("verdict")
+
+
+@pytest.mark.parametrize("verdict, docs", [
+    ("нарушен", [_doc(True, False), _doc(False, False)]),
+    ("соблюдён", [_doc(True, True), _doc(False, False)]),
+    ("не применимо", []),
+    ("нет данных", []),
+    ("нет данных", [_doc(False, False)]),
+])
+def test_indicator01_verdict_follows_documents(verdict, docs):
+    from app.contracts import Indicator01Output
+    assert Indicator01Output(**_ind01(verdict, docs)).verdict == verdict
+
+
+@pytest.mark.parametrize("verdict, docs", [
+    ("соблюдён", [_doc(True, False)]),        # документ есть у государства, оговорки нет — это «нарушен»
+    ("нарушен", [_doc(True, True)]),           # нарушающего документа нет
+    ("не применимо", [_doc(False, False)]),    # документы подаются — это не «не применимо»
+    ("соблюдён", []),                          # документов нет — это не «соблюдён»
+    ("нет данных", [_doc(True, False)]),       # нарушение уже найдено
+])
+def test_indicator01_verdict_contradicting_documents_rejected(verdict, docs):
+    from app.contracts import Indicator01Output
+    with pytest.raises(ValidationError):
+        Indicator01Output(**_ind01(verdict, docs))

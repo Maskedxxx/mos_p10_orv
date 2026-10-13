@@ -29,6 +29,7 @@ import time
 from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any
 
 from app.config import (
     CACHE_WARMUP_S,
@@ -40,7 +41,7 @@ from app.config import (
     indicator_tools,
     prompt_path,
 )
-from app.contracts import ActPassport, Verdict, VerdictOutput
+from app.contracts import ActPassport, Indicator01Output, Verdict, VerdictOutput
 from app.logger import get_run_logger
 from app.runner import call
 from app.nodes.hypotheses import _add_cost_to_meta, _after, append_task_clarification
@@ -76,6 +77,24 @@ def fill_prompt_labels(prompt_text: str, regions: list[str] | None = None, limit
             .replace(_REGIONS_LABEL, ", ".join(regions))
             .replace(_REGIONS_COUNT_LABEL, str(len(regions))))
     return text.replace(_LIMIT_LABEL, str(limit)) if limit is not None else text
+
+
+# Свой контракт индикатора (13.10, разбор узлов): артефакт проверки и рубрика вердикта — в описаниях
+# полей, поля артефакта стоят перед разбором и вердиктом. Остальные индикаторы — общий VerdictOutput.
+INDICATOR_OUTPUT: dict[int, type[VerdictOutput] | type[Indicator01Output]] = {1: Indicator01Output}
+
+
+def _split_artifacts(value: Any) -> tuple[Verdict, dict[str, Any]]:
+    """
+    Ответ агента → вердикт прежнего вида (его читают гипотезы, Excel, чат) и поля артефакта,
+    которых в Verdict нет (сохраняются рядом, в NN.checks.json). Общий контракт — артефактов нет.
+    """
+    extra = [f for f in type(value).model_fields if f not in Verdict.model_fields]
+    if not extra:
+        return value, {}
+    data = value.model_dump(mode="json")
+    artifacts = {f: data.pop(f) for f in extra}
+    return Verdict(**data), artifacts
 
 
 def _error_verdict(indicator_number: int, name: str, error_text: str, attempts: int) -> Verdict:
@@ -127,7 +146,7 @@ def _run_one_indicator(
         result = call(
             instruction,
             None,
-            VerdictOutput,   # 2.5: выжимка для эксперта в ответе обязательна
+            INDICATOR_OUTPUT.get(n, VerdictOutput),   # 2.5: выжимка обязательна; 13.10: свой контракт индикатора
             run_id=run_id,
             trace_name=f"{trace_prefix}03_verdicts/{n:02d}.raw.json",
             allowed_tools=allowed_tools,
@@ -149,7 +168,10 @@ def _run_one_indicator(
         else:
             # attempts всегда берём из CallResult, а не из ответа модели —
             # модель может подставить своё число, перезаписываем настоящим
-            verdict = result.value.model_copy(update={"attempts": result.attempts})
+            value, artifacts = _split_artifacts(result.value)
+            if artifacts:
+                save_json(run_id, f"{trace_prefix}03_verdicts/{n:02d}.checks.json", artifacts)
+            verdict = value.model_copy(update={"attempts": result.attempts})
 
         return n, verdict, result.cost_usd
 
@@ -164,13 +186,15 @@ def _start_delays(nums: list[int]) -> dict[int, float]:
     остальные — через CACHE_WARMUP_S. Инструменты стоят в начале кэша, поэтому кэш
     общий только у агентов с одинаковыми встроенными инструментами и (2.7) с Гарантом
     или без: описания инструментов Гаранта одни и те же при любом списке разрешённых.
+    13.10: и с одинаковой схемой ответа — она тоже в начале запроса (инструмент StructuredOutput),
+    поэтому индикатор со своим контрактом — своя группа.
     """
     delays: dict[int, float] = {}
     seen: set[object] = set()
     for n in nums:
         try:
             builtin, garant = indicator_tools(n)
-            group: object = (tuple(builtin), bool(garant))
+            group: object = (tuple(builtin), bool(garant), INDICATOR_OUTPUT.get(n, VerdictOutput).__name__)
         except Exception:   # неизвестный номер — без сдвига; ошибку покажет сам агент
             group = f"?{n}"
         delays[n] = CACHE_WARMUP_S if group in seen else 0.0
