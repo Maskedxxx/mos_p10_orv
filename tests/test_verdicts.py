@@ -488,7 +488,7 @@ def test_indicator_answer_uses_strict_contract_with_brief(run_id, tmp_prompts_di
     from app.contracts import VerdictOutput
     mock = Mock(side_effect=_default_side_effect)
     monkeypatch.setattr(verdicts_module, "call", mock)
-    run_verdicts("текст акта", run_id, indicators=[4])   # 13.10: у 1–3 свои контракты, 4 — общий
+    run_verdicts("текст акта", run_id, indicators=[5])   # 13.10: у 1–4 свои контракты, 5 — общий
     assert mock.call_args.args[2] is VerdictOutput
 
 
@@ -512,6 +512,8 @@ def test_indicator01_uses_own_contract_and_saves_checked_documents(run_id, tmp_p
     assert INDICATOR_OUTPUT[2] is Indicator02Output   # 13.10: у индикатора 2 тоже свой контракт
     from app.contracts import Indicator03Output
     assert INDICATOR_OUTPUT[3] is Indicator03Output   # 13.10: и у индикатора 3
+    from app.contracts import Indicator04Output
+    assert INDICATOR_OUTPUT[4] is Indicator04Output   # и у индикатора 4
     assert load_json(run_id, "03_verdicts/01.json", Verdict).verdict == "нарушен"
     checks = json.loads((run_dir(run_id) / "03_verdicts/01.checks.json").read_text(encoding="utf-8"))
     assert checks["checked_documents"][0]["held_by_state"] is True
@@ -547,9 +549,9 @@ def test_group_leaders_start_before_followers(run_id, tmp_prompts_dir, monkeypat
 
     monkeypatch.setattr(verdicts_module, "call", Mock(side_effect=_effect))
     result = run_verdicts("текст акта", run_id)
-    # группы кэша: 1, 2, 3 — свои контракты (13.10); 5 — страница и Гарант; 6 — без инструментов;
-    # остальные — интернет и Гарант, лидер 4
-    leaders = {1, 2, 3, 4, 5, 6}
+    # группы кэша: 1–4 — свои контракты (13.10); 5 — страница и Гарант; 6 — без инструментов;
+    # остальные — интернет и Гарант, лидер 7
+    leaders = {1, 2, 3, 4, 5, 6, 7}
     assert len(result) == 12
     assert max(started[n] for n in leaders) + 0.25 <= min(t for n, t in started.items() if n not in leaders)
 

@@ -744,3 +744,51 @@ def test_indicator03_reasoning_before_choice():
     assert order.index("references") < order.index("rationale") < order.index("verdict")
     ref = list(CheckedReference.model_json_schema()["properties"])
     assert ref.index("found") < ref.index("status")   # сначала что показал источник, потом статус
+
+
+# ---- Индикатор 4: таблица требований и двойников, рубрика вердикта (13.10, разбор узлов) ----
+
+
+def _cmp(relation: str) -> dict:
+    return {"requirement": "срок 30 дней", "clause": "п. 1", "counterpart": "закон № 1, ст. 2",
+            "comparison": "тексты совпадают", "relation": relation}
+
+
+def _ind04(verdict: str, rows: list) -> dict:
+    extra = {"missing_data": "текст закона № 1"} if verdict == "нет данных" else {}
+    return {"indicator": 4, "name": "отсутствие дублирования требований", "compared": rows,
+            "rationale": "полный разбор", "verdict": verdict, "rationale_brief": _B, **extra}
+
+
+@pytest.mark.parametrize("verdict, rows", [
+    ("нарушен", [_cmp("повтор"), _cmp("не сверено")]),
+    ("нарушен", [_cmp("требует и сам получает"), _cmp("ссылка")]),
+    ("нет данных", [_cmp("не сверено"), _cmp("конкретизация")]),
+    ("соблюдён", [_cmp("ссылка"), _cmp("конкретизация"), _cmp("воспроизведение по закону")]),
+    ("соблюдён", []),          # двойников нет, но требования в акте есть
+    ("не применимо", []),
+])
+def test_indicator04_verdict_follows_compared(verdict, rows):
+    from app.contracts import Indicator04Output
+    assert Indicator04Output(**_ind04(verdict, rows)).verdict == verdict
+
+
+@pytest.mark.parametrize("verdict, rows", [
+    ("соблюдён", [_cmp("ссылка"), _cmp("не сверено")]),
+    ("нет данных", [_cmp("повтор")]),
+    ("нарушен", [_cmp("конкретизация")]),
+    ("не применимо", [_cmp("ссылка")]),
+    ("нет данных", []),
+])
+def test_indicator04_verdict_contradicting_compared_rejected(verdict, rows):
+    from app.contracts import Indicator04Output
+    with pytest.raises(ValidationError):
+        Indicator04Output(**_ind04(verdict, rows))
+
+
+def test_indicator04_reasoning_before_choice():
+    from app.contracts import ComparedRequirement, Indicator04Output
+    order = list(Indicator04Output.model_json_schema()["properties"])
+    assert order.index("compared") < order.index("rationale") < order.index("verdict")
+    row = list(ComparedRequirement.model_json_schema()["properties"])
+    assert row.index("comparison") < row.index("relation")   # сначала сравнение, потом вывод
