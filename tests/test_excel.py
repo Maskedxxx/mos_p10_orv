@@ -41,7 +41,7 @@ def _minimal_passport_dict() -> dict:
     return {
         "requisites": {"kind": "приказ", "number": "N 1", "date": "1 января 2024 г.",
                        "authority": "Департамент", "title": "Об утверждении порядка"},
-        "status": {"status": "принят", "status_basis": "есть номер, дата, подпись",
+        "status": {"status": "принят", "status_basis": "есть номер, дата принятия и подпись должностного лица",
                    "effective_date": "21.08.2025", "effective_date_clause": None, "deferred": [], "repealed_clauses": []},
         "addressee": {"scope": "внешним лицам", "categories": [{"name": "перевозчики", "clause": "п. 1"}], "distinctions": []},
         "nature": {"actions": [{"action": "утверждает новое", "target": "Порядок", "clauses": ["п. 1"]}],

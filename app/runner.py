@@ -93,6 +93,7 @@ from pydantic import BaseModel, ValidationError
 from app.config import (
     CLI_SETTINGS_FILE, EFFORT, GARANT_MCP_CONFIG, GARANT_NO_PROXY_HOST, GARANT_TOKEN_FILE, MODEL,
 )
+from app.json_fix import repair_json
 from app.logger import get_run_logger
 from app.trace import log_event, run_dir, save_bytes, save_raw
 
@@ -131,6 +132,8 @@ class _AttemptOutcome:
     Любой другой kind ("timeout" | "process_error" | "top_level_json_error" |
     "no_result_event" | "api_error") — сбой процесса/API. Для call() и call_text()
     он обрабатывается ОДИНАКОВО: полный повтор без --resume.
+
+    first_answer — первый ответ модели в StructuredOutput (см. _first_structured_answer).
     """
 
     kind: str
@@ -141,6 +144,7 @@ class _AttemptOutcome:
     num_turns: int | None
     permission_denials: list[Any]
     duration_s: float
+    first_answer: str | None = None
 
 
 # Изоляция каждого вызова модели от окружения машины. Проверено 2026-09-25
@@ -208,6 +212,8 @@ def _build_cmd(
         cmd += ["--json-schema", schema_json]
     # Инструменты Гаранта одобряются по полным именам; встроенные (--tools) — как раньше
     approved = allowed_tools + [_GARANT_TOOL_PREFIX + t for t in (mcp_tools or [])]
+    if schema_json is not None:
+        cmd.append("--include-partial-messages")   # первый ответ модели целиком — см. _first_structured_answer
     cmd += [
         "--output-format", "stream-json", "--verbose",
         "--tools", ",".join(allowed_tools),         # доступны ровно встроенные инструменты узла
@@ -225,6 +231,35 @@ def _build_cmd(
 
 # Срок кэша 5 минут для вызовов пайплайна: чтения внутри прогона идут через секунды и минуты
 _SHORT_CACHE_ENV = {"FORCE_PROMPT_CACHING_5M": "1"}
+
+# Имя инструмента, через который CLI принимает ответ по --json-schema
+_STRUCTURED_TOOL = "StructuredOutput"
+
+
+def _first_structured_answer(events: list[Any]) -> str | None:
+    """
+    Полный текст ПЕРВОГО ответа модели в StructuredOutput — из частичных сообщений
+    (--include-partial-messages). Битый JSON CLI отвергает, модель переписывает ответ
+    и урезает содержимое (паспорт приютов: 16,6 тыс. символов → 8,1 тыс.), поэтому берётся
+    первый ответ, а битый — чинится по схеме (app/json_fix.py). None — частичных сообщений нет.
+    """
+    current: int | None = None
+    parts: list[str] = []
+    for event in events:
+        if not (isinstance(event, dict) and event.get("type") == "stream_event"):
+            continue
+        e = event.get("event") or {}
+        if e.get("type") == "content_block_start":
+            block = e.get("content_block") or {}
+            if current is None and block.get("type") == "tool_use" and block.get("name") == _STRUCTURED_TOOL:
+                current = e.get("index")
+        elif current is not None and e.get("index") == current:
+            delta = e.get("delta") or {}
+            if e.get("type") == "content_block_delta" and delta.get("type") == "input_json_delta":
+                parts.append(delta.get("partial_json", ""))
+            elif e.get("type") == "content_block_stop":
+                return "".join(parts)
+    return None
 
 
 def _shared_context_file(run_id: str, shared_context: str) -> str:
@@ -256,6 +291,23 @@ def _mcp_env() -> dict[str, str]:
     # Гарант — напрямую: через прокси вызовы зависают и рвутся (см. GARANT_NO_PROXY_HOST)
     env["NO_PROXY"] = ",".join(h for h in (env.get("NO_PROXY", ""), GARANT_NO_PROXY_HOST) if h)
     return env
+
+
+def _is_json(text: str) -> bool:
+    """Разбирается ли текст как JSON без починки."""
+    try:
+        json.loads(text)
+    except json.JSONDecodeError:
+        return False
+    return True
+
+
+def _parse_answer(answer: str | None, schema: dict[str, Any]) -> Any:
+    """Ответ модели → объект: как есть, а если JSON битый — после починки по схеме контракта."""
+    try:
+        return json.loads(answer)
+    except json.JSONDecodeError:
+        return json.loads(repair_json(answer, schema))
 
 
 def _retry_message(error_text: str) -> str:
@@ -502,6 +554,7 @@ def _run_attempt(
         error=None,
         result_text=result_text, session_id=session_id, cost_usd=cost_usd, num_turns=num_turns,
         permission_denials=permission_denials, duration_s=duration,
+        first_answer=_first_structured_answer(events),
     )
 
 
@@ -549,7 +602,8 @@ def call(
         raise ValueError("max_attempts должен быть >= 1")
 
     logger = get_run_logger(run_id)
-    schema_json = json.dumps(model_cls.model_json_schema(), ensure_ascii=False)
+    schema = model_cls.model_json_schema()
+    schema_json = json.dumps(schema, ensure_ascii=False)
 
     started = time.monotonic()
     cost_total = 0.0
@@ -597,8 +651,10 @@ def call(
                 break
             continue
 
+        # Первый ответ модели; битый — чинится по схеме. Без частичных сообщений — принятый CLI
+        answer = outcome.first_answer if outcome.first_answer is not None else outcome.result_text
         try:
-            parsed = json.loads(outcome.result_text)
+            parsed = _parse_answer(answer, schema)
         except (json.JSONDecodeError, TypeError) as exc:
             last_error = f"поле result не разбирается как JSON: {exc}"
             _log_attempt(logger, trace_name, attempt, max_attempts, outcome.duration_s,
@@ -613,6 +669,10 @@ def call(
             if _budget_exhausted(cost_total, max_budget_usd):
                 break
             continue
+
+        if isinstance(answer, str) and not _is_json(answer):
+            logger.warning("call: artifact=%s attempt=%d — JSON ответа починен по схеме", trace_name, attempt)
+            log_event(run_id, "json_repaired", who=_agent_label(trace_name), trace=trace_name, attempt=attempt)
 
         try:
             value = model_cls.model_validate(parsed)

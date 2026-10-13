@@ -721,9 +721,10 @@ def test_mcp_tools_command_flags():
 
 def test_without_mcp_tools_isolation_unchanged():
     """Без Гаранта команда прежняя (до 2.7): та же изоляция, тот же порядок флагов; формат вывода — построчный
-    (stream-json, мониторинг 2.7)."""
+    (stream-json, мониторинг 2.7), ответ модели — кусками (первый ответ целиком, 13.10)."""
     from app.config import EFFORT, MODEL
-    expected = ["claude", "-p", "т", "--json-schema", "{}", "--output-format", "stream-json", "--verbose",
+    expected = ["claude", "-p", "т", "--json-schema", "{}", "--include-partial-messages",
+                "--output-format", "stream-json", "--verbose",
                 "--tools", "WebSearch",
                 "--allowedTools", "WebSearch", "--strict-mcp-config", "--safe-mode", "--permission-mode", "dontAsk",
                 "--model", MODEL, "--effort", EFFORT]
@@ -968,3 +969,59 @@ def test_call_streams_to_file_next_to_raw(tmp_runs_dir, valid_verdict_ok, monkey
     assert all(p == tmp_runs_dir / "run_st" / "03_verdicts" / "03.stream.jsonl" for _, p, _ in seen)
     cmd = seen[0][0]
     assert cmd[cmd.index("--output-format") + 1] == "stream-json" and "--verbose" in cmd
+
+
+
+# ---- Первый ответ модели + починка JSON по схеме (13.10, разбор паспорта) ----
+
+
+def _structured_answer(text: str, index: int = 0) -> list[dict[str, Any]]:
+    """Частичные сообщения CLI (--include-partial-messages): ответ модели в StructuredOutput кусками."""
+    def ev(e: dict[str, Any]) -> dict[str, Any]:
+        return {"type": "stream_event", "event": e}
+    half = len(text) // 2
+    return [
+        ev({"type": "content_block_start", "index": index,
+            "content_block": {"type": "tool_use", "name": "StructuredOutput", "input": {}}}),
+        ev({"type": "content_block_delta", "index": index, "delta": {"type": "input_json_delta", "partial_json": text[:half]}}),
+        ev({"type": "content_block_delta", "index": index, "delta": {"type": "input_json_delta", "partial_json": text[half:]}}),
+        ev({"type": "content_block_stop", "index": index}),
+    ]
+
+
+def test_structured_calls_stream_partial_messages():
+    """Вызов со схемой пишет ответ модели кусками — иначе первый (отклонённый CLI) ответ не сохранить."""
+    assert "--include-partial-messages" in _build_cmd("и", "{}", [], None, None)
+    assert "--include-partial-messages" not in _build_cmd("и", None, [], None, None)
+
+
+def test_first_answer_is_taken_even_if_cli_accepted_another(tmp_runs_dir, valid_verdict_ok, monkeypatch):
+    """Берётся ПЕРВЫЙ ответ модели, а не принятый CLI после переписывания (тот бывает урезан)."""
+    first = dict(valid_verdict_ok, rationale="полный первый ответ")
+    later = dict(valid_verdict_ok, rationale="урезанный")
+    stdout = _stdout_with_events(*_structured_answer(json.dumps(first, ensure_ascii=False)),
+                                 _result_event(json.dumps(later, ensure_ascii=False)))
+    monkeypatch.setattr(subprocess, "run", Mock(return_value=_proc(stdout)))
+
+    result = call("инструкция", "текст акта", Verdict,
+                  run_id="run1", trace_name="02_passport.raw.json", allowed_tools=[])
+
+    assert result.ok is True and result.attempts == 1
+    assert result.value.rationale == "полный первый ответ"
+
+
+def test_broken_first_answer_is_repaired_by_schema(tmp_runs_dir, valid_verdict_ok, monkeypatch):
+    """Первый ответ без последней скобки чинится санитайзером по схеме — без повтора; в журнале json_repaired."""
+    from app.trace import read_events, new_run
+    rid = new_run("акт.docx")
+    broken = json.dumps(valid_verdict_ok, ensure_ascii=False)[:-1]
+    stdout = _stdout_with_events(*_structured_answer(broken), _result_event("{}"))
+    mock_run = Mock(return_value=_proc(stdout))
+    monkeypatch.setattr(subprocess, "run", mock_run)
+
+    result = call("инструкция", "текст акта", Verdict,
+                  run_id=rid, trace_name="02_passport.raw.json", allowed_tools=[])
+
+    assert result.ok is True and result.attempts == 1 and mock_run.call_count == 1
+    assert result.value == Verdict.model_validate(valid_verdict_ok)
+    assert [e for e in read_events(rid) if e["event"] == "json_repaired"]

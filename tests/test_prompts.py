@@ -324,9 +324,12 @@ def test_iter4_developer_in_prompts():
     for path in (PROMPT_HYPOTHESES_VIOLATED, PROMPT_HYPOTHESES_NO_DATA, PROMPT_REQUEST, prompt_path(10)):
         text = path.read_text(encoding="utf-8")
         assert "requisites.developers" in text, path.name
-    passport = " ".join(PROMPT_PASSPORT.read_text(encoding="utf-8").split())
-    assert "Единственное исключение — орган-разработчик (developers)" in passport
-    assert "Correspondents(<topic> 0)" in passport
+    # 13.10 (рубрика паспорта): правила паспорта — в описаниях полей контракта, промпт только направляет
+    from app.contracts import Requisites
+    developers = Requisites.model_fields["developers"].description
+    assert "Number(<номер>) & Date(<дата>;<дата>)" in developers
+    assert "Correspondents(<topic> 0)" in developers
+    assert "garant" not in PROMPT_PASSPORT.read_text(encoding="utf-8")
 
 
 

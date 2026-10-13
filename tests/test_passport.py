@@ -11,6 +11,7 @@ from __future__ import annotations
 from unittest.mock import Mock
 
 import pytest
+from pydantic import ValidationError
 
 import app.nodes.passport as passport_module
 from app.config import PASSPORT_TIMEOUT_S
@@ -122,3 +123,32 @@ def test_developers_field_and_user_choice(valid_passport):
     d = p2.requisites.developers[0]
     assert d.name.startswith("Департамент предпринимательства") and d.basis == "указан пользователем при загрузке"
     assert passport_module.apply_user_developers(p, []) is p
+
+
+def test_reasoning_comes_before_choice():
+    """13.10: модель пишет JSON по порядку полей — сначала обоснование и перечни, потом выбор значения."""
+    from app.contracts import AddresseeInfo, Control, StatusInfo
+    order = list(Control.model_json_schema()["properties"])
+    assert order.index("justification") < order.index("state")
+    order = list(StatusInfo.model_json_schema()["properties"])
+    assert order.index("status_basis") < order.index("status")
+    order = list(AddresseeInfo.model_json_schema()["properties"])
+    assert order.index("categories") < order.index("scope") and order.index("distinctions") < order.index("scope")
+
+
+def test_placeholder_justification_rejected(valid_passport):
+    """Скелет ответа с обоснованиями-заглушками («x») контракт не принимает — уходит на повтор."""
+    bad = dict(valid_passport, control=dict(valid_passport["control"], justification="x"))
+    with pytest.raises(ValidationError):
+        ActPassport(**bad)
+
+
+@pytest.mark.parametrize("block", ["procedure", "control"])
+def test_outside_only_scope_contradicts_organ_duties(valid_passport, block):
+    """Есть процедура или контроль органа — у органа обязанности по акту: «внешним лицам» — противоречие."""
+    bad = dict(valid_passport)
+    bad[block] = dict(valid_passport[block], state="есть", clauses=["п. 3"])
+    with pytest.raises(ValidationError, match="внешним лицам"):
+        ActPassport(**bad)
+    bad["addressee"] = dict(valid_passport["addressee"], scope="и тем и другим")
+    assert ActPassport(**bad).addressee.scope == "и тем и другим"
