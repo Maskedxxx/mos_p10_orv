@@ -91,3 +91,24 @@ def test_user_action_on_a_run_goes_to_session_journal(tmp_runs_dir, tmp_path, mo
     assert len(ev) == 1 and ev[0]["action"] == "скачивание Excel" and ev[0]["version"] == 2
     assert ev[0]["who"] == "пользователь" and ev[0]["session"] == "s-abc123"
     assert len((tmp_path / "logs" / "actions.jsonl").read_text(encoding="utf-8").splitlines()) == 2
+
+
+
+def test_service_journal_appends_events():
+    """Журнал сервиса var/logs/service.jsonl: событие — строка со временем; папка создаётся сама."""
+    from app.trace import log_service_event, read_service_events
+    log_service_event("service_started", port=8090)
+    log_service_event("run_queued", run_id="r1", ahead=0)
+    assert [(e["event"], e.get("port"), e.get("run_id")) for e in read_service_events()] == [
+        ("service_started", 8090, None), ("run_queued", None, "r1")]
+    assert all(e["ts"] for e in read_service_events())
+
+
+def test_session_close_goes_to_service_journal(tmp_runs_dir):
+    """Закрытие сессии видно и в журнале сервиса — какие сессии когда закрылись и как."""
+    from app import sessions
+    from app.trace import read_service_events
+    rid = new_run("акт.docx")
+    sessions.close_session(rid, by="таймер")
+    closed = [e for e in read_service_events() if e["event"] == "session_closed"]
+    assert closed == [{"ts": closed[0]["ts"], "event": "session_closed", "run_id": rid, "by": "таймер"}]

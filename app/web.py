@@ -62,9 +62,10 @@ import hmac
 import html
 import json
 import math
+import os
 import time
 from collections.abc import Callable, Coroutine
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
@@ -401,6 +402,7 @@ class _Job:
 
     run_id: str
     docx_path: Path
+    queued_at: float = field(default_factory=time.monotonic)   # для журнала сервиса: сколько ждал слота
 
 
 class RunQueue:
@@ -424,6 +426,7 @@ class RunQueue:
     def submit(self, run_id: str, docx_path: Path) -> None:
         """Поставить прогон в очередь; если слот свободен — он стартует сразу."""
         self._waiting.append(_Job(run_id, docx_path))
+        trace.log_service_event("run_queued", run_id=run_id, ahead=len(self._waiting) - 1)
         self._start_waiting()
 
     def state(self, run_id: str) -> QueueState:
@@ -441,6 +444,8 @@ class RunQueue:
         while self._waiting and len(self._running) < config.MAX_CONCURRENT_RUNS:
             job = self._waiting.pop(0)
             self._running.append(job.run_id)
+            trace.log_service_event("run_started", run_id=job.run_id, slot=len(self._running),
+                                    waited_s=round(time.monotonic() - job.queued_at, 1))
             task = asyncio.create_task(self._execute(job))
             # Ссылку на задачу держим сами: иначе её может забрать сборщик мусора
             self._tasks.add(task)
@@ -448,13 +453,20 @@ class RunQueue:
 
     async def _execute(self, job: _Job) -> None:
         """Один прогон в отдельном потоке, затем освобождение слота для следующего."""
+        started = time.monotonic()
+        error_text = None
         try:
             await nicegui_run.io_bound(self._runner, job.docx_path, job.run_id)
         except Exception as error:
             # Свои сбои прогон пишет в progress.json и run.log сам; сюда попадает
             # только то, что он не поймал — это в лог прогона, страницу не роняем
             get_run_logger(job.run_id).getChild("web").exception("прогон упал: %s", error)
+            error_text = f"{type(error).__name__}: {error}"
         finally:
+            progress = read_progress(job.run_id)
+            trace.log_service_event("run_finished", run_id=job.run_id,
+                                    status=progress.status if progress is not None else None,
+                                    duration_s=round(time.monotonic() - started, 1), error=error_text)
             self._running.remove(job.run_id)
             self._start_waiting()
 
@@ -1987,6 +1999,8 @@ def main() -> None:
     configure_storage_path()
     attach_service_log(config.LOGS_DIR / "service.log")
     app_logger.info("сервис запущен: порт %s", WEB_PORT)
+    trace.log_service_event("service_started", port=WEB_PORT, pid=os.getpid(),
+                            max_concurrent_runs=config.MAX_CONCURRENT_RUNS, model=config.MODEL)
     ui.run(
         host="0.0.0.0",
         port=WEB_PORT,

@@ -190,6 +190,26 @@ def test_third_run_waits_in_queue_and_sees_its_position(monkeypatch):
     asyncio.run(scenario())
 
 
+def test_queue_writes_service_journal(monkeypatch):
+    """Журнал сервиса (2.7): прогон поставлен в очередь, стартовал в слоте, закончился."""
+    monkeypatch.setattr(config, "MAX_CONCURRENT_RUNS", 1)
+
+    async def scenario() -> None:
+        runner = _BlockingRunner(["r1", "r2"])
+        queue = web.RunQueue(runner)
+        queue.submit("r1", Path("/tmp/r1.docx"))
+        queue.submit("r2", Path("/tmp/r2.docx"))
+        await _wait_started(runner, "r1")
+        await _finish_all(queue, runner)
+
+    asyncio.run(scenario())
+    events = [(e["event"], e["run_id"]) for e in trace.read_service_events() if "run_id" in e]
+    assert events[:3] == [("run_queued", "r1"), ("run_started", "r1"), ("run_queued", "r2")]
+    assert ("run_finished", "r1") in events and ("run_started", "r2") in events and events[-1] == ("run_finished", "r2")
+    started = [e for e in trace.read_service_events() if e["event"] == "run_started"]
+    assert started[0]["slot"] == 1 and started[0]["waited_s"] >= 0
+
+
 def test_queue_moves_on_by_itself_when_slot_frees(monkeypatch):
     monkeypatch.setattr(config, "MAX_CONCURRENT_RUNS", 2)
 

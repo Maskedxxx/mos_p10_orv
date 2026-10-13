@@ -47,6 +47,7 @@ from typing import Any, TypeVar
 
 from pydantic import BaseModel
 
+import app.config as config
 from app.config import RUNS_DIR
 from app.contracts import RunMeta
 
@@ -138,6 +139,33 @@ def log_event(run_id: str, event: str, *, who: str = "система", **fields:
 def read_events(run_id: str) -> list[dict]:
     """Прочитать журнал сессии целиком (для проверок и инструментов мониторинга)."""
     path = run_dir(run_id) / EVENTS_FILE
+    if not path.is_file():
+        return []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+
+
+SERVICE_EVENTS_FILE = "service.jsonl"   # журнал сервиса в config.LOGS_DIR (2.7, мониторинг)
+
+
+def log_service_event(event: str, **fields: Any) -> None:
+    """
+    Дописать событие в журнал сервиса var/logs/service.jsonl: старт сервиса, очередь прогонов
+    (поставлен, начат, закончен), закрытие сессий. Сбой записи работу не останавливает.
+    """
+    entry = {"ts": datetime.now().isoformat(timespec="milliseconds"), "event": event, **fields}
+    line = json.dumps(entry, ensure_ascii=False, default=str)
+    try:
+        with _events_lock:
+            config.LOGS_DIR.mkdir(parents=True, exist_ok=True)
+            with open(config.LOGS_DIR / SERVICE_EVENTS_FILE, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+    except OSError:
+        pass
+
+
+def read_service_events() -> list[dict]:
+    """Прочитать журнал сервиса целиком (для проверок и инструментов мониторинга)."""
+    path = config.LOGS_DIR / SERVICE_EVENTS_FILE
     if not path.is_file():
         return []
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]

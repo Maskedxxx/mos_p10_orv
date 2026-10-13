@@ -10,8 +10,15 @@ from __future__ import annotations
 
 import pytest
 
+import app.config as config_module
 import app.logger as logger_module
 import app.trace as trace_module
+
+
+@pytest.fixture(autouse=True)
+def _logs_in_tmp(tmp_path, monkeypatch):
+    """Журналы сервиса (actions.jsonl, service.jsonl — 2.7) в тестах пишутся во временную папку, не в var/logs."""
+    monkeypatch.setattr(config_module, "LOGS_DIR", tmp_path / "var_logs")
 
 
 @pytest.fixture

@@ -23,7 +23,7 @@ from datetime import datetime
 from app import config, dialog, trace, versions
 from app.contracts import RunMeta, RunProgress
 from app.trace import (
-    EVENTS_FILE, SESSION_SUMMARY_FILE, load_json, log_event, read_events, run_dir, save_json,
+    EVENTS_FILE, SESSION_SUMMARY_FILE, load_json, log_event, log_service_event, read_events, run_dir, save_json,
 )
 
 PROGRESS_FILE = "progress.json"   # то же имя, что в pipeline.PROGRESS_FILE (pipeline здесь не нужен целиком)
@@ -132,4 +132,5 @@ def close_session(run_id: str, *, by: str, now: datetime | None = None) -> bool:
     summary = _summary(run_id, by, now)
     log_event(run_id, "session_closed", by=by, cost_usd=summary["cost_usd"]["всего"], version=summary["version"])
     save_json(run_id, SESSION_SUMMARY_FILE, summary)
+    log_service_event("session_closed", run_id=run_id, by=by)
     return True
