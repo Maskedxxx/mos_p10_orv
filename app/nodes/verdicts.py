@@ -41,7 +41,7 @@ from app.config import (
     indicator_tools,
     prompt_path,
 )
-from app.contracts import ActPassport, Indicator01Output, Indicator02Output, Indicator03Output, Indicator04Output, Indicator05Output, Indicator06Output, Verdict, VerdictOutput
+from app.contracts import ActPassport, Indicator01Output, Indicator02Output, Indicator03Output, Indicator04Output, Indicator05Output, Indicator06Output, Indicator07Output, Verdict, VerdictOutput
 from app.logger import get_run_logger
 from app.runner import call
 from app.nodes.hypotheses import _add_cost_to_meta, _after, append_task_clarification
@@ -82,7 +82,8 @@ def fill_prompt_labels(prompt_text: str, regions: list[str] | None = None, limit
 # Свой контракт индикатора (13.10, разбор узлов): артефакт проверки и рубрика вердикта — в описаниях
 # полей, поля артефакта стоят перед разбором и вердиктом. Остальные индикаторы — общий VerdictOutput.
 INDICATOR_OUTPUT: dict[int, type] = {1: Indicator01Output, 2: Indicator02Output, 3: Indicator03Output,
-                                  4: Indicator04Output, 5: Indicator05Output, 6: Indicator06Output}
+                                  4: Indicator04Output, 5: Indicator05Output, 6: Indicator06Output,
+                                  7: Indicator07Output}
 
 
 def _split_artifacts(value: Any) -> tuple[Verdict, dict[str, Any]]:
@@ -240,7 +241,7 @@ def run_verdicts(
     ответов, возврат кандидата без записи 03_verdicts/NN.json (запись после
     «Принять»). Стоимость учитывается в meta всегда.
 
-    regions — регионы сравнения прогона для промптов 7, 8, 11 (None — COMPARISON_REGIONS);
+    regions — регионы сравнения прогона для промптов 8, 11 (None — COMPARISON_REGIONS);
     search_limits — потолки поиска прогона по индикаторам (None — SEARCH_LIMITS).
 
     Требует, чтобы meta.json прогона уже существовал (создаётся trace.new_run()

@@ -882,3 +882,48 @@ def test_indicator06_reasoning_before_choice():
     assert order.index("requirements") < order.index("term") < order.index("term_check") < order.index("rationale") < order.index("verdict")
     row = list(ActRequirement.model_json_schema()["properties"])
     assert row.index("basis") < row.index("kind")
+
+
+# ---- Индикатор 7: таблица возможных повторов, рубрика вердикта (13.10, разбор узлов) ----
+
+
+def _rep7(outcome: str) -> dict:
+    return {"step": "проверка заявки", "clause": "п. 2", "first_clause": "п. 1",
+            "difference": "те же требования", "outcome": outcome}
+
+
+def _ind07(verdict: str, rows: list, procedures: str | None) -> dict:
+    return {"indicator": 7, "name": "отсутствие избыточных процедур", "procedures": procedures, "repeats": rows,
+            "rationale": "полный разбор", "verdict": verdict, "rationale_brief": _B}
+
+
+@pytest.mark.parametrize("verdict, rows, procedures", [
+    ("нарушен", [_rep7("явный повтор"), _rep7("не повтор")], "приём и проверка заявки (п. 1–2)"),
+    ("соблюдён", [_rep7("не повтор")], "приём и проверка заявки (п. 1–2)"),
+    ("соблюдён", [], "приём заявки (п. 1)"),
+    ("не применимо", [], None),
+])
+def test_indicator07_verdict_follows_repeats(verdict, rows, procedures):
+    from app.contracts import Indicator07Output
+    assert Indicator07Output(**_ind07(verdict, rows, procedures)).verdict == verdict
+
+
+@pytest.mark.parametrize("verdict, rows, procedures", [
+    ("соблюдён", [_rep7("явный повтор")], "п. 1–2"),
+    ("нарушен", [_rep7("не повтор")], "п. 1–2"),
+    ("не применимо", [], "п. 1"),
+    ("соблюдён", [], None),
+    ("нарушен", [_rep7("явный повтор")], None),   # повтор без процедур — противоречие
+])
+def test_indicator07_verdict_contradicting_repeats_rejected(verdict, rows, procedures):
+    from app.contracts import Indicator07Output
+    with pytest.raises(ValidationError):
+        Indicator07Output(**_ind07(verdict, rows, procedures))
+
+
+def test_indicator07_reasoning_before_choice():
+    from app.contracts import Indicator07Output, RepeatedStep
+    order = list(Indicator07Output.model_json_schema()["properties"])
+    assert order.index("procedures") < order.index("repeats") < order.index("rationale") < order.index("verdict")
+    row = list(RepeatedStep.model_json_schema()["properties"])
+    assert row.index("difference") < row.index("outcome")

@@ -1058,6 +1058,122 @@ class Indicator06Output(BaseModel):
         return self
 
 
+# ---- Индикатор 7: свой контракт — таблица возможных повторов, рубрика вердикта (13.10) ----
+# Рубрика: 4_документы/Рубрика_индикатор_07.md. Таблица — в 03_verdicts/07.checks.json.
+
+
+class RepeatedStep(_Base):
+    """Шаг, похожий на повтор другого шага, и вывод — явный ли это повтор."""
+
+    step: str = Field(description="Что делается второй раз — как в акте: проверка, согласование, подача сведений.")
+    clause: str = Field(description="Пункт, где шаг делается второй раз.")
+    first_clause: str = Field(description="Пункт, где тот же шаг уже сделан.")
+    difference: str = Field(
+        description="Что второй шаг даёт нового: другой предмет, другие требования, новый результат — или ничего."
+    )
+    outcome: Literal["явный повтор", "не повтор"] = Field(
+        description=(
+            "«явный повтор» — одно и то же делается дважды, и это видно из текста акта: лицо повторно подаёт "
+            "те же документы или сведения, повторно проходит то же согласование; второй орган или второй этап "
+            "проверяет то же самое по тем же требованиям («повторно проверяет», те же основания отказа), "
+            "и второй раз ничего нового не даёт. «не повтор» — второй шаг проверяет или решает другое (другой "
+            "предмет, другой орган со своей компетенцией), даёт новый результат, или акт ссылается на "
+            "федеральный закон, который требует этот шаг; есть сомнение — это «не повтор»."
+        )
+    )
+
+
+class Indicator07Output(BaseModel):
+    """Индикатор 7 «Отсутствие избыточных процедур»: одно и то же действие не совершается дважды —
+    ни лицом, ни органами власти.
+    Сначала опиши процедуры и заполни repeats по всему документу, потом разбор, потом вердикт."""
+
+    model_config = ConfigDict(extra="forbid", title="Verdict")
+
+    indicator: int = Field(ge=1, le=12, description="Номер индикатора из задания, 1–12.")
+    name: str = Field(description="Название индикатора, как в задании.")
+    procedures: str | None = Field(
+        default=None,
+        description=(
+            "Какие процедуры для граждан, организаций или органов (подача, рассмотрение, согласование, "
+            "отчётность) и какие контрольные мероприятия устанавливает акт — кратко, с пунктами. Ни процедур, "
+            "ни контроля нет — null."
+        ),
+    )
+    repeats: list[RepeatedStep] = Field(
+        default_factory=list,
+        description=(
+            "Артефакт. Одна запись — один шаг, похожий на повтор другого шага того же акта. Включать: каждый "
+            "такой шаг из текста и приложений; одинаковый повтор в нескольких приложениях — одна запись. "
+            "Не включать: тяжёлый, частый или затратный шаг, если он делается один раз; число документов "
+            "и форм; требования, повторённые в других актах."
+        ),
+    )
+    rationale: str = Field(
+        description="Разбор: какие процедуры есть, что сравнивал, почему такой вердикт."
+    )
+    verdict: Literal["нарушен", "соблюдён", "не применимо", "нет данных"] = Field(
+        description=(
+            "Вердикт следует только из procedures и repeats. "
+            "«нарушен» — есть хотя бы одна запись «явный повтор». "
+            "«соблюдён» — procedures заполнено, записей «явный повтор» нет. "
+            "«не применимо» — procedures = null: ни процедур, ни контроля в акте нет. "
+            "«нет данных» не ставится: вывод делается по тексту акта, при сомнении — «не повтор»."
+        )
+    )
+    missing_data: str | None = Field(
+        default=None,
+        description="Всегда null: «нет данных» у этого индикатора не ставится.",
+    )
+    proof: str | None = Field(
+        default=None,
+        description=(
+            "Дословная цитата. «нарушен» — пункт, где шаг повторяется. «соблюдён» — пункт с процедурой. "
+            "«не применимо» — null."
+        ),
+    )
+    clause: str | None = Field(
+        default=None,
+        description="Пункт, откуда цитата proof. «не применимо» — null.",
+    )
+    sources: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Только адреса страниц, на которых стоит вывод, по одному на элемент. "
+            "Рассуждения о том, что не открылось и не нашлось, — в rationale."
+        ),
+    )
+    attempts: int = Field(
+        default=1, ge=1,
+        description="Служебное: сколько попыток вызова понадобилось. Заполняет код — оставь 1.",
+    )
+    rationale_brief: list[BriefPoint] = _brief(_RATIONALE_BRIEF)
+
+    @model_validator(mode="after")
+    def _check_name_rationale_missing_data(self) -> "Indicator07Output":
+        _not_blank(self.name)
+        _not_blank(self.rationale)
+        _check_missing_data(self.verdict, self.missing_data)
+        return self
+
+    @model_validator(mode="after")
+    def _check_verdict_follows_repeats(self) -> "Indicator07Output":
+        """Вердикт следует из процедур и таблицы повторов (рубрика индикатора 7, раздел 4)."""
+        if self.procedures is None and self.repeats:
+            raise ValueError("procedures = null, но repeats не пуст — повторы бывают только в процедурах акта")
+        clear = [r.step for r in self.repeats if r.outcome == "явный повтор"]
+        if clear:
+            allowed, why = {"нарушен"}, f"есть явный повтор ({clear[0]})"
+        elif self.procedures is not None:
+            allowed, why = {"соблюдён"}, "процедуры есть, явных повторов нет"
+        else:
+            allowed, why = {"не применимо"}, "процедур и контроля нет"
+        if self.verdict not in allowed:
+            raise ValueError(f"вердикт «{self.verdict}» не следует из procedures и repeats: {why} — "
+                             f"допустимо: {', '.join(sorted(allowed))}")
+        return self
+
+
 class Buckets(BaseModel):
     """Разбор корзины вердиктов на 4 кучи (узел [3] пайплайна)."""
 
