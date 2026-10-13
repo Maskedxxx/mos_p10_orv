@@ -70,6 +70,7 @@ def test_report_shows_agents_tools_and_problems(tmp_runs_dir):
     line = next(ln for ln in text.splitlines() if ln.startswith("03_verdicts/03"))
     assert "попыток 1 · ok · 760 с · $0.37 · ходов 20" in line
     assert "garant_search×1" in line and "garant_document_redactions×1" in line and "StructuredOutput" not in line.split("⚠")[0]
+    assert "garant_export_html" not in line.split("⚠")[0]   # запрещённый вызов не выполнялся — не в счёт инструментов
     assert "обрыв связи×1" in line and "не разрешён агенту×1" in line
     problems = text.split("== Проблемы")[1]
     assert ("агент 03_verdicts/03: ошибки инструментов {'обрыв связи': 1, 'таймаут': 1, 'нет такого инструмента': 1}"

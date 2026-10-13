@@ -82,7 +82,9 @@ def agents(run_path: Path, journal: list[dict]) -> list[dict]:
             "agent": base, "attempts": len(files),
             "outcomes": [a["outcome"] for a in attempts],
             "cost_usd": round(cost, 4), "turns": int(turns), "seconds": round(seconds),
-            "tools": Counter(c["name"] for c in calls if c["name"] != STRUCTURED_OUTPUT),
+            # Запрещённый изоляцией вызов не выполнялся — в счёт инструментов не идёт (виден в ошибках)
+            "tools": Counter(c["name"] for c in calls
+                             if c["name"] != STRUCTURED_OUTPUT and c["error"] != "не разрешён агенту"),
             "errors": Counter(c["error"] for c in calls if c["error"]),
         })
     return result
