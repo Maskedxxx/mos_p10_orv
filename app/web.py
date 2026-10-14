@@ -83,7 +83,7 @@ from starlette.responses import Response
 
 from app import config, dialog, feedback, operations, sessions, trace, versions
 from app.actions import Who, log_action, session_label
-from app.config import ACCEPTED_EXTENSIONS, COMPARISON_REGIONS, SEARCH_LIMIT_MAX, SEARCH_LIMITS, all_indicators
+from app.config import ACCEPTED_EXTENSIONS, SEARCH_LIMIT_MAX, SEARCH_LIMITS, all_indicators
 from app.mandatory_indicators import ACT_TYPES, NO_TYPE
 from app.contracts import (
     Buckets, DataRequest, HypothesisMap, Marks, NodeState, NodeStatus, Operation, RunMeta, RunProgress, RunStatus,
@@ -206,16 +206,6 @@ def toggle_act_type(selected: set[str], changed: str, checked: bool) -> set[str]
     return (selected - {NO_TYPE}) | {changed}
 
 
-def parse_regions(text: str) -> list[str]:
-    """Регионы сравнения (К) из поля страницы: по строке на регион, без пустых и повторов."""
-    seen: list[str] = []
-    for line in text.splitlines():
-        name = line.strip().strip(",;").strip()
-        if name and name not in seen:
-            seen.append(name)
-    return seen
-
-
 def clamp_limits(values: dict[int, object]) -> dict[int, int]:
     """Потолки поиска (Л) из полей страницы: целые от 1 до SEARCH_LIMIT_MAX; пусто — значение по умолчанию."""
     out: dict[int, int] = {}
@@ -228,9 +218,10 @@ def clamp_limits(values: dict[int, object]) -> dict[int, int]:
     return out
 
 
-def can_start(has_file: bool, act_types: set[str], regions: list[str]) -> bool:
-    """Кнопка «Проанализировать»: файл принят, выбран хотя бы один тип акта, регионов сравнения не ноль."""
-    return has_file and bool(act_types) and bool(regions)
+def can_start(has_file: bool, act_types: set[str]) -> bool:
+    """Кнопка «Проанализировать»: файл принят и выбран хотя бы один тип акта (14.10: поле регионов сравнения
+    убрано — сравнение с регионами снято у индикаторов 7, 8, 11 до БЛ-3)."""
+    return has_file and bool(act_types)
 
 
 def validate_upload(filename: str, size: int) -> str | None:
@@ -1818,9 +1809,8 @@ def page_index(request: Request) -> None:
     limit_inputs: dict[int, ui.number] = {}
 
     def refresh_start() -> None:
-        """Кнопка активна, только когда есть файл, тип акта и регионы сравнения (2.7)."""
-        regions = parse_regions(regions_box.value or "")
-        if can_start("data" in pending, act_types, regions):
+        """Кнопка активна, только когда есть файл и тип акта (2.7)."""
+        if can_start("data" in pending, act_types):
             start.enable()
         else:
             start.disable()
@@ -1863,18 +1853,17 @@ def page_index(request: Request) -> None:
         if not isinstance(name, str) or not isinstance(data, bytes):
             ui.notify("Сначала выберите файл акта", type="warning")
             return
-        regions = parse_regions(regions_box.value or "")
-        if not act_types or not regions:
-            ui.notify("Отметьте тип акта и оставьте хотя бы один регион сравнения", type="warning")
+        if not act_types:
+            ui.notify("Отметьте тип акта", type="warning")
             return
         types = [t for t in ACT_TYPES if t in act_types]          # порядок — как на странице
         limits = clamp_limits({n: box.value for n, box in limit_inputs.items()})
-        run_id = trace.new_run(name, act_types=types, comparison_regions=regions, search_limits=limits)
+        run_id = trace.new_run(name, act_types=types, search_limits=limits)
         input_name = input_filename(name)
         trace.save_bytes(run_id, input_name, data)
         QUEUE.submit(run_id, trace.run_dir(run_id) / input_name)
         log_action(who, "старт прогона", run_id, file=name, size=len(data), act_types=types,
-                   regions=regions, search_limits=limits)
+                   search_limits=limits)
         ui.navigate.to(f"/run/{run_id}")
 
     with ui.column().classes("w-full items-center p-8"):
@@ -1908,12 +1897,9 @@ def page_index(request: Request) -> None:
                     name, on_change=lambda e, n=name: on_type(n, bool(e.value)),
                 ).classes("text-sm")
 
-            # 2.7 (К, Л): «Настройки прогона» — по умолчанию из конфига, хранятся в прогоне
+            # 2.7 (Л): «Настройки прогона» — потолки поиска, по умолчанию из конфига, хранятся в прогоне.
+            # 14.10: поле «Регионы сравнения» (К) убрано — сравнение с регионами снято до БЛ-3
             with ui.expansion("Настройки прогона").classes("w-full text-sm"):
-                ui.label("Регионы сравнения — по строке на регион").classes("text-sm")
-                regions_box = ui.textarea(
-                    value="\n".join(COMPARISON_REGIONS), on_change=lambda _: refresh_start(),
-                ).props("outlined autogrow").classes("w-full")
                 ui.label(f"Потолок заходов поиска в интернете (от 1 до {SEARCH_LIMIT_MAX})").classes("text-sm")
                 names = {ind.number: ind.name for ind in all_indicators()}
                 for n, default in SEARCH_LIMITS.items():
