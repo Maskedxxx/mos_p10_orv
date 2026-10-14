@@ -140,6 +140,23 @@ def _to_request(run_id: str, n: int, trace_prefix: str) -> list[dict]:
     return []
 
 
+def _questions_to_data(value: HypothesisSetOutput) -> HypothesisSet:
+    """
+    14.10: вопросы органу модель пишет отдельным списком questions (своё место для вопросов), дальше по цепочке
+    (карта, бланк, лист «Вопросы органу», диалог) они живут, как прежде, строками data с источником «вопрос органу».
+    Код перекладывает их туда без пересказа.
+    """
+    data = value.model_dump(mode="json")
+    for h in data["hypotheses"]:
+        for q in h.pop("questions", []) or []:
+            text = q["question"].strip()
+            clause = q["clause"].strip()
+            if clause and clause.casefold() not in text.casefold():
+                text = f"{text} ({clause})"
+            h["data"].append({"metric": text, "source": "вопрос органу", "where": None})
+    return HypothesisSet.model_validate(data)
+
+
 def _metric_key(text: str) -> str:
     """Ключ сравнения показателей: без скобок (пункты, приложения), знаков и регистра — агент гипотез часто
     вставляет пункт в середину названия («… (приложение 1, п. 2.1), ед.»), это то же число."""
@@ -233,7 +250,7 @@ def _run_one_hypothesis(
         # indicator/name перезаписываем из вердикта (источник истины), чтобы модель
         # не могла разъехаться с номером/именем индикатора, под которым сохраняется
         # артефакт NN.json — по аналогии с перезаписью attempts в узле [2]
-        hset = result.value.model_copy(update={"indicator": n, "name": verdict.name})
+        hset = _questions_to_data(result.value).model_copy(update={"indicator": n, "name": verdict.name})
         hset, added = _ensure_requests(hset, to_request)
         if added:
             get_run_logger(run_id).getChild("05_hypotheses").info(

@@ -474,3 +474,20 @@ def test_ensure_requests_recognizes_reworded_metric():
     out, added = _ensure_requests(hset, [{"metric": "число поданных заявок на субсидию (приложение 1)",
                                           "unit": "ед.", "clause": "п. 2.1"}])
     assert added == [] and len(out.hypotheses[0].data) == 1
+
+
+def test_questions_moved_to_data_as_before():
+    """14.10: вопросы из questions код кладёт в data с источником «вопрос органу» — дальше по цепочке как прежде."""
+    from app.contracts import HypothesisSetOutput
+    from app.nodes.hypotheses import _questions_to_data
+    hyp = {"hypothesis": "г", "grounds": "о", "proof": None, "clause": None,
+           "effects": [{"affected": "бизнес", "metric": "м", "how_to_calculate": "к",
+                        "expected_trend": "рост показателя относительно года до вступления акта подтвердит гипотезу",
+                        "how_to_calculate_brief": ["к"], "expected_trend_brief": ["рост"]}],
+           "data": [{"metric": "число заявок", "source": "запрос органу"}],
+           "questions": [{"clause": "п. 2.7", "why": "причины", "question": "Какие основания продления чаще всего?"}],
+           "hypothesis_brief": ["г"], "grounds_brief": ["о"]}
+    value = HypothesisSetOutput(indicator=11, name="н", violation_kind="издержки", why_this_many="одна", hypotheses=[hyp])
+    hset = _questions_to_data(value)
+    assert [(d.metric, d.source) for d in hset.hypotheses[0].data] == [
+        ("число заявок", "запрос органу"), ("Какие основания продления чаще всего? (п. 2.7)", "вопрос органу")]

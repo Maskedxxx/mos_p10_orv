@@ -259,11 +259,12 @@ def test_all_field_names_across_all_models_are_latin():
     # Защита от того, что рекурсия случайно не дошла до части моделей
     # (13: + PairDecision — решение по кандидату на слияние, узел [5], ОС 2026-09-04;
     #  14: + SourceRef — происхождение позиции запроса, узел [6], ОС 2026-09-04)
-    assert len(all_models) == 60   # v2: + ActPassport с 24 вложенными, + PairDecision, + SourceRef;
+    assert len(all_models) == 62   # v2: + ActPassport с 24 вложенными, + PairDecision, + SourceRef;
     # итерация 3: + DialogTurn, 10 операций диалога и SplitPart;
     # 2.5: + строгие ответы с выжимкой — VerdictOutput, HypothesisSetOutput, HypothesisOutput,
     # EffectOutput, MergeOutput, MapRowOutput;
     # 2.7: + DataItemOutput — показатель в ответе модели без пометки эксперта (Ж3), + MarkNotTracked, + Developer (орган-разработчик, А)
+    # 14.10: + NumberItemOutput и OrganQuestion — числа и вопросы органу в ответе гипотез разными списками (ошибка 4)
 
     for model_cls in all_models:
         for field_name in model_cls.model_fields:
@@ -1204,3 +1205,18 @@ def test_indicator10_to_request_only_and_always_with_no_data():
                              "to_request": [{"metric": "число заявок", "unit": "ед.", "clause": "п. 1"}]})
     order = list(Indicator10Output.model_json_schema()["properties"])
     assert order.index("findings") < order.index("to_request") < order.index("verdict")
+
+
+# ---- 14.10, ошибка 4 аудита: вопросы органу — своим списком в ответе гипотез ----
+
+
+def test_hypothesis_output_separates_numbers_and_questions():
+    """Число — в data («открытый» / «запрос органу»), вопрос словами — в questions; вопрос в data не принимается."""
+    from app.contracts import HypothesisOutput
+    ok = {**_hyp_out(), "questions": [{"clause": "п. 2.7", "why": "понять причины продлений",
+                                        "question": "По каким основаниям чаще всего продлевается срок?"}]}
+    assert len(HypothesisOutput(**ok).questions) == 1
+    assert HypothesisOutput(**_hyp_out()).questions == []                       # без вопросов — нормально
+    bad = {**_hyp_out(), "data": [{"metric": "Почему?", "source": "вопрос органу"}]}
+    with pytest.raises(ValidationError):
+        HypothesisOutput(**bad)

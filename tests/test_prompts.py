@@ -286,7 +286,7 @@ def test_iter4_hypotheses_prompts():
         text = " ".join(path.read_text(encoding="utf-8").split())   # без учёта переносов строк
         assert "число жалоб и судебных споров по применению акта" in text
         assert "орган их не ведёт" not in text
-        assert "Вопрос органу словами ставь (source «вопрос органу»" in text
+        assert "Вопрос органу словами — не в data, а в отдельный список questions" in text   # 14.10, ошибка 4
         assert "Исключение: показатель, который орган сам ведёт как официальный" in text
     v = " ".join(PROMPT_HYPOTHESES_VIOLATED.read_text(encoding="utf-8").split())
     assert "прошивка (если акт её требует)" in v and "время на дорогу и курьера" not in v

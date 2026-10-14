@@ -2122,15 +2122,49 @@ class HypothesisSet(_Base):
         return self
 
 
+class NumberItemOutput(DataItem):
+    """14.10 (ошибка 4 аудита): число в ответе модели гипотез — только «открытый» или «запрос органу»;
+    вопросы словами — отдельным списком questions, чтобы модель видела для них своё место."""
+
+    model_config = ConfigDict(title="DataItem")
+
+    source: Literal["открытый", "запрос органу"] = Field(description=DataItem.model_fields["source"].description.split(
+        " «вопрос органу» —")[0])
+
+
+class OrganQuestion(_Base):
+    """Вопрос органу словами (14.10): что орган делает на практике, а в акте не написано."""
+
+    clause: str = Field(description="Пункт акта, о применении которого вопрос.")
+    why: str = Field(description="Зачем ответ гипотезе: что без него нельзя проверить.")
+    question: str = Field(
+        description=(
+            "Текст вопроса органу. Ставится, когда для проверки гипотезы нужно знать, как орган применяет этот "
+            "пункт на практике, а в акте этого нет: какими критериями пользуется, какие причины или случаи "
+            "встречаются чаще, какие категории выделяет. Ответ — словами или коротким перечнем. Например: "
+            "«По каким основаниям чаще всего продлевается срок рассмотрения (п. N)? Назовите три самых частых». "
+            "Не ставится: ответ есть в тексте акта или в открытых данных; ответ — число (это data с источником "
+            "«запрос органу»); мнение органа об акте в целом; его планы."
+        )
+    )
+
+
 class HypothesisOutput(Hypothesis):
-    """Гипотеза в ответе модели узлов 4a / 4b: выжимки обязательны (2.5)."""
+    """Гипотеза в ответе модели узлов 4a / 4b: выжимки обязательны (2.5); числа и вопросы — разными списками (14.10)."""
 
     model_config = ConfigDict(title="Hypothesis")
 
     hypothesis_brief: list[BriefPoint] = _brief(_HYPOTHESIS_BRIEF)
     grounds_brief: list[BriefPoint] = _brief(_GROUNDS_BRIEF)
     effects: list[EffectOutput] = Field(min_length=1, description=Hypothesis.model_fields["effects"].description)
-    data: list[DataItemOutput] = Field(min_length=1, description=Hypothesis.model_fields["data"].description)
+    data: list[NumberItemOutput] = Field(
+        min_length=1,
+        description="Числа, нужные для расчёта эффектов: из открытых источников или запросом органу.",
+    )
+    questions: list[OrganQuestion] = Field(
+        default_factory=list,
+        description="Вопросы органу словами — если без ответа гипотезу не проверить. Пусто — нормально.",
+    )
 
 
 class HypothesisSetOutput(HypothesisSet):
