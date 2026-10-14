@@ -284,11 +284,12 @@ def test_raw_saved_every_attempt(tmp_runs_dir, monkeypatch):
 
 
 def test_cost_summed_across_attempts(tmp_runs_dir, valid_verdict_ok, monkeypatch):
-    """8. Стоимость суммируется по всем попыткам."""
+    """8. Стоимость суммируется по всем попыткам. Вторая попытка идёт через --resume сессии s1, а CLI при --resume
+    сообщает стоимость сессии с начала (14.10): 0.05 = 0.02 первой попытки + 0.03 второй."""
 
     bad_stdout = _stdout_with_events(_result_event("{плохой", session_id="s1", cost=0.02))
     good_stdout = _stdout_with_events(
-        _result_event(json.dumps(valid_verdict_ok), session_id="s1", cost=0.03)
+        _result_event(json.dumps(valid_verdict_ok), session_id="s1", cost=0.05)
     )
     mock_run = Mock(side_effect=[_proc(bad_stdout), _proc(good_stdout)])
     monkeypatch.setattr(subprocess, "run", mock_run)
@@ -1070,3 +1071,22 @@ def test_resume_session_kept_after_process_failure(tmp_runs_dir, valid_verdict_o
                 resume_session_id="sess-dlg").ok
     for c in mock_run.call_args_list:
         assert _flag_value(c.args[0], "--resume") == "sess-dlg"
+
+
+def test_resume_cost_counts_only_this_run(tmp_runs_dir, valid_verdict_ok, monkeypatch):
+    """14.10: при --resume CLI сообщает стоимость сессии с начала — расход хода = сообщённое минус прежнее."""
+    mock_run = Mock(return_value=_proc(_stdout_with_events(_result_event(json.dumps(valid_verdict_ok, ensure_ascii=False),
+                                                                          session_id="sess-dlg", cost=0.58))))
+    monkeypatch.setattr(subprocess, "run", mock_run)
+    res = call("вопрос", None, Verdict, run_id="run_rc", trace_name="a.raw.json", allowed_tools=[],
+               resume_session_id="sess-dlg", resume_cost_base=0.52)
+    assert res.cost_usd == pytest.approx(0.06) and res.session_cost_usd == pytest.approx(0.58)
+
+
+def test_validation_retry_via_resume_not_double_counted(tmp_runs_dir, valid_verdict_ok, monkeypatch):
+    """Ретрай через --resume внутри вызова: вторая попытка сообщает сумму двух — считается только её часть."""
+    bad = _stdout_with_events(_result_event("{\"verdict\": \"x\"}", session_id="sess-9", cost=0.10))
+    good = _stdout_with_events(_result_event(json.dumps(valid_verdict_ok, ensure_ascii=False), session_id="sess-9", cost=0.15))
+    monkeypatch.setattr(subprocess, "run", Mock(side_effect=[_proc(bad), _proc(good)]))
+    res = call("и", "док", Verdict, run_id="run_rc2", trace_name="a.raw.json", allowed_tools=[])
+    assert res.ok and res.cost_usd == pytest.approx(0.15)

@@ -119,6 +119,9 @@ class CallResult(Generic[ValueT]):
     error: str | None
     permission_denials: list[Any]
     duration_s: float
+    # Стоимость всей сессии CLI, как её сообщил последний запуск (14.10: при --resume CLI сообщает стоимость
+    # сессии с начала, а не одного запуска) — помощник хранит её, чтобы следующий ход считал только свой расход
+    session_cost_usd: float = 0.0
 
 
 @dataclass
@@ -605,6 +608,7 @@ def call(
     validation_context: dict[str, Any] | None = None,
     resume_session_id: str | None = None,
     mcp_config: str | None = None,
+    resume_cost_base: float = 0.0,
 ) -> CallResult[ModelT]:
     """
     Вызвать `claude -p` с ретраями и вернуть провалидированный ответ.
@@ -631,6 +635,11 @@ def call(
     не шлётся (модель его уже видела). Полный повтор после сбоя процесса — тоже с --resume этой сессии: начать
     заново значит потерять разговор. Без него — поведение прежнее.
     mcp_config — свой файл серверов MCP вместо файла Гаранта (помощник: Гарант + чтение артефактов прогона).
+
+    Стоимость при --resume (14.10, проба помощника): CLI сообщает total_cost_usd всей сессии с её начала, а не
+    одного запуска (modelUsage второго хода = сумма двух ходов). Расход попытки через --resume = сообщённое минус
+    прежнее сообщённое по этой сессии; resume_cost_base — прежнее сообщённое для resume_session_id (помощник
+    берёт его из CallResult.session_cost_usd прошлого хода).
 
     Исключение бросается только если ретраем чинить бессмысленно: бинарь
     claude не найден, функция вызвана с неверными аргументами, либо агенту нужен
@@ -665,6 +674,8 @@ def call(
     base_resume = resume_session_id
     message = instruction
     send_document = base_resume is None
+    # Сколько CLI уже сообщил по каждой сессии: при --resume он сообщает стоимость сессии с начала
+    reported: dict[str, float] = {resume_session_id: resume_cost_base} if resume_session_id else {}
 
     for attempt in range(1, max_attempts + 1):
         attempts_made = attempt
@@ -674,7 +685,12 @@ def call(
         outcome = _run_attempt(cmd, document, send_document, timeout_s, run_id, trace_name, env, attempt)
 
         session_id = outcome.session_id or session_id
-        cost_total += outcome.cost_usd
+        attempt_cost = outcome.cost_usd
+        if resume_session_id is not None and outcome.session_id == resume_session_id:
+            attempt_cost = max(0.0, outcome.cost_usd - reported.get(resume_session_id, 0.0))
+        if outcome.session_id:
+            reported[outcome.session_id] = outcome.cost_usd
+        cost_total += attempt_cost
         permission_denials_total.extend(outcome.permission_denials)
         if outcome.permission_denials:
             logger.warning(
@@ -687,7 +703,7 @@ def call(
             # нет события result, is_error) -> полный повтор без --resume (помощник — с --resume своей сессии)
             last_error = outcome.error
             _log_attempt(logger, trace_name, attempt, max_attempts, outcome.duration_s,
-                         outcome.cost_usd, outcome.num_turns, outcome.kind, run_id=run_id, error=last_error)
+                         attempt_cost, outcome.num_turns, outcome.kind, run_id=run_id, error=last_error)
             resume_session_id, message, send_document = base_resume, instruction, base_resume is None
             if _budget_exhausted(cost_total, max_budget_usd):
                 break
@@ -700,7 +716,7 @@ def call(
         except (json.JSONDecodeError, TypeError) as exc:
             last_error = f"поле result не разбирается как JSON: {exc}"
             _log_attempt(logger, trace_name, attempt, max_attempts, outcome.duration_s,
-                         outcome.cost_usd, outcome.num_turns, "result_json_error", run_id=run_id, error=last_error)
+                         attempt_cost, outcome.num_turns, "result_json_error", run_id=run_id, error=last_error)
             if outcome.session_id is not None:
                 resume_session_id, message, send_document = (
                     outcome.session_id, _retry_message(last_error), False
@@ -721,7 +737,7 @@ def call(
         except ValidationError as exc:
             last_error = str(exc)
             _log_attempt(logger, trace_name, attempt, max_attempts, outcome.duration_s,
-                         outcome.cost_usd, outcome.num_turns, "validation_error", run_id=run_id, error=last_error)
+                         attempt_cost, outcome.num_turns, "validation_error", run_id=run_id, error=last_error)
             if outcome.session_id is not None:
                 resume_session_id, message, send_document = (
                     outcome.session_id, _retry_message(last_error), False
@@ -735,7 +751,7 @@ def call(
         # Успех
         last_error = None
         _log_attempt(logger, trace_name, attempt, max_attempts, outcome.duration_s,
-                     outcome.cost_usd, outcome.num_turns, "ok", run_id=run_id, error=last_error)
+                     attempt_cost, outcome.num_turns, "ok", run_id=run_id, error=last_error)
         break
 
     duration_total = time.monotonic() - started
@@ -748,6 +764,7 @@ def call(
         error=last_error,
         permission_denials=permission_denials_total,
         duration_s=duration_total,
+        session_cost_usd=reported.get(session_id, 0.0) if session_id else 0.0,
     )
     _log_agent_finished(run_id, trace_name, result)
     return result

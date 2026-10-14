@@ -57,8 +57,10 @@ def test_turn_sends_all_blocks_and_records_chat(rid, monkeypatch):
     assert "## ВЕРДИКТЫ (JSON)" not in doc + system          # вердикты помощник читает инструментом
     assert doc.rstrip().endswith("Почему индикатор 3 нарушен?") and "применено: версия 1" in doc
     assert seen["instruction"] == dialog_module.NEW_SESSION_INSTRUCTION and "resume_session_id" not in seen
-    assert seen["model_cls"] is DialogTurn and seen["allowed_tools"] == []
-    assert seen["mcp_tools"] == dialog_module.RUN_TOOLS
+    assert seen["model_cls"] is DialogTurn and seen["allowed_tools"] == ["WebSearch", "WebFetch"]
+    # шаг 5: Гарант без лимита и чтение артефактов; выгрузки текста без кнопки нет
+    assert seen["mcp_tools"] == dialog_module.GARANT_FREE_TOOLS + dialog_module.RUN_TOOLS
+    assert not any("export" in t for t in seen["mcp_tools"])
     assert seen["model"] == dialog_module.DIALOG_MODEL and seen["short_cache_ttl"] is False
     assert seen["trace_name"].startswith("dialog/turns/")
     assert res.reply.startswith("Индикатор 3") and res.plan == []
@@ -164,3 +166,16 @@ def test_lost_session_falls_back_to_new_with_history(rid, monkeypatch):
     assert mock.call_args_list[0].kwargs["resume_session_id"] == "dead"
     assert "resume_session_id" not in mock.call_args_list[1].kwargs and "## ИСТОРИЯ ДИАЛОГА" in mock.call_args_list[1].args[1]
     assert dialog_module.load_session(rid)["session_id"] == "sess-B"
+
+
+def test_export_allowed_only_for_this_turn_and_reported(rid, monkeypatch):
+    """«Разрешить выгрузку»: выгрузка текста — в инструментах ровно этого хода; после хода в чат — остаток."""
+    seen = []
+    monkeypatch.setattr(dialog_module, "call", Mock(side_effect=lambda *a, **kw: seen.append(kw) or _ok(DialogTurn(reply="ок"))))
+    left = iter([21, 20])
+    monkeypatch.setattr(dialog_module.garant_limits, "limits", lambda fresh=False: {"Экспорт": next(left)})
+    dialog_module.turn(rid, "выгрузи п. 5", allow_export=True)
+    assert "garant_export_block_html" in seen[0]["mcp_tools"]
+    assert dialog_module.read_chat(rid)[-1]["text"] == "Выгрузок Гаранта потрачено: 1, осталось 20 в этом месяце."
+    dialog_module.turn(rid, "а теперь вопрос")
+    assert not any("export" in t for t in seen[1]["mcp_tools"])
