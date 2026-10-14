@@ -35,6 +35,8 @@ def _ok(value: DialogTurn, cost: float = 0.4) -> CallResult:
 
 
 def test_turn_sends_all_blocks_and_records_chat(rid, monkeypatch):
+    """Первый ход — новая сессия: системный промпт = промпт 07 + карта прогона + акт + паспорт;
+    вход = служебная строка, история, сообщение; инструменты — чтение артефактов прогона (14.10)."""
     seen = {}
 
     def _effect(instruction, document, model_cls, **kw):
@@ -46,19 +48,25 @@ def test_turn_sends_all_blocks_and_records_chat(rid, monkeypatch):
 
     res = dialog_module.turn(rid, "Почему индикатор 3 нарушен?")
 
-    doc = seen["shared_context"] + seen["document"]   # 2.6: акт и паспорт — в системном промпте, остальное — stdin
-    for block in ("## ПОЛНЫЙ ТЕКСТ АКТА", "## ВЕРДИКТЫ (JSON)", "## КАРТА ГИПОТЕЗ (JSON)", "## ЗАПРОС ПОКАЗАТЕЛЕЙ (JSON)",
-                  "## СОСТОЯНИЕ ВЕРСИЙ (JSON)", "## ИСТОРИЯ ДИАЛОГА", "## СООБЩЕНИЕ ПОЛЬЗОВАТЕЛЯ"):
+    system, doc = seen["shared_context"], seen["document"]
+    assert system.startswith("Промпт 07_dialog (фикстура).")
+    for block in ("# КАРТА ПРОГОНА", "## ПОЛНЫЙ ТЕКСТ АКТА", "ТЕКСТ АКТА: п. 2.4.1"):
+        assert block in system
+    for block in ("## СЛУЖЕБНО", "Сейчас версия v0.", "## ИСТОРИЯ ДИАЛОГА", "## СООБЩЕНИЕ ПОЛЬЗОВАТЕЛЯ"):
         assert block in doc
-    assert doc.rstrip().endswith("Почему индикатор 3 нарушен?")
-    assert "применено: версия 1" in doc
+    assert "## ВЕРДИКТЫ (JSON)" not in doc + system          # вердикты помощник читает инструментом
+    assert doc.rstrip().endswith("Почему индикатор 3 нарушен?") and "применено: версия 1" in doc
+    assert seen["instruction"] == dialog_module.NEW_SESSION_INSTRUCTION and "resume_session_id" not in seen
     assert seen["model_cls"] is DialogTurn and seen["allowed_tools"] == []
-    assert seen["model"] == dialog_module.DIALOG_MODEL
-    assert seen["trace_name"].startswith("dialog/turns/") and seen["instruction"] == "Промпт 07_dialog (фикстура)."
+    assert seen["mcp_tools"] == dialog_module.RUN_TOOLS
+    assert seen["model"] == dialog_module.DIALOG_MODEL and seen["short_cache_ttl"] is False
+    assert seen["trace_name"].startswith("dialog/turns/")
     assert res.reply.startswith("Индикатор 3") and res.plan == []
     roles = [m["role"] for m in dialog_module.read_chat(rid)]
     assert roles == ["сервис", "пользователь", "ассистент"]
     assert load_json(rid, "meta.json", RunMeta).cost_usd == pytest.approx(10.4)
+    sess = dialog_module.load_session(rid)
+    assert sess["session_id"] == "s" and sess["version_seen"] == 0
 
 
 def test_turn_returns_plan(rid, monkeypatch):
@@ -105,20 +113,54 @@ def test_turn_marks_user_message_with_session(rid, monkeypatch):
     assert user["session"] == "s-7f3a91" and "session" not in assistant
 
 
+def test_mcp_config_reads_only_this_run(rid):
+    """Конфиг серверов помощника: Гарант как в пайплайне и чтение артефактов именно этого прогона."""
+    import json
+    data = json.loads(open(dialog_module.mcp_config(rid), encoding="utf-8").read())["mcpServers"]
+    assert data["garant"]["headers"]["Authorization"] == "Bearer ${GARANT_TOKEN}"
+    assert data["p10run"]["args"][0].endswith("app/mcp_run.py")
+    assert data["p10run"]["env"]["P10_RUN_DIR"] == str(run_dir(rid).resolve())
 
-def test_act_and_passport_are_cached_between_turns(rid, monkeypatch):
-    """2.6: акт и паспорт за жизнь прогона не меняются — уходят в системный промпт и читаются
-    из кэша между ходами; всё, что меняется (вердикты, карта, история, сообщение), — в stdin.
-    Срок кэша — по умолчанию (1 час): человек думает между сообщениями."""
-    seen = {}
+
+def test_second_turn_resumes_with_version_line(rid, monkeypatch):
+    """Второй ход — --resume той же сессии: только служебная строка и сообщение; после правки строка
+    называет новую версию и что изменилось."""
+    from app import versions
+    calls = []
 
     def _effect(instruction, document, model_cls, **kw):
-        seen.update(document=document, **kw)
-        return _ok(DialogTurn(reply="ок"))
+        calls.append(dict(instruction=instruction, document=document, **kw))
+        return CallResult(value=DialogTurn(reply="ок"), ok=True, attempts=1, cost_usd=0.1, session_id="sess-A",
+                          error=None, permission_denials=[], duration_s=1.0)
 
     monkeypatch.setattr(dialog_module, "call", Mock(side_effect=_effect))
-    dialog_module.turn(rid, "вопрос")
-    assert seen["shared_context"].startswith("## ПОЛНЫЙ ТЕКСТ АКТА") and "ТЕКСТ АКТА: п. 2.4.1" in seen["shared_context"]
-    assert "## ВЕРДИКТЫ (JSON)" not in seen["shared_context"]
-    assert "ТЕКСТ АКТА: п. 2.4.1" not in seen["document"] and seen["document"].startswith("## ВЕРДИКТЫ (JSON)")
-    assert seen["short_cache_ttl"] is False
+    dialog_module.turn(rid, "первый вопрос")
+    dialog_module.turn(rid, "второй вопрос")
+    assert calls[1]["resume_session_id"] == "sess-A" and calls[1]["document"] is None
+    assert "Сейчас версия v0. С прошлого хода изменений нет." in calls[1]["instruction"]
+    assert calls[1]["instruction"].rstrip().endswith("второй вопрос") and "ИСТОРИЯ" not in calls[1]["instruction"]
+    # правка между ходами — новая версия и строка журнала
+    from test_versions import _entry
+    versions.commit(rid, versions.load_state(rid), [_entry(1)])
+    dialog_module.turn(rid, "третий вопрос")
+    assert "Сейчас версия v1. С прошлого хода изменено: v1: переформулировано — Карта гипотез, стр. 1." in calls[2]["instruction"]
+    assert dialog_module.load_session(rid)["version_seen"] == 1
+    events = [e["event"] for e in __import__("app.trace", fromlist=["read_events"]).read_events(rid)]
+    assert events.count("dialog_session_started") == 1 and events.count("dialog_session_resumed") == 2
+    assert events.count("dialog_turn") == 3
+
+
+def test_lost_session_falls_back_to_new_with_history(rid, monkeypatch):
+    """Продолжить сессию не удалось — тот же ход идёт новой сессией с историей чата; стоимость — обе попытки."""
+    failed = CallResult(value=None, ok=False, attempts=3, cost_usd=0.05, session_id=None, error="нет сессии",
+                        permission_denials=[], duration_s=1.0)
+    new = CallResult(value=DialogTurn(reply="ок"), ok=True, attempts=1, cost_usd=0.2, session_id="sess-B",
+                     error=None, permission_denials=[], duration_s=1.0)
+    dialog_module._save_session(rid, {"session_id": "dead", "started": "x", "last_turn": "x", "version_seen": 0})
+    mock = Mock(side_effect=[failed, new])
+    monkeypatch.setattr(dialog_module, "call", mock)
+    res = dialog_module.turn(rid, "вопрос")
+    assert res.reply == "ок" and res.cost_usd == pytest.approx(0.25)
+    assert mock.call_args_list[0].kwargs["resume_session_id"] == "dead"
+    assert "resume_session_id" not in mock.call_args_list[1].kwargs and "## ИСТОРИЯ ДИАЛОГА" in mock.call_args_list[1].args[1]
+    assert dialog_module.load_session(rid)["session_id"] == "sess-B"
