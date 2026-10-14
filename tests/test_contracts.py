@@ -1220,3 +1220,32 @@ def test_hypothesis_output_separates_numbers_and_questions():
     bad = {**_hyp_out(), "data": [{"metric": "Почему?", "source": "вопрос органу"}]}
     with pytest.raises(ValidationError):
         HypothesisOutput(**bad)
+
+
+# ---- 14.10, карта: своя цитата у гипотезы, мягкая сверка с актом ----
+
+_ACT = ("1.2. Институты развития, в том числе АО «Российская венчурная компания», вправе выдавать займы. "
+        "1.3.10. Получатель субсидии не является аффилированным лицом банка или лизингодателя.")
+
+
+@pytest.mark.parametrize("quote, ok", [
+    ("Получатель субсидии не является аффилированным лицом банка или лизингодателя.", True),
+    ("получатель субсидии не являеться аффилированным лицом банка или лизингодателя", True),   # опечатка
+    ("Институты развития, в том числе АО \"Российская венчурная компания\", вправе выдавать займы", True),
+    ("Институты развития … вправе выдавать займы", True),                                      # сокращение
+    ("Банк сам решает, кого считать аффилированным, критериев в акте нет", False),             # пересказ
+])
+def test_quote_in_text_soft(quote, ok):
+    from app.contracts import quote_in_text
+    assert quote_in_text(quote, _ACT) is ok
+
+
+def test_hypothesis_proof_checked_against_act_only_with_context():
+    """Цитата сверяется с текстом акта, когда узел передал его в контексте; без контекста — нет."""
+    from app.contracts import HypothesisOutput
+    bad = {**_hyp_out(), "proof": "Банк сам решает, кого считать аффилированным, критериев в акте нет"}
+    HypothesisOutput(**bad)                                                    # без контекста проходит
+    with pytest.raises(ValidationError):
+        HypothesisOutput.model_validate(bad, context={"act_text": _ACT})
+    good = {**_hyp_out(), "proof": "не является аффилированным лицом банка"}
+    assert HypothesisOutput.model_validate(good, context={"act_text": _ACT}).proof

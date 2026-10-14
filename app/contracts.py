@@ -29,7 +29,7 @@ from __future__ import annotations
 import re
 from typing import Annotated, Literal, Union
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationInfo, field_validator, model_validator
 
 # Допустимые значения вердикта по индикатору
 VerdictValue = Literal["нарушен", "соблюдён", "не применимо", "нет данных", "ошибка"]
@@ -124,6 +124,34 @@ BriefPoint = Annotated[str, StringConstraints(strip_whitespace=True, min_length=
 def _brief(description: str):
     """Обязательная выжимка в ответе модели: 1–4 пункта."""
     return Field(min_length=1, max_length=4, description=description)
+
+
+def _quote_words(text: str) -> list[str]:
+    """Слова для сравнения цитаты с текстом: без регистра, «ё», кавычек, знаков и разметки."""
+    return re.findall(r"[0-9a-zа-я]+", text.casefold().replace("ё", "е"))
+
+
+# Доля пар соседних слов цитаты, которые должны найтись в тексте акта (14.10: мягко — опечатка портит 1–2 пары,
+# многоточие на месте сокращённого куска — одну; пересказ своими словами почти не совпадает)
+QUOTE_MATCH_SHARE = 0.6
+
+
+def quote_in_text(quote: str, text: str) -> bool:
+    """
+    Есть ли цитата в тексте акта — мягко: доля пар соседних слов цитаты, найденных в тексте, не меньше
+    QUOTE_MATCH_SHARE. Опечатка, пропуск слова, кавычки, «е/ё», многоточие вместо сокращённого куска проходят;
+    пересказ своими словами — нет. Цитата из одного слова — по вхождению слова.
+    """
+    q = _quote_words(quote)
+    t = _quote_words(text)
+    if not q:
+        return True
+    if len(q) < 2:
+        return q[0] in t
+    text_pairs = {(t[i], t[i + 1]) for i in range(len(t) - 1)}
+    pairs = [(q[i], q[i + 1]) for i in range(len(q) - 1)]
+    found = sum(1 for g in pairs if g in text_pairs)
+    return found / len(pairs) >= QUOTE_MATCH_SHARE
 
 
 def _check_missing_data(verdict: str, missing_data: str | None) -> None:
@@ -1932,7 +1960,7 @@ class DataItem(_Base):
         min_length=1,
         description=(
             "Что именно нужно, одним измерением: «количество поданных заявок, "
-            "ед., по годам 2023-2025». Без «и/или» внутри — два измерения это "
+            "ед.». Годы не пиши: их задаёт бланк. Без «и/или» внутри — два измерения это "
             "два показателя. Без излишней детализации: разбивку по основаниям "
             "или категориям добавляй только если она нужна для расчёта эффекта."
         ),
@@ -2051,14 +2079,14 @@ class Hypothesis(_Base):
     proof: str | None = Field(
         default=None,
         description=(
-            "Дословная цитата пункта акта из карточки вердикта, не своя. "
-            "Для «нет данных» — цитата пункта, на который опирается вопрос; "
-            "null только если вопрос к процедуре в целом, без опорного пункта."
+            "Дословная цитата из текста акта — из того пункта, на котором стоит эта гипотеза; у гипотез "
+            "про разные пункты — разные цитаты. Без пересказа своими словами. Для «нет данных» — цитата "
+            "пункта, на который опирается вопрос; null только если вопрос к процедуре в целом, без опорного пункта."
         ),
     )
     clause: str | None = Field(
         default=None,
-        description="Номер пункта из карточки вердикта, не свой.",
+        description="Номер пункта акта, откуда цитата proof.",
     )
     hypothesis_brief: list[str] | None = Field(default=None, description=_HYPOTHESIS_BRIEF)
     grounds_brief: list[str] | None = Field(default=None, description=_GROUNDS_BRIEF)
@@ -2165,6 +2193,16 @@ class HypothesisOutput(Hypothesis):
         default_factory=list,
         description="Вопросы органу словами — если без ответа гипотезу не проверить. Пусто — нормально.",
     )
+
+    @model_validator(mode="after")
+    def _proof_is_in_act(self, info: ValidationInfo) -> "HypothesisOutput":
+        """14.10: цитата есть в тексте акта (мягко — опечатки и кавычки не в счёт). Текст акта узел гипотез
+        передаёт в контексте проверки; без контекста (хранение, тесты) проверки нет."""
+        act_text = (info.context or {}).get("act_text") if info is not None else None
+        if act_text and self.proof and not quote_in_text(self.proof, act_text):
+            raise ValueError("proof: такой цитаты в тексте акта нет — возьми дословно из пункта, на котором "
+                             "стоит гипотеза, без пересказа")
+        return self
 
 
 class HypothesisSetOutput(HypothesisSet):

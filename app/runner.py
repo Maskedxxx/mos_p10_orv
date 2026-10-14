@@ -575,9 +575,13 @@ def call(
     shared_context: str | None = None,
     short_cache_ttl: bool = True,
     mcp_tools: list[str] | None = None,
+    validation_context: dict[str, Any] | None = None,
 ) -> CallResult[ModelT]:
     """
     Вызвать `claude -p` с ретраями и вернуть провалидированный ответ.
+
+    validation_context (14.10) — данные для проверок контракта, которым нужен вход узла (например, текст акта,
+    чтобы сверить цитату); уходит в model_validate(context=...).
 
     document уходит в stdin ТОЛЬКО на попытках без --resume (первая попытка и
     ретраи после сбоя процесса/API) — при ретрае через --resume модель уже
@@ -677,7 +681,7 @@ def call(
             log_event(run_id, "json_repaired", who=_agent_label(trace_name), trace=trace_name, attempt=attempt)
 
         try:
-            value = model_cls.model_validate(parsed)
+            value = model_cls.model_validate(parsed, context=validation_context)
         except ValidationError as exc:
             last_error = str(exc)
             _log_attempt(logger, trace_name, attempt, max_attempts, outcome.duration_s,

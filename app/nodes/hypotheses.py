@@ -242,6 +242,7 @@ def _run_one_hypothesis(
             timeout_s=timeout_s,
             max_budget_usd=max_budget_usd,
             shared_context=_shared_context(document_md, passport_block_text),
+            validation_context={"act_text": document_md},   # 14.10: цитата гипотезы сверяется с актом
         )
 
         if not result.ok or result.value is None:
