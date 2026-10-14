@@ -314,6 +314,17 @@ def test_iter4_dialog_prompt():
     assert "эксперт подсказал, где искать" in text and "«Вопросы органу»" in text
 
 
+def test_dialog_prompt_assistant_tools():
+    """Помощник (14.10): вход — карта прогона и служебная строка, инструменты и их порядок, режим ПОИСК, выгрузка
+    по кнопке; блоков, которые заменила карта прогона, нет."""
+    text = " ".join(PROMPT_DIALOG.read_text(encoding="utf-8").split())
+    for phrase in ("«# КАРТА ПРОГОНА»", "«## СЛУЖЕБНО»", "list_artifacts и read_artifact", "«Разрешить выгрузку»",
+                   "2. ПОИСК", "перечитай нужные файлы"):
+        assert phrase in text, phrase
+    for gone in ("## ВЕРДИКТЫ (JSON)", "## КАРТА ГИПОТЕЗ (JSON)", "Интернета у тебя нет", "во входе"):
+        assert gone not in text, gone
+
+
 
 def test_iter4_request_prompt_mandatory_block():
     """АМ: агент запроса знает блок обязательных показателей; средние формы — как есть."""

@@ -62,6 +62,7 @@ class TurnResult:
     reply: str
     plan: list[Operation] = field(default_factory=list)
     cost_usd: float = 0.0
+    sources: list[str] = field(default_factory=list)
 
 
 def read_chat(run_id: str) -> list[dict]:
@@ -216,8 +217,8 @@ def turn(run_id: str, message: str, *, session: str | None = None, timeout_s: in
                                    "cost_reported": result.session_cost_usd})
         value = result.value
         append_chat(run_id, "ассистент", value.reply, plan=[op.model_dump(mode="json") for op in value.plan],
-                    cost_usd=round(cost, 4))
-        out = TurnResult(reply=value.reply, plan=list(value.plan), cost_usd=cost)
+                    sources=value.sources or None, cost_usd=round(cost, 4))
+        out = TurnResult(reply=value.reply, plan=list(value.plan), cost_usd=cost, sources=list(value.sources))
     if allow_export:   # строка об остатке — после ответа помощника
         _report_exports(run_id, exports_before, session)
     return out
