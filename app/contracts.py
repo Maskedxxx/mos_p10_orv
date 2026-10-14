@@ -29,7 +29,7 @@ from __future__ import annotations
 import re
 from typing import Annotated, Literal, Union
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator, model_validator
 
 # Допустимые значения вердикта по индикатору
 VerdictValue = Literal["нарушен", "соблюдён", "не применимо", "нет данных", "ошибка"]
@@ -1531,6 +1531,152 @@ class Indicator10Output(BaseModel):
             allowed, why = {"нет данных"}, "фактов про применение этого акта нет"
         if self.verdict not in allowed:
             raise ValueError(f"вердикт «{self.verdict}» не следует из applicability и findings: {why} — "
+                             f"допустимо: {', '.join(sorted(allowed))}")
+        return self
+
+
+# ---- Индикатор 11: свой контракт — таблица сроков и сравнение с федеральной нормой, рубрика (14.10) ----
+# Рубрика: 4_документы/Рубрика_индикатор_11.md. Таблица и разнобой единиц — в 03_verdicts/11.checks.json.
+
+# Отметки срока, которые означают нарушение (рубрика индикатора 11, раздел 3)
+DEADLINE_VIOLATIONS = ("длиннее федерального", "максимум при делении по сложности")
+
+
+class DeadlineCheck(_Base):
+    """Один срок акта и его сравнение с федеральной нормой."""
+
+    whose: Literal["орган", "лицо"] = Field(
+        description=(
+            "«орган» — сколько ждать от органа: рассмотрение, проверка, решение, уведомление, выдача, возврат "
+            "денег. «лицо» — срок для самого лица: подача заявки, оплата, предупреждение, исполнение обязанности."
+        )
+    )
+    what: str = Field(description="На что срок — как в акте.")
+    value: str = Field(description="Сколько и в каких единицах: «10 рабочих дней», «30 календарных дней».")
+    clause: str = Field(description="Пункт акта.")
+    federal: str = Field(
+        description=(
+            "Федеральная норма об этом сроке: акт, статья, её формулировка («не более 42 рабочих дней») и адрес "
+            "страницы, где ты её прочитал. Акт ссылается на закон — найди и прочитай статью. Нормы нет или "
+            "статью прочитать не удалось — «нет». По памяти не заполняй."
+        )
+    )
+    @model_validator(mode="after")
+    def _person_deadline_never_violation(self) -> "DeadlineCheck":
+        """Длину сравниваем только у сроков органа: срок лица — всегда «в пределах» (14.10, методика: сроки услуг)."""
+        if self.whose == "лицо" and self.mark != "в пределах":
+            raise ValueError("срок лица — всегда «в пределах»: длина сравнивается только у сроков органа")
+        return self
+
+    @field_validator("federal")
+    @classmethod
+    def _federal_read_from_page(cls, v: str) -> str:
+        """Федеральная норма — только прочитанная: с адресом страницы; без него — «нет» (14.10, без «по памяти»)."""
+        if v.strip().lower().rstrip(".") != "нет" and "http" not in v:
+            raise ValueError("federal: укажи адрес страницы, где прочитана норма, или «нет» — по памяти не заполняй")
+        return v
+
+    mark: Literal["в пределах", "длиннее федерального", "максимум при делении по сложности"] = Field(
+        description=(
+            "Только для срока органа. «длиннее федерального» — срок органа больше предела федеральной нормы. "
+            "«максимум при делении по сложности» — федеральная норма предельная («не более»), акт взял максимум "
+            "для всех случаев, хотя сам делит случаи или объекты на простые и сложные (по категории, объёму, "
+            "сложности). «в пределах» — всё остальное: срок не больше федерального, федеральной нормы нет, "
+            "деления на случаи нет; срок лица — всегда «в пределах»."
+        )
+    )
+
+
+class Indicator11Output(BaseModel):
+    """Индикатор 11 «Приемлемые сроки»: акт не устанавливает чрезмерно долгих сроков услуг и рассмотрения
+    документов. Сравнение — с федеральной нормой и внутри самого акта.
+    Сначала заполни deadlines и units_mixed по всему документу, потом разбор, потом вердикт."""
+
+    model_config = ConfigDict(extra="forbid", title="Verdict")
+
+    indicator: int = Field(ge=1, le=12, description="Номер индикатора из задания, 1–12.")
+    name: str = Field(description="Название индикатора, как в задании.")
+    deadlines: list[DeadlineCheck] = Field(
+        default_factory=list,
+        description=(
+            "Артефакт. Одна запись — один срок: органу на рассмотрение, решение, уведомление, возврат денег; "
+            "лицу — срок подачи заявки, оплаты, устранения недостатков, срок исполнения обязанности. Включать: "
+            "все такие сроки из текста и приложений; одинаковый срок в нескольких приложениях — одна запись. "
+            "Не включать: периодичность («раз в неделю», «раз в пять лет»), дату вступления акта в силу."
+        ),
+    )
+    units_mixed: str | None = Field(
+        default=None,
+        description=(
+            "Разнобой единиц у сроков органа: в одной процедуре одни сроки органа заданы в рабочих днях, другие — "
+            "в календарных, и сам акт не объясняет почему, — назови пункты с рабочими и с календарными днями. "
+            "Сроки лица здесь не учитываются. Объяснение засчитывается, только если оно написано в тексте акта; "
+            "своё объяснение не придумывай. Сроки органа в одной процедуре в одних единицах или акт сам объясняет "
+            "разницу — null."
+        ),
+    )
+    rationale: str = Field(
+        description="Разбор: какие сроки есть, с какой федеральной нормой сравнивал, почему такой вердикт."
+    )
+    verdict: Literal["нарушен", "соблюдён", "не применимо", "нет данных"] = Field(
+        description=(
+            "Вердикт следует только из deadlines и units_mixed. "
+            "«нарушен» — есть запись «длиннее федерального» или «максимум при делении по сложности», либо "
+            "units_mixed заполнено. "
+            "«соблюдён» — сроки есть, нарушений нет. "
+            "«не применимо» — deadlines пуст: сроков в акте нет. "
+            "«нет данных» не ставится."
+        )
+    )
+    missing_data: str | None = Field(
+        default=None,
+        description="Всегда null: «нет данных» у этого индикатора не ставится.",
+    )
+    proof: str | None = Field(
+        default=None,
+        description=(
+            "Дословная цитата. «нарушен» — пункт со сроком-нарушением или с разными единицами. «соблюдён» — "
+            "пункт со сроком. «не применимо» — null."
+        ),
+    )
+    clause: str | None = Field(
+        default=None,
+        description="Пункт, откуда цитата proof. «не применимо» — null.",
+    )
+    sources: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Только адреса страниц, на которых стоит вывод, по одному на элемент. "
+            "Рассуждения о том, что не открылось и не нашлось, — в rationale."
+        ),
+    )
+    attempts: int = Field(
+        default=1, ge=1,
+        description="Служебное: сколько попыток вызова понадобилось. Заполняет код — оставь 1.",
+    )
+    rationale_brief: list[BriefPoint] = _brief(_RATIONALE_BRIEF)
+
+    @model_validator(mode="after")
+    def _check_name_rationale_missing_data(self) -> "Indicator11Output":
+        _not_blank(self.name)
+        _not_blank(self.rationale)
+        _check_missing_data(self.verdict, self.missing_data)
+        return self
+
+    @model_validator(mode="after")
+    def _check_verdict_follows_deadlines(self) -> "Indicator11Output":
+        """Вердикт следует из таблицы сроков и разнобоя единиц (рубрика индикатора 11, раздел 4)."""
+        if not self.deadlines and self.units_mixed is not None:
+            raise ValueError("units_mixed заполнено, но deadlines пуст — разнобой бывает только между сроками")
+        long = [d.what for d in self.deadlines if d.mark in DEADLINE_VIOLATIONS]
+        if long or self.units_mixed is not None:
+            allowed, why = {"нарушен"}, f"срок-нарушение ({long[0]})" if long else "разные единицы сроков"
+        elif self.deadlines:
+            allowed, why = {"соблюдён"}, "сроки есть, нарушений нет"
+        else:
+            allowed, why = {"не применимо"}, "сроков нет"
+        if self.verdict not in allowed:
+            raise ValueError(f"вердикт «{self.verdict}» не следует из deadlines и units_mixed: {why} — "
                              f"допустимо: {', '.join(sorted(allowed))}")
         return self
 

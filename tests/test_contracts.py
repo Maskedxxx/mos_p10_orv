@@ -1063,3 +1063,72 @@ def test_indicator10_reasoning_before_choice():
         < order.index("rationale") < order.index("verdict")
     row = list(PracticeFinding.model_json_schema()["properties"])
     assert row.index("about") < row.index("mark")
+
+
+# ---- Индикатор 11: таблица сроков, разнобой единиц, рубрика вердикта (14.10, разбор узлов) ----
+
+
+def _d11(mark: str) -> dict:
+    return {"whose": "орган", "what": "рассмотрение", "value": "42 рабочих дня", "clause": "п. 1",
+            "federal": "174-ФЗ, ст. 14, не более 42 рабочих дней, https://www.consultant.ru/x", "mark": mark}
+
+
+def _ind11(verdict: str, rows: list, units_mixed: str | None = None) -> dict:
+    return {"indicator": 11, "name": "приемлемые сроки", "deadlines": rows, "units_mixed": units_mixed,
+            "rationale": "полный разбор", "verdict": verdict, "rationale_brief": _B}
+
+
+@pytest.mark.parametrize("verdict, rows, units_mixed", [
+    ("нарушен", [_d11("длиннее федерального")], None),
+    ("нарушен", [_d11("максимум при делении по сложности"), _d11("в пределах")], None),
+    ("нарушен", [_d11("в пределах")], "п. 1 — рабочие, п. 2 — календарные"),
+    ("соблюдён", [_d11("в пределах")], None),
+    ("не применимо", [], None),
+])
+def test_indicator11_verdict_follows_deadlines(verdict, rows, units_mixed):
+    from app.contracts import Indicator11Output
+    assert Indicator11Output(**_ind11(verdict, rows, units_mixed)).verdict == verdict
+
+
+@pytest.mark.parametrize("verdict, rows, units_mixed", [
+    ("соблюдён", [_d11("длиннее федерального")], None),
+    ("соблюдён", [_d11("в пределах")], "п. 1 — рабочие, п. 2 — календарные"),
+    ("нарушен", [_d11("в пределах")], None),
+    ("соблюдён", [], None),
+    ("нарушен", [], "п. 1 — рабочие"),
+])
+def test_indicator11_verdict_contradicting_deadlines_rejected(verdict, rows, units_mixed):
+    from app.contracts import Indicator11Output
+    with pytest.raises(ValidationError):
+        Indicator11Output(**_ind11(verdict, rows, units_mixed))
+
+
+def test_indicator11_reasoning_before_choice():
+    from app.contracts import DeadlineCheck, Indicator11Output
+    order = list(Indicator11Output.model_json_schema()["properties"])
+    assert order.index("deadlines") < order.index("units_mixed") < order.index("rationale") < order.index("verdict")
+    row = list(DeadlineCheck.model_json_schema()["properties"])
+    assert row.index("federal") < row.index("mark")
+
+
+@pytest.mark.parametrize("federal, ok", [
+    ("нет", True), ("Нет.", True), ("174-ФЗ, ст. 14, https://www.consultant.ru/x", True),
+    ("248-ФЗ, ст. 49 — 20 рабочих дней (по памяти)", False),
+])
+def test_indicator11_federal_norm_only_from_read_page(federal, ok):
+    """14.10: федеральная норма — только с адресом прочитанной страницы, иначе «нет»."""
+    from app.contracts import DeadlineCheck
+    row = {**_d11("в пределах"), "federal": federal}
+    if ok:
+        DeadlineCheck(**row)
+    else:
+        with pytest.raises(ValidationError):
+            DeadlineCheck(**row)
+
+
+def test_indicator11_person_deadline_never_violation():
+    """14.10: длину сравниваем только у сроков органа — срок лица всегда «в пределах»."""
+    from app.contracts import DeadlineCheck
+    DeadlineCheck(**{**_d11("в пределах"), "whose": "лицо"})
+    with pytest.raises(ValidationError):
+        DeadlineCheck(**{**_d11("длиннее федерального"), "whose": "лицо"})
