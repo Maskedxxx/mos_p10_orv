@@ -26,6 +26,8 @@ def rid(tmp_runs_dir, tmp_path, monkeypatch) -> str:
     prompt = tmp_path / "07_dialog.md"
     prompt.write_text("Промпт 07_dialog (фикстура).", encoding="utf-8")
     monkeypatch.setattr(dialog_module, "PROMPT_DIALOG", prompt)
+    # остаток выгрузок Гаранта — не настоящий запрос к API (каждый ход спрашивает его до и после)
+    monkeypatch.setattr(dialog_module.garant_limits, "limits", lambda fresh=False: None)
     return rid
 
 
@@ -58,9 +60,10 @@ def test_turn_sends_all_blocks_and_records_chat(rid, monkeypatch):
     assert doc.rstrip().endswith("Почему индикатор 3 нарушен?") and "применено: версия 1" in doc
     assert seen["instruction"] == dialog_module.NEW_SESSION_INSTRUCTION and "resume_session_id" not in seen
     assert seen["model_cls"] is DialogTurn and seen["allowed_tools"] == ["WebSearch", "WebFetch"]
-    # шаг 5: Гарант без лимита и чтение артефактов; выгрузки текста без кнопки нет
-    assert seen["mcp_tools"] == dialog_module.GARANT_FREE_TOOLS + dialog_module.RUN_TOOLS
-    assert not any("export" in t for t in seen["mcp_tools"])
+    # решение владельца 14.10: весь Гарант всегда (и выгрузки) + чтение артефактов
+    from app.config import GARANT_ALL_TOOLS
+    assert seen["mcp_tools"] == list(GARANT_ALL_TOOLS) + dialog_module.RUN_TOOLS
+    assert "garant_export_block_html" in seen["mcp_tools"]
     assert seen["model"] == dialog_module.DIALOG_MODEL and seen["short_cache_ttl"] is False
     assert seen["trace_name"].startswith("dialog/turns/")
     assert res.reply.startswith("Индикатор 3") and res.plan == []
@@ -168,17 +171,17 @@ def test_lost_session_falls_back_to_new_with_history(rid, monkeypatch):
     assert dialog_module.load_session(rid)["session_id"] == "sess-B"
 
 
-def test_export_allowed_only_for_this_turn_and_reported(rid, monkeypatch):
-    """«Разрешить выгрузку»: выгрузка текста — в инструментах ровно этого хода; после хода в чат — остаток."""
-    seen = []
-    monkeypatch.setattr(dialog_module, "call", Mock(side_effect=lambda *a, **kw: seen.append(kw) or _ok(DialogTurn(reply="ок"))))
-    left = iter([21, 20])
+def test_exports_reported_only_when_spent(rid, monkeypatch):
+    """Выгрузки помощник делает сам; потратил — строка сервиса «потрачено N, осталось M», не тратил — строки нет."""
+    monkeypatch.setattr(dialog_module, "call", Mock(return_value=_ok(DialogTurn(reply="ок"))))
+    left = iter([21, 20, 20, 20])
     monkeypatch.setattr(dialog_module.garant_limits, "limits", lambda fresh=False: {"Экспорт": next(left)})
-    dialog_module.turn(rid, "выгрузи п. 5", allow_export=True)
-    assert "garant_export_block_html" in seen[0]["mcp_tools"]
-    assert dialog_module.read_chat(rid)[-1]["text"] == "Выгрузок Гаранта потрачено: 1, осталось 20 в этом месяце."
+    dialog_module.turn(rid, "выгрузи п. 5")
+    chat = dialog_module.read_chat(rid)
+    assert chat[-2]["role"] == "ассистент"
+    assert chat[-1]["text"] == "Выгрузок Гаранта потрачено: 1, осталось 20 в этом месяце (на всех пользователей)."
     dialog_module.turn(rid, "а теперь вопрос")
-    assert not any("export" in t for t in seen[1]["mcp_tools"])
+    assert dialog_module.read_chat(rid)[-1]["role"] == "ассистент"
 
 
 def test_turn_steps_from_stream(rid):

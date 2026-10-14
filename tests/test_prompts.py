@@ -315,13 +315,18 @@ def test_iter4_dialog_prompt():
 
 
 def test_dialog_prompt_assistant_tools():
-    """Помощник (14.10): вход — карта прогона и служебная строка, инструменты и их порядок, режим ПОИСК, выгрузка
-    по кнопке; блоков, которые заменила карта прогона, нет."""
+    """Помощник (14.10): вход — карта прогона и служебная строка, источники и справка по Гаранту (все инструменты,
+    лимиты, выгрузку делает сам и предупреждает), режим ПОИСК; блоков, которые заменила карта прогона, нет."""
+    from app.config import GARANT_ALL_TOOLS
     text = " ".join(PROMPT_DIALOG.read_text(encoding="utf-8").split())
-    for phrase in ("«# КАРТА ПРОГОНА»", "«## СЛУЖЕБНО»", "list_artifacts и read_artifact", "«Разрешить выгрузку»",
-                   "2. ПОИСК", "перечитай нужные файлы"):
+    for phrase in ("«# КАРТА ПРОГОНА»", "«## СЛУЖЕБНО»", "<источники>", "делай это в этом же ходе",
+                   "garant_entry_text", "Если выгрузил — скажи в ответе", "2. ПОИСК", "перечитай нужные файлы"):
         assert phrase in text, phrase
-    for gone in ("## ВЕРДИКТЫ (JSON)", "## КАРТА ГИПОТЕЗ (JSON)", "Интернета у тебя нет", "во входе"):
+    for tool in ("garant_search", "garant_document_redactions", "garant_snippets", "garant_sutyazhnik",
+                 "garant_export_block_html", "garant_export_html"):
+        assert tool in text and tool in GARANT_ALL_TOOLS, tool
+    for gone in ("## ВЕРДИКТЫ (JSON)", "## КАРТА ГИПОТЕЗ (JSON)", "Интернета у тебя нет", "во входе",
+                 "Разрешить выгрузку", "пятнадцать форм"):
         assert gone not in text, gone
 
 

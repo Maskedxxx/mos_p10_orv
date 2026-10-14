@@ -773,14 +773,13 @@ class DialogJobs:
         dialog.append_chat(run_id, "сервис", f"План отменён — файл не изменён (версия {_current_version(run_id)}).",
                            mark="отменено", session=session)
 
-    async def turn(self, run_id: str, text: str, session: str | None = None, allow_export: bool = False) -> None:
-        """Ход помощника: ответ и, может быть, план — всё пишется в чат; session — чья реплика;
-        allow_export — пользователь разрешил выгрузку из Гаранта на этот ход."""
+    async def turn(self, run_id: str, text: str, session: str | None = None) -> None:
+        """Ход помощника: ответ и, может быть, план — всё пишется в чат; session — чья реплика."""
         if pending_plan(dialog.read_chat(run_id)):
             dialog.append_chat(run_id, "сервис", "План выше не применён.", mark="отменено", session=session)
         dialog.set_status(run_id, "думает", "Помощник думает…", "обычно 10–40 сек")
         try:
-            await nicegui_run.io_bound(lambda: dialog.turn(run_id, text, session=session, allow_export=allow_export))
+            await nicegui_run.io_bound(lambda: dialog.turn(run_id, text, session=session))
         except Exception as error:   # сбой вне вызова модели (диск, артефакты) — в чат, сервис живёт
             dialog.append_chat(run_id, "сервис", f"Сбой хода помощника: {error}", mark="сбой", session=session)
         finally:
@@ -1471,7 +1470,6 @@ class _DialogView:
         self._shown_versions: tuple | None = None   # от чего зависит список версий
         self._known_version: int | None = None      # версия, по которой нарисована карточка результата
         self._shown_steps: list[str] = []           # шаги помощника, что сейчас на экране
-        self._allow_export = False                  # «Разрешить выгрузку» нажата — на следующее сообщение
 
         with ui.card().classes("w-full p-0"):
             with ui.row().classes("w-full items-center flex-nowrap gap-3 px-5 py-4"):
@@ -1523,11 +1521,6 @@ class _DialogView:
                         on_click=lambda: self._upload.run_method("pickFiles"),
                     ).props("outline")
                     self._next = ui.button("", icon="skip_next", on_click=self._on_next_remark).props("outline")
-                    # Платная выгрузка из Гаранта — только по этой кнопке, ровно на следующее сообщение
-                    self._export = ui.button("Разрешить выгрузку", icon="file_download",
-                                             on_click=self._on_toggle_export).props("outline")
-                    self._export.tooltip("Следующий ответ помощника сможет выгрузить текст из Гаранта "
-                                         "(30 выгрузок в месяц на всех)")
             ui.separator()
             with ui.expansion("Версии файла", icon="history").classes("w-full"):
                 self._versions = ui.column().classes("w-full gap-2 px-2 pb-3")
@@ -1616,7 +1609,7 @@ class _DialogView:
                 ui.label(f"→ {step}").classes("text-xs text-gray-600")
 
     def _render_controls(self, chat: list[dict], active: bool) -> None:
-        for element in (self._input, self._send, self._upload_button, self._next, self._export):
+        for element in (self._input, self._send, self._upload_button, self._next):
             element.set_enabled(active)
         progress = dialog.remarks_progress(self._run_id)
         left = progress is not None and progress[0] < progress[1]
@@ -1753,25 +1746,8 @@ class _DialogView:
         if not text or not self._editable or DIALOG_JOBS.busy(self._run_id):
             return
         self._input.set_value("")
-        allow, self._allow_export = self._allow_export, False   # разрешение — ровно на это сообщение
-        self._show_export()
-        log_action(self._who, "сообщение помощнику", self._run_id, text=shorten(text, 500),
-                   export_allowed=allow or None)
-        self._start(DIALOG_JOBS.turn(self._run_id, text, self._who.session, allow_export=allow))
-
-    def _on_toggle_export(self) -> None:
-        if not self._editable:
-            return
-        self._allow_export = not self._allow_export
-        log_action(self._who, "разрешить выгрузку" if self._allow_export else "отменить разрешение выгрузки",
-                   self._run_id)
-        self._show_export()
-
-    def _show_export(self) -> None:
-        """Кнопка выгрузки: нажата — залита, подпись говорит, что разрешено на следующее сообщение."""
-        _RunView._set_text(self._export, "Выгрузка разрешена на следующее сообщение" if self._allow_export
-                           else "Разрешить выгрузку")
-        self._export.props(remove="outline unelevated").props("unelevated" if self._allow_export else "outline")
+        log_action(self._who, "сообщение помощнику", self._run_id, text=shorten(text, 500))
+        self._start(DIALOG_JOBS.turn(self._run_id, text, self._who.session))
 
     def _on_next_remark(self) -> None:
         if not self._editable or DIALOG_JOBS.busy(self._run_id):

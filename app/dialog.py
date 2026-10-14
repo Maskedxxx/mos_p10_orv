@@ -26,7 +26,7 @@ import time
 from dataclasses import dataclass, field
 
 from app import garant_limits, versions
-from app.config import ALLOWED_TOOLS_WEB, DIALOG_MODEL, GARANT_MCP_CONFIG, PROJECT_ROOT, PROMPT_DIALOG
+from app.config import ALLOWED_TOOLS_WEB, DIALOG_MODEL, GARANT_ALL_TOOLS, GARANT_MCP_CONFIG, PROJECT_ROOT, PROMPT_DIALOG
 from app.contracts import DialogTurn, Operation, Remark
 from app.nodes.hypotheses import _add_cost_to_meta
 from app.run_map import build_run_map
@@ -45,11 +45,10 @@ SESSION = "dialog/session.json"
 MCP_CONFIG = "dialog/mcp.json"    # серверы MCP помощника: Гарант + чтение артефактов прогона
 # Инструменты чтения артефактов прогона (app/mcp_run.py, сервер p10run в dialog/mcp.json)
 RUN_TOOLS = ["mcp__p10run__list_artifacts", "mcp__p10run__read_artifact"]
-# Гарант в чате (шаг 5): только методы без лимита — поиск, вхождения, редакции, «Сутяжник», остаток лимитов
-GARANT_FREE_TOOLS = ["garant_search", "garant_snippets", "garant_document_redactions", "garant_sutyazhnik",
-                     "garant_limits"]
-# Выгрузка текста (30 в месяц на весь токен) — только по кнопке «Разрешить выгрузку», ровно на один ход
-GARANT_EXPORT_TOOLS = ["garant_export_block_html", "garant_export_html"]
+# Гарант в чате (решение владельца 14.10): все инструменты всегда, и лимитированные. Набор за сессию не меняется —
+# смена инструментов посреди сессии сбрасывает кэш. Выгрузки (30 в месяц на всех) помощник делает сам и предупреждает:
+# пишет в ответе, а после хода с выгрузкой сервис дописывает в чат «потрачено N, осталось M» (_report_exports)
+GARANT_TOOLS = list(GARANT_ALL_TOOLS)
 # Задание первого хода новой сессии; роль и правила — в системном промпте (промпт 07)
 NEW_SESSION_INSTRUCTION = "Ответь на сообщение пользователя — оно последним блоком входа."
 _ROLES = ("пользователь", "ассистент", "сервис")
@@ -159,22 +158,19 @@ def resume_message(run_id: str, message: str, version_seen: int) -> str:
     return f"## СЛУЖЕБНО\n\n{version_line(run_id, version_seen)}\n\n## СООБЩЕНИЕ ПОЛЬЗОВАТЕЛЯ\n\n{message}\n"
 
 
-def turn(run_id: str, message: str, *, session: str | None = None, timeout_s: int = 900,
-         allow_export: bool = False) -> TurnResult:
+def turn(run_id: str, message: str, *, session: str | None = None, timeout_s: int = 900) -> TurnResult:
     """
     Ответить на сообщение пользователя: текст и план. Реплики и стоимость — в чат и meta; session — чья реплика
     (сессия браузера). Есть сессия CLI — продолжаем её; продолжить не удалось — новая сессия с историей чата.
-    allow_export — пользователь нажал «Разрешить выгрузку»: на этот ход помощнику доступна выгрузка текста Гаранта,
-    после хода в чат — сколько выгрузок осталось.
     """
     versions.recover(run_id)
     versions.ensure_v0(run_id)
     history = read_chat(run_id)[-HISTORY_MESSAGES:]
     n = len(read_chat(run_id)) + 1
     append_chat(run_id, "пользователь", message, session=session)
-    # Инструменты хода: интернет, Гарант без лимита, чтение артефактов; выгрузка — только по кнопке
-    mcp_tools = GARANT_FREE_TOOLS + (GARANT_EXPORT_TOOLS if allow_export else []) + RUN_TOOLS
-    exports_before = (garant_limits.limits(fresh=True) or {}).get(garant_limits.EXPORT) if allow_export else None
+    # Инструменты хода: интернет, весь Гарант, чтение артефактов; остаток выгрузок — до хода (запрос бесплатный)
+    mcp_tools = GARANT_TOOLS + RUN_TOOLS
+    exports_before = (garant_limits.limits(fresh=True) or {}).get(garant_limits.EXPORT)
     common = dict(run_id=run_id, allowed_tools=ALLOWED_TOOLS_WEB, timeout_s=timeout_s, model=DIALOG_MODEL,
                   shared_context=shared_context(run_id), mcp_tools=mcp_tools, mcp_config=mcp_config(run_id),
                   short_cache_ttl=False)   # срок кэша 1 час: человек думает между сообщениями дольше 5 минут
@@ -206,7 +202,7 @@ def turn(run_id: str, message: str, *, session: str | None = None, timeout_s: in
     current = state.current if state is not None else 0
     ok = result.ok and result.value is not None
     log_event(run_id, "dialog_turn", ok=ok, version=current, cost_usd=round(cost, 4),
-              session_id=cli["session_id"] if cli else None, export_allowed=allow_export or None)
+              session_id=cli["session_id"] if cli else None)
     if not ok:
         reply = f"Не получилось ответить: {result.error or 'неизвестная ошибка'}. Попробуйте ещё раз."
         append_chat(run_id, "ассистент", reply, cost_usd=round(cost, 4), mark="сбой")
@@ -219,8 +215,7 @@ def turn(run_id: str, message: str, *, session: str | None = None, timeout_s: in
         append_chat(run_id, "ассистент", value.reply, plan=[op.model_dump(mode="json") for op in value.plan],
                     sources=value.sources or None, steps=turn_steps(run_id, n) or None, cost_usd=round(cost, 4))
         out = TurnResult(reply=value.reply, plan=list(value.plan), cost_usd=cost, sources=list(value.sources))
-    if allow_export:   # строка об остатке — после ответа помощника
-        _report_exports(run_id, exports_before, session)
+    _report_exports(run_id, exports_before, session)   # строка о выгрузках — после ответа помощника, если тратил
     return out
 
 
@@ -233,6 +228,17 @@ _STEP_TITLES = {
     "mcp__garant__garant_limits": "смотрю остаток лимитов Гаранта",
     "mcp__garant__garant_export_block_html": "выгружаю текст пункта из Гаранта (платно)",
     "mcp__garant__garant_export_html": "выгружаю текст документа из Гаранта (платно)",
+    "mcp__garant__garant_export_rtf": "выгружаю документ из Гаранта в RTF (платно)",
+    "mcp__garant__garant_export_odt": "выгружаю документ из Гаранта в ODT (платно)",
+    "mcp__garant__garant_export_pdf": "выгружаю документ из Гаранта в PDF (платно)",
+    "mcp__garant__garant_export_image": "выгружаю картинку из Гаранта (платно)",
+    "mcp__garant__garant_export_formula": "выгружаю формулу из Гаранта (платно)",
+    "mcp__garant__garant_document_info": "смотрю карточку документа в Гаранте",
+    "mcp__garant__garant_find_hyperlinks": "распознаю ссылки на акты в тексте (Гарант)",
+    "mcp__garant__garant_find_modified": "проверяю в Гаранте, менялись ли документы",
+    "mcp__garant__garant_block_changed": "проверяю в Гаранте, менялись ли пункты",
+    "mcp__garant__garant_prime_categories": "смотрю разделы новостей Гаранта",
+    "mcp__garant__garant_prime_news": "ищу новости в Гаранте",
 }
 
 
@@ -278,15 +284,14 @@ def turn_steps(run_id: str, n: int) -> list[str]:
 
 
 def _report_exports(run_id: str, before: int | None, session: str | None) -> None:
-    """После хода с разрешённой выгрузкой — строка в чат: сколько выгрузок Гаранта потрачено и осталось."""
+    """После хода, в котором помощник потратил выгрузки Гаранта, — строка в чат: сколько потрачено и осталось.
+    Не тратил или остаток узнать не удалось — строки нет (выгрузки видно и в шагах хода)."""
     after = (garant_limits.limits(fresh=True) or {}).get(garant_limits.EXPORT)
-    if after is None:
-        text = "Остаток выгрузок Гаранта узнать не удалось."
-    elif before is not None and before > after:
-        text = f"Выгрузок Гаранта потрачено: {before - after}, осталось {after} в этом месяце."
-    else:
-        text = f"Выгрузка Гаранта не понадобилась, осталось {after} в этом месяце."
-    append_chat(run_id, "сервис", text, mark="лимиты", session=session)
+    if before is None or after is None or before <= after:
+        return
+    append_chat(run_id, "сервис", f"Выгрузок Гаранта потрачено: {before - after}, осталось {after} в этом месяце "
+                f"(на всех пользователей).", mark="лимиты", session=session)
+    log_event(run_id, "garant_exports_spent", spent=before - after, left=after)
 
 
 def _now() -> str:
