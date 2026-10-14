@@ -1036,3 +1036,37 @@ def test_broken_first_answer_is_repaired_by_schema(tmp_runs_dir, valid_verdict_o
     assert result.ok is True and result.attempts == 1 and mock_run.call_count == 1
     assert result.value == Verdict.model_validate(valid_verdict_ok)
     assert [e for e in read_events(rid) if e["event"] == "json_repaired"]
+
+
+def test_own_mcp_config_and_full_tool_names():
+    """Помощник (14.10): свой файл серверов вместо файла Гаранта; полные имена «mcp__…» одобряются как есть,
+    не прячутся --disallowedTools; неразрешённые инструменты Гаранта по-прежнему скрыты."""
+    cmd = _build_cmd("т", "{}", ["WebSearch"], None, None,
+                     mcp_tools=["garant_search", "mcp__p10run__read_artifact"], mcp_config="/r/dialog/mcp.json")
+    assert _flag_value(cmd, "--mcp-config") == "/r/dialog/mcp.json"
+    assert _flag_value(cmd, "--allowedTools") == "WebSearch mcp__garant__garant_search mcp__p10run__read_artifact"
+    denied = _flag_value(cmd, "--disallowedTools").split()
+    assert "mcp__p10run__read_artifact" not in denied and "mcp__garant__garant_search" not in denied
+    assert "mcp__garant__garant_export_html" in denied
+    assert _flag_value(cmd, "--setting-sources") == "" and "--safe-mode" not in cmd
+
+
+def test_resume_session_first_attempt_without_document(tmp_runs_dir, valid_verdict_ok, monkeypatch):
+    """resume_session_id: первая попытка — --resume этой сессии, документ в stdin не идёт."""
+    mock_run = Mock(return_value=_proc(_ok_stdout(valid_verdict_ok)))
+    monkeypatch.setattr(subprocess, "run", mock_run)
+    assert call("вопрос", "док", Verdict, run_id="run_rs", trace_name="a.raw.json", allowed_tools=[],
+                resume_session_id="sess-dlg").ok
+    cmd = mock_run.call_args.args[0]
+    assert _flag_value(cmd, "--resume") == "sess-dlg" and "вопрос" in cmd
+    assert "input" not in mock_run.call_args.kwargs
+
+
+def test_resume_session_kept_after_process_failure(tmp_runs_dir, valid_verdict_ok, monkeypatch):
+    """Сбой процесса при продолжении разговора — повтор тоже через --resume той же сессии, а не с нуля."""
+    mock_run = Mock(side_effect=[_proc("", returncode=1, stderr="сбой"), _proc(_ok_stdout(valid_verdict_ok))])
+    monkeypatch.setattr(subprocess, "run", mock_run)
+    assert call("вопрос", "док", Verdict, run_id="run_rs2", trace_name="a.raw.json", allowed_tools=[],
+                resume_session_id="sess-dlg").ok
+    for c in mock_run.call_args_list:
+        assert _flag_value(c.args[0], "--resume") == "sess-dlg"

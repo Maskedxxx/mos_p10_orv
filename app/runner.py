@@ -198,12 +198,15 @@ def _build_cmd(
     model: str = MODEL,
     system_file: str | None = None,
     mcp_tools: list[str] | None = None,
+    mcp_config: str | None = None,
 ) -> list[str]:
     """
     Собрать argv для вызова `claude -p` (список аргументов, не строка через shell).
 
     schema_json=None — режим без --json-schema (текстовый ответ, call_text()).
-    mcp_tools — разрешённые инструменты Гаранта; пусто/None — вызов без MCP, как раньше.
+    mcp_tools — разрешённые инструменты MCP: короткое имя — инструмент Гаранта, полное «mcp__…» — инструмент
+    другого сервера из mcp_config (помощник, 14.10); пусто/None — вызов без MCP, как раньше.
+    mcp_config — свой файл серверов MCP вместо файла Гаранта (помощник: Гарант + чтение артефактов прогона).
     """
     cmd = ["claude", "-p"]
     if resume_session_id is not None:
@@ -212,20 +215,20 @@ def _build_cmd(
     if schema_json is not None:
         cmd += ["--json-schema", schema_json]
     # Инструменты Гаранта одобряются по полным именам; встроенные (--tools) — как раньше
-    approved = allowed_tools + [_GARANT_TOOL_PREFIX + t for t in (mcp_tools or [])]
+    approved = allowed_tools + [_mcp_tool_name(t) for t in (mcp_tools or [])]
     if schema_json is not None:
         cmd.append("--include-partial-messages")   # первый ответ модели целиком — см. _first_structured_answer
     cmd += [
         "--output-format", "stream-json", "--verbose",
         "--tools", ",".join(allowed_tools),         # доступны ровно встроенные инструменты узла
         "--allowedTools", " ".join(approved),       # и они же (плюс Гарант) одобрены без запроса
-        *(_MCP_ISOLATION_FLAGS if mcp_tools else _ISOLATION_FLAGS),
+        *(_mcp_isolation_flags(mcp_config) if mcp_tools else _ISOLATION_FLAGS),
         "--model", model,
         "--effort", EFFORT,
     ]
     if mcp_tools:
         # 14.10: неразрешённые инструменты Гаранта — из списка модели долой (без этого видны все 18)
-        denied = [_GARANT_TOOL_PREFIX + t for t in GARANT_ALL_TOOLS if t not in mcp_tools]
+        denied = [_GARANT_TOOL_PREFIX + t for t in GARANT_ALL_TOOLS if _GARANT_TOOL_PREFIX + t not in approved]
         if denied:
             cmd += ["--disallowedTools", " ".join(denied)]
     if max_budget_usd is not None:
@@ -236,6 +239,20 @@ def _build_cmd(
     else:
         cmd += ["--system-prompt", SERVICE_SYSTEM_PROMPT]
     return cmd
+
+
+def _mcp_tool_name(tool: str) -> str:
+    """Полное имя инструмента MCP для CLI: короткое — инструмент Гаранта, «mcp__…» — уже полное."""
+    return tool if tool.startswith("mcp__") else _GARANT_TOOL_PREFIX + tool
+
+
+def _mcp_isolation_flags(mcp_config: str | None) -> list[str]:
+    """Флаги изоляции агента с MCP; mcp_config — свой файл серверов вместо файла Гаранта (помощник)."""
+    if mcp_config is None:
+        return _MCP_ISOLATION_FLAGS
+    flags = list(_MCP_ISOLATION_FLAGS)
+    flags[flags.index("--mcp-config") + 1] = mcp_config
+    return flags
 
 
 # Срок кэша 5 минут для вызовов пайплайна: чтения внутри прогона идут через секунды и минуты
@@ -586,6 +603,8 @@ def call(
     short_cache_ttl: bool = True,
     mcp_tools: list[str] | None = None,
     validation_context: dict[str, Any] | None = None,
+    resume_session_id: str | None = None,
+    mcp_config: str | None = None,
 ) -> CallResult[ModelT]:
     """
     Вызвать `claude -p` с ретраями и вернуть провалидированный ответ.
@@ -605,7 +624,13 @@ def call(
     (см. «Кэш» в docstring модуля), а не в stdin. short_cache_ttl — срок кэша 5 минут
     (пайплайн); False — срок по умолчанию, 1 час (диалог).
 
-    mcp_tools — инструменты Гаранта, разрешённые агенту (см. «ГАРАНТ» в docstring модуля).
+    mcp_tools — инструменты Гаранта, разрешённые агенту (см. «ГАРАНТ» в docstring модуля); полные имена «mcp__…» —
+    инструменты других серверов из mcp_config.
+
+    resume_session_id (помощник, 14.10) — продолжить сессию CLI: первая попытка идёт через --resume, document
+    не шлётся (модель его уже видела). Полный повтор после сбоя процесса — тоже с --resume этой сессии: начать
+    заново значит потерять разговор. Без него — поведение прежнее.
+    mcp_config — свой файл серверов MCP вместо файла Гаранта (помощник: Гарант + чтение артефактов прогона).
 
     Исключение бросается только если ретраем чинить бессмысленно: бинарь
     claude не найден, функция вызвана с неверными аргументами, либо агенту нужен
@@ -635,16 +660,17 @@ def call(
         env = {**(env if env is not None else os.environ), **_mcp_env()}
     _log_agent_started(run_id, trace_name, model, allowed_tools, mcp_tools, timeout_s)
 
-    # Состояние следующей попытки: что слать и слать ли документ в stdin
+    # Состояние следующей попытки: что слать и слать ли документ в stdin.
+    # base_resume — с чего начинает попытка «с начала»: новая сессия или продолжение разговора помощника
+    base_resume = resume_session_id
     message = instruction
-    resume_session_id: str | None = None
-    send_document = True
+    send_document = base_resume is None
 
     for attempt in range(1, max_attempts + 1):
         attempts_made = attempt
 
         cmd = _build_cmd(message, schema_json, allowed_tools, resume_session_id, max_budget_usd, model, system_file,
-                         mcp_tools)
+                         mcp_tools, mcp_config)
         outcome = _run_attempt(cmd, document, send_document, timeout_s, run_id, trace_name, env, attempt)
 
         session_id = outcome.session_id or session_id
@@ -658,11 +684,11 @@ def call(
 
         if outcome.kind != "ok":
             # Сбой процесса/API (таймаут, ненулевой код, битый JSON верхнего уровня,
-            # нет события result, is_error) -> полный повтор без --resume
+            # нет события result, is_error) -> полный повтор без --resume (помощник — с --resume своей сессии)
             last_error = outcome.error
             _log_attempt(logger, trace_name, attempt, max_attempts, outcome.duration_s,
                          outcome.cost_usd, outcome.num_turns, outcome.kind, run_id=run_id, error=last_error)
-            resume_session_id, message, send_document = None, instruction, True
+            resume_session_id, message, send_document = base_resume, instruction, base_resume is None
             if _budget_exhausted(cost_total, max_budget_usd):
                 break
             continue
@@ -681,7 +707,7 @@ def call(
                 )
             else:
                 # Защита: без session_id resume невозможен — начинаем заново
-                resume_session_id, message, send_document = None, instruction, True
+                resume_session_id, message, send_document = base_resume, instruction, base_resume is None
             if _budget_exhausted(cost_total, max_budget_usd):
                 break
             continue
@@ -701,7 +727,7 @@ def call(
                     outcome.session_id, _retry_message(last_error), False
                 )
             else:
-                resume_session_id, message, send_document = None, instruction, True
+                resume_session_id, message, send_document = base_resume, instruction, base_resume is None
             if _budget_exhausted(cost_total, max_budget_usd):
                 break
             continue
