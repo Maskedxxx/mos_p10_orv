@@ -112,6 +112,21 @@ ALLOWED_TOOLS_WEB: list[str] = ["WebSearch", "WebFetch"]
 # кладёт только в окружение процесса агента с инструментами Гаранта. Токен — в файле
 # машины (скилл garant-api), в репо, логи и трейсы не попадает.
 GARANT_MCP_CONFIG = PROJECT_ROOT / "deploy" / "garant_mcp.json"
+# Все инструменты сервера Гаранта (14.10, проба: агент видел все 18, хотя разрешены 2–4, и тратил ходы на отказы).
+# Неразрешённые агенту уходят в --disallowedTools — так они пропадают из списка, который видит модель.
+# Новый инструмент сервера, которого здесь нет, агент увидит — дописать сюда.
+GARANT_ALL_TOOLS: tuple[str, ...] = (
+    "garant_search", "garant_snippets", "garant_document_redactions", "garant_document_info",
+    "garant_find_hyperlinks", "garant_find_modified", "garant_block_changed", "garant_export_block_html",
+    "garant_export_html", "garant_export_rtf", "garant_export_odt", "garant_export_pdf", "garant_export_image",
+    "garant_export_formula", "garant_sutyazhnik", "garant_prime_categories", "garant_prime_news", "garant_limits",
+)
+# Системный промпт агентов сервиса (14.10) — ЗАМЕНЯЕТ стандартный промпт Claude Code (~5,5 тыс. токенов
+# инструкций программиста-ассистента на каждый вызов, нашим агентам не нужных). Роль и правила — в промпте узла.
+SERVICE_SYSTEM_PROMPT = (
+    "Ты агент сервиса П-10 «Платформа ОРВ»: оцениваешь нормативный правовой акт города Москвы. "
+    "Выполняй инструкцию пользователя; если задана схема ответа — отвечай строго по ней."
+)
 GARANT_TOKEN_FILE = Path.home() / ".config" / "garant" / "token"
 # Гарант — мимо прокси машины (в NO_PROXY агента). Проба 12.10: через прокси garant_search
 # зависал > 60 с (3 из 3), в живых прогонах — 38 обрывов из 165 вызовов; напрямую 128 из 128

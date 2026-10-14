@@ -91,7 +91,8 @@ from typing import Any, Generic, TypeVar
 from pydantic import BaseModel, ValidationError
 
 from app.config import (
-    CLI_SETTINGS_FILE, EFFORT, GARANT_MAX_OUTPUT_TOKENS, GARANT_MCP_CONFIG, GARANT_NO_PROXY_HOST, GARANT_TOKEN_FILE, MODEL,
+    CLI_SETTINGS_FILE, EFFORT, GARANT_ALL_TOOLS, GARANT_MAX_OUTPUT_TOKENS, GARANT_MCP_CONFIG, GARANT_NO_PROXY_HOST,
+    GARANT_TOKEN_FILE, MODEL, SERVICE_SYSTEM_PROMPT,
 )
 from app.json_fix import repair_json
 from app.logger import get_run_logger
@@ -222,10 +223,18 @@ def _build_cmd(
         "--model", model,
         "--effort", EFFORT,
     ]
+    if mcp_tools:
+        # 14.10: неразрешённые инструменты Гаранта — из списка модели долой (без этого видны все 18)
+        denied = [_GARANT_TOOL_PREFIX + t for t in GARANT_ALL_TOOLS if t not in mcp_tools]
+        if denied:
+            cmd += ["--disallowedTools", " ".join(denied)]
     if max_budget_usd is not None:
         cmd += ["--max-budget-usd", str(max_budget_usd)]
+    # 14.10: свой системный промпт ВМЕСТО стандартного Claude Code; общий контекст группы агентов — в нём же (кэш)
     if system_file is not None:
-        cmd += ["--append-system-prompt-file", system_file]   # общий контекст группы агентов — в кэш
+        cmd += ["--system-prompt-file", system_file]
+    else:
+        cmd += ["--system-prompt", SERVICE_SYSTEM_PROMPT]
     return cmd
 
 
@@ -263,8 +272,9 @@ def _first_structured_answer(events: list[Any]) -> str | None:
 
 
 def _shared_context_file(run_id: str, shared_context: str) -> str:
-    """Файл общего контекста в папке прогона — один на содержимое (одинаковый текст — один файл)."""
-    data = shared_context.encode("utf-8")
+    """Файл системного промпта в папке прогона: наш короткий системный промпт и общий контекст группы агентов —
+    один файл на содержимое (одинаковый текст — один файл)."""
+    data = f"{SERVICE_SYSTEM_PROMPT}\n\n{shared_context}".encode("utf-8")
     relname = f"_context/{hashlib.sha1(data).hexdigest()[:12]}.md"
     return str(save_bytes(run_id, relname, data))
 

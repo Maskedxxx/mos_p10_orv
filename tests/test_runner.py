@@ -638,9 +638,11 @@ def test_shared_context_goes_to_system_prompt_file(tmp_runs_dir, valid_verdict_o
     call("инструкция", None, Verdict, run_id="run_ctx", trace_name="03_verdicts/01.raw.json",
          allowed_tools=[], shared_context="## ПОЛНЫЙ ТЕКСТ АКТА\n\nакт")
     cmd, kwargs = mock_run.call_args.args[0], mock_run.call_args.kwargs
-    path = _flag_value(cmd, "--append-system-prompt-file")
+    path = _flag_value(cmd, "--system-prompt-file")
     assert path is not None and path.startswith(str(tmp_runs_dir / "run_ctx" / "_context"))
-    assert open(path, encoding="utf-8").read() == "## ПОЛНЫЙ ТЕКСТ АКТА\n\nакт"
+    from app.config import SERVICE_SYSTEM_PROMPT
+    assert open(path, encoding="utf-8").read() == f"{SERVICE_SYSTEM_PROMPT}\n\n## ПОЛНЫЙ ТЕКСТ АКТА\n\nакт"
+    assert "--append-system-prompt-file" not in cmd   # 14.10: стандартный промпт Claude Code не используется
     assert kwargs["stdin"] == subprocess.DEVNULL
 
 
@@ -650,7 +652,7 @@ def test_same_context_is_one_file(tmp_runs_dir, valid_verdict_ok, monkeypatch):
     for n in (1, 2):
         call(f"инструкция {n}", None, Verdict, run_id="run_ctx", trace_name=f"03_verdicts/0{n}.raw.json",
              allowed_tools=[], shared_context="акт")
-    paths = {_flag_value(c.args[0], "--append-system-prompt-file") for c in mock_run.call_args_list}
+    paths = {_flag_value(c.args[0], "--system-prompt-file") for c in mock_run.call_args_list}
     assert len(paths) == 1 and len(list((tmp_runs_dir / "run_ctx" / "_context").iterdir())) == 1
 
 
@@ -668,7 +670,9 @@ def test_without_shared_context_command_unchanged(tmp_runs_dir, valid_verdict_ok
     mock_run = Mock(return_value=_proc(_ok_stdout(valid_verdict_ok)))
     monkeypatch.setattr(subprocess, "run", mock_run)
     call("и", "док", Verdict, run_id="run_plain", trace_name="a.raw.json", allowed_tools=[])
-    assert "--append-system-prompt-file" not in mock_run.call_args.args[0]
+    from app.config import SERVICE_SYSTEM_PROMPT
+    assert _flag_value(mock_run.call_args.args[0], "--system-prompt") == SERVICE_SYSTEM_PROMPT   # 14.10: свой промпт
+    assert "--system-prompt-file" not in mock_run.call_args.args[0]
     assert mock_run.call_args.kwargs["input"] == "док"
 
 
@@ -679,7 +683,7 @@ def test_resume_keeps_shared_context(tmp_runs_dir, valid_verdict_ok, monkeypatch
     monkeypatch.setattr(subprocess, "run", mock_run)
     res = call("и", None, Verdict, run_id="run_res", trace_name="a.raw.json", allowed_tools=[], shared_context="акт")
     second = mock_run.call_args_list[1].args[0]
-    assert res.ok and "--resume" in second and _flag_value(second, "--append-system-prompt-file")
+    assert res.ok and "--resume" in second and _flag_value(second, "--system-prompt-file")
 
 
 # ---- 2.7 (итерация 4, Б): Гарант через MCP ----
@@ -717,17 +721,23 @@ def test_mcp_tools_command_flags():
     assert _flag_value(cmd, "--permission-mode") == "dontAsk"
     assert _flag_value(cmd, "--tools") == "WebSearch"   # встроенные — как раньше
     assert _flag_value(cmd, "--allowedTools") == "WebSearch mcp__garant__garant_search mcp__garant__garant_snippets"
+    # 14.10: остальные инструменты Гаранта скрыты от модели
+    from app.config import GARANT_ALL_TOOLS
+    denied = _flag_value(cmd, "--disallowedTools").split()
+    assert len(denied) == len(GARANT_ALL_TOOLS) - 2
+    assert "mcp__garant__garant_export_html" in denied and "mcp__garant__garant_search" not in denied
 
 
 def test_without_mcp_tools_isolation_unchanged():
     """Без Гаранта команда прежняя (до 2.7): та же изоляция, тот же порядок флагов; формат вывода — построчный
-    (stream-json, мониторинг 2.7), ответ модели — кусками (первый ответ целиком, 13.10)."""
-    from app.config import EFFORT, MODEL
+    (stream-json, мониторинг 2.7), ответ модели — кусками (первый ответ целиком, 13.10); 14.10 — свой системный
+    промпт вместо стандартного."""
+    from app.config import EFFORT, MODEL, SERVICE_SYSTEM_PROMPT
     expected = ["claude", "-p", "т", "--json-schema", "{}", "--include-partial-messages",
                 "--output-format", "stream-json", "--verbose",
                 "--tools", "WebSearch",
                 "--allowedTools", "WebSearch", "--strict-mcp-config", "--safe-mode", "--permission-mode", "dontAsk",
-                "--model", MODEL, "--effort", EFFORT]
+                "--model", MODEL, "--effort", EFFORT, "--system-prompt", SERVICE_SYSTEM_PROMPT]
     assert _build_cmd("т", "{}", ["WebSearch"], None, None) == expected
     assert _build_cmd("т", "{}", ["WebSearch"], None, None, mcp_tools=[]) == expected
 
