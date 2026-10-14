@@ -22,6 +22,9 @@ from app.config import GARANT_TOKEN_FILE
 LIMITS_URL = "https://api.garant.ru/v2/limits"
 CACHE_S = 60
 EXPORT = "Экспорт"            # семейство выгрузок текста (30 в месяц) — так оно называется в ответе /v2/limits
+LINKS = "Постановка ссылки"   # распознавание ссылок на акты (1000 в месяц)
+# Месячные лимиты токена (скилл garant-api, проверено по /v2/limits 2026-10-07) — для строки «осталось N из M»
+MONTHLY = {EXPORT: 30, LINKS: 1000, "Информация о документе": 300}
 
 _cache: tuple[float, dict[str, int]] | None = None
 # Без прокси машины: Гарант напрямую (через прокси вызовы зависали — см. GARANT_NO_PROXY_HOST в config.py)

@@ -63,6 +63,7 @@ import html
 import json
 import math
 import os
+import re
 import time
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
@@ -81,7 +82,7 @@ from nicegui.storage import Storage
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.responses import Response
 
-from app import config, dialog, feedback, operations, sessions, trace, versions
+from app import config, dialog, feedback, garant_limits, operations, sessions, trace, versions
 from app.actions import Who, log_action, session_label
 from app.config import ACCEPTED_EXTENSIONS, SEARCH_LIMIT_MAX, SEARCH_LIMITS, all_indicators
 from app.mandatory_indicators import ACT_TYPES, NO_TYPE
@@ -664,6 +665,31 @@ class PanelState:
     detail: str
 
 
+_URL_RE = re.compile(r"https?://[^\s<>«»\"]+")
+
+
+def sources_html(sources: list[str]) -> str:
+    """Источники ответа помощника (шаг 7 плана помощника) — HTML под ответом: адреса страниц — ссылками."""
+    if not sources:
+        return ""
+    items = []
+    for src in sources:
+        text = html.escape(src)
+        items.append(_URL_RE.sub(lambda m: f'<a href="{m.group(0)}" target="_blank" rel="noopener" '
+                                           f'class="text-primary underline">{m.group(0)}</a>', text))
+    return ('<div class="text-xs text-gray-600 mt-2">Источники:<br>' + "<br>".join(f"• {i}" for i in items)
+            + "</div>")
+
+
+def limits_text(left: dict[str, int] | None) -> str:
+    """Строка остатка лимитов Гаранта на панели; None — узнать не удалось."""
+    if left is None:
+        return "Гарант: остаток лимитов узнать не удалось"
+    parts = [f"{title.lower() if title != garant_limits.EXPORT else 'выгрузки'} {left[title]} из {total}"
+             for title, total in garant_limits.MONTHLY.items() if title in left and title != "Информация о документе"]
+    return "Гарант в этом месяце: " + ", ".join(parts)
+
+
 def panel_state(chat: list[dict], status: dict | None, editable: bool, version: int, now: datetime) -> PanelState:
     """
     Одно состояние панели, только из диска: сначала идущее действие (dialog/status.json),
@@ -747,13 +773,14 @@ class DialogJobs:
         dialog.append_chat(run_id, "сервис", f"План отменён — файл не изменён (версия {_current_version(run_id)}).",
                            mark="отменено", session=session)
 
-    async def turn(self, run_id: str, text: str, session: str | None = None) -> None:
-        """Ход помощника: ответ и, может быть, план — всё пишется в чат; session — чья реплика."""
+    async def turn(self, run_id: str, text: str, session: str | None = None, allow_export: bool = False) -> None:
+        """Ход помощника: ответ и, может быть, план — всё пишется в чат; session — чья реплика;
+        allow_export — пользователь разрешил выгрузку из Гаранта на этот ход."""
         if pending_plan(dialog.read_chat(run_id)):
             dialog.append_chat(run_id, "сервис", "План выше не применён.", mark="отменено", session=session)
         dialog.set_status(run_id, "думает", "Помощник думает…", "обычно 10–40 сек")
         try:
-            await nicegui_run.io_bound(lambda: dialog.turn(run_id, text, session=session))
+            await nicegui_run.io_bound(lambda: dialog.turn(run_id, text, session=session, allow_export=allow_export))
         except Exception as error:   # сбой вне вызова модели (диск, артефакты) — в чат, сервис живёт
             dialog.append_chat(run_id, "сервис", f"Сбой хода помощника: {error}", mark="сбой", session=session)
         finally:
@@ -1443,13 +1470,17 @@ class _DialogView:
         self._shown_pending: tuple | None = None    # от чего зависит карточка плана или решения
         self._shown_versions: tuple | None = None   # от чего зависит список версий
         self._known_version: int | None = None      # версия, по которой нарисована карточка результата
+        self._shown_steps: list[str] = []           # шаги помощника, что сейчас на экране
+        self._allow_export = False                  # «Разрешить выгрузку» нажата — на следующее сообщение
 
         with ui.card().classes("w-full p-0"):
             with ui.row().classes("w-full items-center flex-nowrap gap-3 px-5 py-4"):
                 ui.icon("forum", color="primary").classes("text-2xl")
                 ui.label("Работа с результатом").classes("text-lg font-medium")
                 ui.space()
-                self._spent = ui.label("").classes("text-sm text-gray-600 text-right")
+                with ui.column().classes("gap-0 items-end"):
+                    self._spent = ui.label("").classes("text-sm text-gray-600 text-right")
+                    self._limits = ui.label("").classes("text-xs text-gray-500 text-right")
             ui.separator()
             with ui.column().classes("w-full p-5 gap-3"):
                 ui.label(
@@ -1468,6 +1499,8 @@ class _DialogView:
                 self._scroll = ui.scroll_area().classes("w-full h-96 border rounded")
                 with self._scroll:
                     self._chat = ui.column().classes("w-full gap-1 p-2")
+                # Шаги помощника, пока идёт его ход (из файла хода, по таймеру)
+                self._steps = ui.column().classes("w-full gap-0 px-3")
                 self._pending = ui.column().classes("w-full gap-2")
                 with ui.row().classes("w-full items-end flex-nowrap gap-2"):
                     self._input = (
@@ -1490,6 +1523,11 @@ class _DialogView:
                         on_click=lambda: self._upload.run_method("pickFiles"),
                     ).props("outline")
                     self._next = ui.button("", icon="skip_next", on_click=self._on_next_remark).props("outline")
+                    # Платная выгрузка из Гаранта — только по этой кнопке, ровно на следующее сообщение
+                    self._export = ui.button("Разрешить выгрузку", icon="file_download",
+                                             on_click=self._on_toggle_export).props("outline")
+                    self._export.tooltip("Следующий ответ помощника сможет выгрузить текст из Гаранта "
+                                         "(30 выгрузок в месяц на всех)")
             ui.separator()
             with ui.expansion("Версии файла", icon="history").classes("w-full"):
                 self._versions = ui.column().classes("w-full gap-2 px-2 pb-3")
@@ -1498,7 +1536,14 @@ class _DialogView:
         self._client.on_connect(lambda: setattr(self, "_disconnected", False))
         self._client.on_disconnect(self._on_disconnect)
         ui.timer(DIALOG_POLL_S, self._tick)
+        ui.timer(garant_limits.CACHE_S, self._refresh_limits)
         self._tick()
+        ui.timer(0.1, self._refresh_limits, once=True)
+
+    async def _refresh_limits(self) -> None:
+        """Остаток лимитов Гаранта — в фоне, не чаще раза в минуту (кэш garant_limits)."""
+        left = await nicegui_run.io_bound(garant_limits.limits)
+        _RunView._set_text(self._limits, limits_text(left))
 
     def _on_disconnect(self) -> None:
         self._disconnected = True
@@ -1528,6 +1573,7 @@ class _DialogView:
         if len(chat) != self._shown_chat:
             self._shown_chat = len(chat)
             self._render_chat(chat)
+        self._render_steps(chat, dialog.read_status(rid))
         pending_key = (len(chat), busy, id(waiting[1]) if waiting else None, self._editable)
         if pending_key != self._shown_pending:
             self._shown_pending = pending_key
@@ -1558,8 +1604,19 @@ class _DialogView:
             _RunView._set_text(self._state_title, state.title)
         _RunView._set_text(self._state_detail, state.detail)   # секунды тикают каждый опрос
 
+    def _render_steps(self, chat: list[dict], status: dict | None) -> None:
+        """Пока помощник думает — его шаги по ходу (номер хода = номер последней реплики пользователя)."""
+        steps = dialog.turn_steps(self._run_id, len(chat)) if status and status.get("state") == "думает" else []
+        if steps == self._shown_steps:
+            return
+        self._shown_steps = steps
+        self._steps.clear()
+        with self._steps:
+            for step in steps:
+                ui.label(f"→ {step}").classes("text-xs text-gray-600")
+
     def _render_controls(self, chat: list[dict], active: bool) -> None:
-        for element in (self._input, self._send, self._upload_button, self._next):
+        for element in (self._input, self._send, self._upload_button, self._next, self._export):
             element.set_enabled(active)
         progress = dialog.remarks_progress(self._run_id)
         left = progress is not None and progress[0] < progress[1]
@@ -1590,9 +1647,13 @@ class _DialogView:
                 if message.get("cost_usd"):
                     stamp += f" · {format_cost(message['cost_usd'])}"
                 ui.chat_message(
-                    text=html.escape(message["text"]).replace("\n", "<br>"), text_html=True,
-                    name="Вы" if mine else "Помощник", sent=mine, stamp=stamp,
+                    text=html.escape(message["text"]).replace("\n", "<br>") + sources_html(message.get("sources") or []),
+                    text_html=True, name="Вы" if mine else "Помощник", sent=mine, stamp=stamp,
                 ).classes("w-full")
+                if message.get("steps"):   # что помощник делал в этом ходе — свёрнуто под ответом
+                    with ui.expansion(f"Шаги помощника ({len(message['steps'])})").classes("w-full text-xs text-gray-600"):
+                        for step in message["steps"]:
+                            ui.label(f"→ {step}").classes("text-xs text-gray-600")
         self._scroll.scroll_to(percent=1.0)
 
     def _render_pending(self, chat: list[dict], busy: bool, waiting: tuple | None) -> None:
@@ -1692,8 +1753,25 @@ class _DialogView:
         if not text or not self._editable or DIALOG_JOBS.busy(self._run_id):
             return
         self._input.set_value("")
-        log_action(self._who, "сообщение помощнику", self._run_id, text=shorten(text, 500))
-        self._start(DIALOG_JOBS.turn(self._run_id, text, self._who.session))
+        allow, self._allow_export = self._allow_export, False   # разрешение — ровно на это сообщение
+        self._show_export()
+        log_action(self._who, "сообщение помощнику", self._run_id, text=shorten(text, 500),
+                   export_allowed=allow or None)
+        self._start(DIALOG_JOBS.turn(self._run_id, text, self._who.session, allow_export=allow))
+
+    def _on_toggle_export(self) -> None:
+        if not self._editable:
+            return
+        self._allow_export = not self._allow_export
+        log_action(self._who, "разрешить выгрузку" if self._allow_export else "отменить разрешение выгрузки",
+                   self._run_id)
+        self._show_export()
+
+    def _show_export(self) -> None:
+        """Кнопка выгрузки: нажата — залита, подпись говорит, что разрешено на следующее сообщение."""
+        _RunView._set_text(self._export, "Выгрузка разрешена на следующее сообщение" if self._allow_export
+                           else "Разрешить выгрузку")
+        self._export.props(remove="outline unelevated").props("unelevated" if self._allow_export else "outline")
 
     def _on_next_remark(self) -> None:
         if not self._editable or DIALOG_JOBS.busy(self._run_id):

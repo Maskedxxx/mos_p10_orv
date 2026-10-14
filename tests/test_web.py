@@ -1101,3 +1101,16 @@ def test_close_idle_sessions_skips_busy_dialog(tmp_runs_dir, monkeypatch):
     closed = web.close_idle_sessions(datetime(2026, 10, 13, 12, 0), SimpleNamespace(busy=lambda r: r == b))
     assert closed == [a] and sessions.is_closed(a) and not sessions.is_closed(b)
     assert json.loads((trace.run_dir(a) / sessions.SESSION_SUMMARY_FILE).read_text(encoding="utf-8"))["closed_by"] == "таймер"
+
+
+def test_sources_html_links_and_escapes():
+    """Шаг 7 помощника: источники под ответом — адреса ссылками, остальное экранировано."""
+    out = web.sources_html(["Вердикты, индикатор 3", "https://internet.garant.ru/#/document/70636256 — редакции <акта>"])
+    assert 'href="https://internet.garant.ru/#/document/70636256"' in out and "&lt;акта&gt;" in out
+    assert "Вердикты, индикатор 3" in out and web.sources_html([]) == ""
+
+
+def test_limits_text():
+    assert web.limits_text({"Экспорт": 21, "Постановка ссылки": 929, "Информация о документе": 299}) == \
+        "Гарант в этом месяце: выгрузки 21 из 30, постановка ссылки 929 из 1000"
+    assert "не удалось" in web.limits_text(None)

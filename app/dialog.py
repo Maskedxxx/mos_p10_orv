@@ -217,11 +217,64 @@ def turn(run_id: str, message: str, *, session: str | None = None, timeout_s: in
                                    "cost_reported": result.session_cost_usd})
         value = result.value
         append_chat(run_id, "ассистент", value.reply, plan=[op.model_dump(mode="json") for op in value.plan],
-                    sources=value.sources or None, cost_usd=round(cost, 4))
+                    sources=value.sources or None, steps=turn_steps(run_id, n) or None, cost_usd=round(cost, 4))
         out = TurnResult(reply=value.reply, plan=list(value.plan), cost_usd=cost, sources=list(value.sources))
     if allow_export:   # строка об остатке — после ответа помощника
         _report_exports(run_id, exports_before, session)
     return out
+
+
+# Шаги помощника для пользователя (шаг 7): вызов инструмента → строка «что делаю»
+_STEP_TITLES = {
+    "mcp__p10run__list_artifacts": "смотрю список файлов результата",
+    "mcp__garant__garant_document_redactions": "смотрю редакции акта в Гаранте",
+    "mcp__garant__garant_snippets": "ищу место в документе Гаранта",
+    "mcp__garant__garant_sutyazhnik": "ищу судебную практику в Гаранте («Сутяжник»)",
+    "mcp__garant__garant_limits": "смотрю остаток лимитов Гаранта",
+    "mcp__garant__garant_export_block_html": "выгружаю текст пункта из Гаранта (платно)",
+    "mcp__garant__garant_export_html": "выгружаю текст документа из Гаранта (платно)",
+}
+
+
+def _step_text(name: str, args: dict) -> str | None:
+    """Строка шага по вызову инструмента; None — служебный вызов (ответ по схеме), не показывается."""
+    if name == "StructuredOutput":
+        return None
+    if name == "mcp__p10run__read_artifact":
+        query = args.get("query")
+        return f"читаю {args.get('path', '')}" + (f" — ищу «{query}»" if query else "")
+    if name == "mcp__garant__garant_search":
+        return f"ищу в Гаранте: {args.get('query') or args.get('text') or ''}".rstrip(": ")
+    if name == "WebSearch":
+        return f"ищу в интернете: {args.get('query', '')}"
+    if name == "WebFetch":
+        return f"открываю {args.get('url', '')}"
+    return _STEP_TITLES.get(name, f"вызываю {name.removeprefix('mcp__')}")
+
+
+def turn_steps(run_id: str, n: int) -> list[str]:
+    """
+    Шаги хода n по порядку — из файлов хода dialog/turns/NNNN*.stream.jsonl (их пишет runner по ходу работы).
+    Вход: прогон, номер хода (номер реплики пользователя в чате). Выход: строки «что делает помощник».
+    """
+    steps: list[str] = []
+    seen: set[str] = set()
+    for path in sorted((run_dir(run_id) / "dialog" / "turns").glob(f"{n:04d}*.stream.jsonl")):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                event = json.loads(line).get("event") or {}
+            except (ValueError, AttributeError):
+                continue
+            if not isinstance(event, dict) or event.get("type") != "assistant":
+                continue
+            for block in (event.get("message") or {}).get("content") or []:
+                if not isinstance(block, dict) or block.get("type") != "tool_use" or block.get("id") in seen:
+                    continue
+                seen.add(block.get("id"))
+                text = _step_text(block.get("name", ""), block.get("input") or {})
+                if text:
+                    steps.append(text)
+    return steps
 
 
 def _report_exports(run_id: str, before: int | None, session: str | None) -> None:

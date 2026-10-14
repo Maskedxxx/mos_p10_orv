@@ -179,3 +179,24 @@ def test_export_allowed_only_for_this_turn_and_reported(rid, monkeypatch):
     assert dialog_module.read_chat(rid)[-1]["text"] == "Выгрузок Гаранта потрачено: 1, осталось 20 в этом месяце."
     dialog_module.turn(rid, "а теперь вопрос")
     assert not any("export" in t for t in seen[1]["mcp_tools"])
+
+
+def test_turn_steps_from_stream(rid):
+    """Шаги хода — из файла хода: вызовы инструментов по порядку, без дублей и служебного ответа по схеме."""
+    import json
+    path = run_dir(rid) / "dialog" / "turns" / "0003.stream.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    def tool(i, name, args):
+        return json.dumps({"ts": "t", "attempt": 1, "event": {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": i, "name": name, "input": args}]}}}, ensure_ascii=False)
+    lines = [tool("a", "mcp__p10run__read_artifact", {"path": "03_verdicts/03.json"}),
+             tool("a", "mcp__p10run__read_artifact", {"path": "03_verdicts/03.json"}),          # дубль события
+             json.dumps({"ts": "t", "event": {"type": "stream_event"}}), "не json",
+             tool("b", "mcp__garant__garant_search", {"query": "Number(166-ПП)"}),
+             tool("c", "WebFetch", {"url": "https://mos.ru/x"}),
+             tool("d", "StructuredOutput", {"reply": "…"})]
+    path.write_text("\n".join(lines), encoding="utf-8")
+    assert dialog_module.turn_steps(rid, 3) == ["читаю 03_verdicts/03.json", "ищу в Гаранте: Number(166-ПП)",
+                                                 "открываю https://mos.ru/x"]
+    assert dialog_module.turn_steps(rid, 5) == []
