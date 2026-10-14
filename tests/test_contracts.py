@@ -1015,3 +1015,51 @@ def test_indicator09_reasoning_before_choice():
     assert order.index("addressed") < order.index("wordings") < order.index("rationale") < order.index("verdict")
     row = list(UnclearWording.model_json_schema()["properties"])
     assert row.index("effect") < row.index("mark")
+
+
+# ---- Индикатор 10: применимость и таблица фактов практики, рубрика вердикта (14.10, разбор узлов) ----
+
+
+def _f10(mark: str) -> dict:
+    return {"source": "https://example.ru/a", "fact": "отбор не состоялся", "about": "этот акт", "mark": mark}
+
+
+def _ind10(verdict: str, rows: list, applicability: str = "применим") -> dict:
+    extra = {"missing_data": "число заявок (п. 2)"} if verdict == "нет данных" else {}
+    return {"indicator": 10, "name": "учёт практики применения", "applicability_basis": "акт действует",
+            "applicability": applicability, "searches": ["суды", "новости", "доклады"], "findings": rows,
+            "rationale": "полный разбор", "verdict": verdict, "rationale_brief": _B, **extra}
+
+
+@pytest.mark.parametrize("verdict, rows, applicability", [
+    ("нарушен", [_f10("не работает"), _f10("работает")], "применим"),
+    ("соблюдён", [_f10("работает"), _f10("не про этот акт")], "применим"),
+    ("нет данных", [_f10("не про этот акт")], "применим"),
+    ("нет данных", [], "применим"),
+    ("не применимо", [], "не вступил в силу"),
+    ("не применимо", [_f10("не работает")], "только органу"),
+])
+def test_indicator10_verdict_follows_findings(verdict, rows, applicability):
+    from app.contracts import Indicator10Output
+    assert Indicator10Output(**_ind10(verdict, rows, applicability)).verdict == verdict
+
+
+@pytest.mark.parametrize("verdict, rows, applicability", [
+    ("нет данных", [_f10("не работает")], "применим"),
+    ("соблюдён", [], "применим"),
+    ("нарушен", [_f10("не про этот акт")], "применим"),
+    ("нет данных", [], "не вступил в силу"),
+])
+def test_indicator10_verdict_contradicting_findings_rejected(verdict, rows, applicability):
+    from app.contracts import Indicator10Output
+    with pytest.raises(ValidationError):
+        Indicator10Output(**_ind10(verdict, rows, applicability))
+
+
+def test_indicator10_reasoning_before_choice():
+    from app.contracts import Indicator10Output, PracticeFinding
+    order = list(Indicator10Output.model_json_schema()["properties"])
+    assert order.index("applicability_basis") < order.index("applicability") < order.index("findings") \
+        < order.index("rationale") < order.index("verdict")
+    row = list(PracticeFinding.model_json_schema()["properties"])
+    assert row.index("about") < row.index("mark")
