@@ -40,7 +40,7 @@ from app.nodes.merge import _clause_tokens, _fallback_map, _flatten_hypotheses
 from app.nodes.request import build_request
 from app.nodes.sort import sort_verdicts
 from app.nodes.verdicts import run_verdicts
-from app.trace import load_json, run_dir, save_json
+from app.trace import load_json, run_dir, save_bytes, save_json
 
 
 class OperationError(Exception):
@@ -66,6 +66,7 @@ class Candidate:
     before: str
     after: str
     cost_usd: float
+    checks: bytes | None = None   # 14.10: таблица проверки индикатора из перепроверки — в корень при «Принять»
 
 
 @dataclass
@@ -396,13 +397,17 @@ def _prepare_recheck(ctx: _Ctx, op: RecheckIndicator, prefix: str) -> Candidate:
     if new.verdict == "ошибка":
         raise OperationError(f"перепроверка не удалась: {new.rationale[:300]}")
     old = ctx.verdicts[op.indicator]
+    checks_path = run_dir(ctx.run_id) / f"{prefix}03_verdicts/{op.indicator:02d}.checks.json"
     return Candidate(op, new, f"{old.verdict}\n{_points(old.rationale_brief, old.rationale)}",
-                     f"{new.verdict}\n{_points(new.rationale_brief, new.rationale)}", cost)
+                     f"{new.verdict}\n{_points(new.rationale_brief, new.rationale)}", cost,
+                     checks=checks_path.read_bytes() if checks_path.is_file() else None)
 
 
 def _accept_recheck(ctx: _Ctx, cand: Candidate) -> Change:
     new: Verdict = cand.payload
     before = _apply_verdict(ctx, new)
+    if cand.checks is not None:   # таблица проверки — та, на которой стоит новый вердикт
+        save_bytes(ctx.run_id, f"03_verdicts/{new.indicator:02d}.checks.json", cand.checks)
     return Change(f"Вердикты, инд. {new.indicator}", "вердикт перепроверен агентом индикатора", before, new.verdict)
 
 

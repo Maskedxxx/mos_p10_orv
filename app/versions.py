@@ -34,10 +34,13 @@ _NUMBERED = ("03_verdicts", "05_hypotheses")   # внутри — NN.json, сы�
 
 
 def artifact_files(base: Path) -> list[str]:
-    """Относительные пути чистых артефактов версии, которые есть в папке base."""
+    """Относительные пути чистых артефактов версии, которые есть в папке base.
+    14.10: и таблицы проверки индикаторов 03_verdicts/NN.checks.json — помощник читает их, и они должны
+    совпадать с вердиктом своей версии (снимок, откат, «Принять» перепроверки)."""
     names = [name for name in _SINGLE if (base / name).is_file()]
     for folder in _NUMBERED:
         names += sorted(f"{folder}/{p.name}" for p in (base / folder).glob("[0-9][0-9].json"))
+    names += sorted(f"03_verdicts/{p.name}" for p in (base / "03_verdicts").glob("[0-9][0-9].checks.json"))
     return names
 
 

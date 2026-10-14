@@ -117,3 +117,15 @@ def test_version_commit_and_restore_are_logged(rid):
     assert [e["version"] for e in created] == [0, 1]
     assert created[1]["changes"] == ["правка: Карта гипотез, стр. 1"]
     assert [e["version"] for e in read_events(rid) if e["event"] == "version_restored"] == [0]
+
+
+def test_checks_tables_in_snapshot_and_restore(rid):
+    """14.10: таблицы проверки индикаторов (NN.checks.json) — часть версии: в снимке и возвращаются откатом."""
+    (run_dir(rid) / "03_verdicts" / "03.checks.json").write_text('{"references": ["v0"]}', encoding="utf-8")
+    versions.ensure_v0(rid)
+    assert (run_dir(rid) / "versions" / "v0" / "03_verdicts" / "03.checks.json").exists()
+    (run_dir(rid) / "03_verdicts" / "03.checks.json").write_text('{"references": ["v1"]}', encoding="utf-8")
+    state = versions.ensure_v0(rid)
+    versions.commit(rid, state, [_entry(1)])
+    versions.restore(rid, 0)
+    assert (run_dir(rid) / "03_verdicts" / "03.checks.json").read_text(encoding="utf-8") == '{"references": ["v0"]}'

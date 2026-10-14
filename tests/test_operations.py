@@ -245,3 +245,22 @@ def test_model_cannot_add_row_with_not_tracked():
     with pytest.raises(ValidationError):
         AddMapRow(kind="добавить строку карты", indicators=[10], hypothesis="h", grounds="э", effects=[_EFFECT],
                   data=[{"metric": "x", "source": "нигде не ведётся"}], reason="э")
+
+
+def test_recheck_accept_puts_new_checks_table_to_root(rid, monkeypatch):
+    """14.10: «Принять» перепроверки кладёт в корень и новую таблицу проверки — помощник читает её, а не старую."""
+    new = Verdict(indicator=3, name="индикатор 3", verdict="соблюдён", rationale="всё действует")
+    (run_dir(rid) / "03_verdicts" / "03.checks.json").write_text('{"references": ["старая"]}', encoding="utf-8")
+
+    def _fake(document_md, run_id, **kw):
+        path = run_dir(run_id) / f"{kw['trace_prefix']}03_verdicts/03.checks.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"references": ["новая"]}', encoding="utf-8")
+        return [new]
+
+    monkeypatch.setattr(ops_module, "run_verdicts", _fake)
+    res = run_step(rid, RecheckIndicator(kind="перепроверить индикатор", indicator=3, clarification="по таблице",
+                                         reason="эксперт"))
+    assert '"старая"' in (run_dir(rid) / "03_verdicts" / "03.checks.json").read_text(encoding="utf-8")   # до «Принять»
+    accept(rid, res.candidate)
+    assert '"новая"' in (run_dir(rid) / "03_verdicts" / "03.checks.json").read_text(encoding="utf-8")
