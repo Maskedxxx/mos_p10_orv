@@ -17,8 +17,8 @@ from app.config import (
     web_indicators,
 )
 
-TEXT_INDICATOR_NUMBERS = {1, 2, 5, 6, 7, 8}   # 7, 8 — с 13.10 только текст акта
-WEB_INDICATOR_NUMBERS = {3, 4, 9, 10, 11, 12}
+TEXT_INDICATOR_NUMBERS = {1, 2, 5, 6, 7, 8, 9}   # 7, 8, 9 — с 13.10 только текст акта
+WEB_INDICATOR_NUMBERS = {3, 4, 10, 11, 12}
 
 
 def test_exactly_12_indicators_without_gaps_or_duplicates():

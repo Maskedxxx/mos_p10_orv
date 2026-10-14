@@ -970,3 +970,48 @@ def test_indicator08_reasoning_before_choice():
     assert order.index("documents") < order.index("rationale") < order.index("verdict")
     row = list(PackageDocument.model_json_schema()["properties"])
     assert row.index("made_by") < row.index("mark") and row.index("overlap") < row.index("mark")
+
+
+# ---- Индикатор 9: таблица возможно неясных формулировок, рубрика вердикта (13.10, разбор узлов) ----
+
+
+def _w9(mark: str) -> dict:
+    return {"clause": "п. 1", "quote": "при необходимости", "readings": "два прочтения",
+            "effect": "меняется пакет", "mark": mark}
+
+
+def _ind09(verdict: str, rows: list, addressed: str | None) -> dict:
+    return {"indicator": 9, "name": "содержание понятных требований", "addressed": addressed, "wordings": rows,
+            "rationale": "полный разбор", "verdict": verdict, "rationale_brief": _B}
+
+
+@pytest.mark.parametrize("verdict, rows, addressed", [
+    ("нарушен", [_w9("непонятно"), _w9("понятно")], "требования к заявителю (п. 1–3)"),
+    ("соблюдён", [_w9("понятно")], "требования к заявителю (п. 1–3)"),
+    ("соблюдён", [], "требования к заявителю (п. 1)"),
+    ("не применимо", [], None),
+])
+def test_indicator09_verdict_follows_wordings(verdict, rows, addressed):
+    from app.contracts import Indicator09Output
+    assert Indicator09Output(**_ind09(verdict, rows, addressed)).verdict == verdict
+
+
+@pytest.mark.parametrize("verdict, rows, addressed", [
+    ("соблюдён", [_w9("непонятно")], "п. 1"),
+    ("нарушен", [_w9("понятно")], "п. 1"),
+    ("не применимо", [], "п. 1"),
+    ("соблюдён", [], None),
+    ("нарушен", [_w9("непонятно")], None),
+])
+def test_indicator09_verdict_contradicting_wordings_rejected(verdict, rows, addressed):
+    from app.contracts import Indicator09Output
+    with pytest.raises(ValidationError):
+        Indicator09Output(**_ind09(verdict, rows, addressed))
+
+
+def test_indicator09_reasoning_before_choice():
+    from app.contracts import Indicator09Output, UnclearWording
+    order = list(Indicator09Output.model_json_schema()["properties"])
+    assert order.index("addressed") < order.index("wordings") < order.index("rationale") < order.index("verdict")
+    row = list(UnclearWording.model_json_schema()["properties"])
+    assert row.index("effect") < row.index("mark")

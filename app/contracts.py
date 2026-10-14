@@ -1293,6 +1293,121 @@ class Indicator08Output(BaseModel):
         return self
 
 
+# ---- Индикатор 9: свой контракт — таблица возможно неясных формулировок, рубрика вердикта (13.10) ----
+# Рубрика: 4_документы/Рубрика_индикатор_09.md. Таблица — в 03_verdicts/09.checks.json.
+
+
+class UnclearWording(_Base):
+    """Формулировка требования или условия, которая может быть неясна адресату, и вывод — понятна ли она."""
+
+    clause: str = Field(description="Пункт акта.")
+    quote: str = Field(description="Дословная формулировка из акта.")
+    readings: str = Field(
+        description="Как её можно понять: оба прочтения, или чего адресат не знает (что ещё представить, когда откажут)."
+    )
+    effect: str = Field(description="Что меняется для адресата в зависимости от прочтения — или ничего.")
+    mark: Literal["непонятно", "понятно"] = Field(
+        description=(
+            "«непонятно» — адресат не может понять из текста, что ему делать или что с ним будет, в одном из "
+            "трёх случаев: формулировку можно понять двумя способами, и от этого меняется, что делать адресату; "
+            "адресат обязан представить или сделать «иное», и не знает что именно («и иные документы»); орган "
+            "решает против адресата по оценочному основанию без критериев (отказ «при наличии достаточных "
+            "оснований», дополнительные требования «при необходимости»). «понятно» — всё остальное: сложный "
+            "язык; термин без определения, если смысл ясен; оценочное слово в норме для самого органа, которое "
+            "на адресата не влияет; «рекомендуется»; не описаны последствия. Есть сомнение — «понятно»."
+        )
+    )
+
+
+class Indicator09Output(BaseModel):
+    """Индикатор 9 «Содержание понятных требований и условий»: адресат понимает из текста акта, что ему
+    делать и что с ним будет.
+    Сначала опиши, что акт адресует гражданам и организациям, и заполни wordings, потом разбор, потом вердикт."""
+
+    model_config = ConfigDict(extra="forbid", title="Verdict")
+
+    indicator: int = Field(ge=1, le=12, description="Номер индикатора из задания, 1–12.")
+    name: str = Field(description="Название индикатора, как в задании.")
+    addressed: str | None = Field(
+        default=None,
+        description=(
+            "Какие требования и условия акт адресует гражданам и организациям (обязанности, процедура "
+            "с их участием, контроль за ними) — кратко, с пунктами. Ничего не адресует — null."
+        ),
+    )
+    wordings: list[UnclearWording] = Field(
+        default_factory=list,
+        description=(
+            "Артефакт. Одна запись — одна формулировка требования или условия для граждан и организаций, "
+            "которая может быть им неясна. Включать: такие формулировки из текста и приложений; одинаковая "
+            "формулировка в нескольких приложениях — одна запись, пункты через «;»."
+        ),
+    )
+    rationale: str = Field(
+        description="Разбор: что акт адресует гражданам и организациям, что нашёл, почему такой вердикт."
+    )
+    verdict: Literal["нарушен", "соблюдён", "не применимо", "нет данных"] = Field(
+        description=(
+            "Вердикт следует только из addressed и wordings. "
+            "«нарушен» — есть хотя бы одна запись «непонятно». "
+            "«соблюдён» — addressed заполнено, записей «непонятно» нет. "
+            "«не применимо» — addressed = null: акт ничего не адресует гражданам и организациям. "
+            "«нет данных» не ставится: понятность видна по тексту акта."
+        )
+    )
+    missing_data: str | None = Field(
+        default=None,
+        description="Всегда null: «нет данных» у этого индикатора не ставится.",
+    )
+    proof: str | None = Field(
+        default=None,
+        description=(
+            "Дословная цитата. «нарушен» — неясная формулировка. «соблюдён» — пункт с требованием или "
+            "условием. «не применимо» — null."
+        ),
+    )
+    clause: str | None = Field(
+        default=None,
+        description="Пункт, откуда цитата proof. «не применимо» — null.",
+    )
+    sources: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Только адреса страниц, на которых стоит вывод, по одному на элемент. "
+            "Рассуждения о том, что не открылось и не нашлось, — в rationale."
+        ),
+    )
+    attempts: int = Field(
+        default=1, ge=1,
+        description="Служебное: сколько попыток вызова понадобилось. Заполняет код — оставь 1.",
+    )
+    rationale_brief: list[BriefPoint] = _brief(_RATIONALE_BRIEF)
+
+    @model_validator(mode="after")
+    def _check_name_rationale_missing_data(self) -> "Indicator09Output":
+        _not_blank(self.name)
+        _not_blank(self.rationale)
+        _check_missing_data(self.verdict, self.missing_data)
+        return self
+
+    @model_validator(mode="after")
+    def _check_verdict_follows_wordings(self) -> "Indicator09Output":
+        """Вердикт следует из addressed и таблицы формулировок (рубрика индикатора 9, раздел 4)."""
+        if self.addressed is None and self.wordings:
+            raise ValueError("addressed = null, но wordings не пуст — неясными бывают только адресованные нормы")
+        unclear = [w.clause for w in self.wordings if w.mark == "непонятно"]
+        if unclear:
+            allowed, why = {"нарушен"}, f"есть непонятная формулировка (п. {unclear[0]})"
+        elif self.addressed is not None:
+            allowed, why = {"соблюдён"}, "требования есть, непонятных формулировок нет"
+        else:
+            allowed, why = {"не применимо"}, "акт ничего не адресует гражданам и организациям"
+        if self.verdict not in allowed:
+            raise ValueError(f"вердикт «{self.verdict}» не следует из addressed и wordings: {why} — "
+                             f"допустимо: {', '.join(sorted(allowed))}")
+        return self
+
+
 class Buckets(BaseModel):
     """Разбор корзины вердиктов на 4 кучи (узел [3] пайплайна)."""
 
