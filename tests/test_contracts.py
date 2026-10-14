@@ -1132,3 +1132,48 @@ def test_indicator11_person_deadline_never_violation():
     DeadlineCheck(**{**_d11("в пределах"), "whose": "лицо"})
     with pytest.raises(ValidationError):
         DeadlineCheck(**{**_d11("длиннее федерального"), "whose": "лицо"})
+
+
+# ---- Индикатор 12: таблица условий допуска и назначений, рубрика вердикта (14.10, разбор узлов) ----
+
+
+def _l12(mark: str) -> dict:
+    return {"clause": "п. 1", "what": "вакцинация — только в ГБУ", "who_pays": "само лицо",
+            "assessment": "лицо не выбирает исполнителя", "mark": mark}
+
+
+def _ind12(verdict: str, rows: list, allocation: str | None) -> dict:
+    return {"indicator": 12, "name": "отсутствие ограничения конкуренции", "allocation": allocation, "limits": rows,
+            "rationale": "полный разбор", "verdict": verdict, "rationale_brief": _B}
+
+
+@pytest.mark.parametrize("verdict, rows, allocation", [
+    ("нарушен", [_l12("ограничивает"), _l12("не ограничивает")], "назначение исполнителя (п. 1)"),
+    ("соблюдён", [_l12("не ограничивает")], "отбор (п. 2)"),
+    ("соблюдён", [], "отбор (п. 2)"),
+    ("не применимо", [], None),
+])
+def test_indicator12_verdict_follows_limits(verdict, rows, allocation):
+    from app.contracts import Indicator12Output
+    assert Indicator12Output(**_ind12(verdict, rows, allocation)).verdict == verdict
+
+
+@pytest.mark.parametrize("verdict, rows, allocation", [
+    ("соблюдён", [_l12("ограничивает")], "п. 1"),
+    ("нарушен", [_l12("не ограничивает")], "п. 1"),
+    ("не применимо", [], "п. 1"),
+    ("соблюдён", [], None),
+    ("нарушен", [_l12("ограничивает")], None),
+])
+def test_indicator12_verdict_contradicting_limits_rejected(verdict, rows, allocation):
+    from app.contracts import Indicator12Output
+    with pytest.raises(ValidationError):
+        Indicator12Output(**_ind12(verdict, rows, allocation))
+
+
+def test_indicator12_reasoning_before_choice():
+    from app.contracts import CompetitionLimit, Indicator12Output
+    order = list(Indicator12Output.model_json_schema()["properties"])
+    assert order.index("allocation") < order.index("limits") < order.index("rationale") < order.index("verdict")
+    row = list(CompetitionLimit.model_json_schema()["properties"])
+    assert row.index("assessment") < row.index("mark")

@@ -211,7 +211,7 @@ def test_tools_follow_route_for_all_twelve_indicators(run_id, tmp_prompts_dir, m
 
     assert set(seen_tools) == set(range(1, 13))
     for n in range(1, 13):
-        if n in {1, 2, 5, 6, 7, 8, 9}:   # 1, 2, 5, 7, 8, 9 — без инструментов с 13.10: только текст акта
+        if n in {1, 2, 5, 6, 7, 8, 9, 12}:   # 1, 2, 5, 7, 8, 9, 12 — без инструментов с 13–14.10: только текст акта
             assert seen_tools[n] == [] and seen_garant[n] is None
         else:
             assert seen_tools[n] == ["WebSearch", "WebFetch"]
@@ -482,11 +482,15 @@ def test_no_passport_block_without_passport(run_id, monkeypatch):
 
 
 def test_indicator_answer_uses_strict_contract_with_brief(run_id, tmp_prompts_dir, monkeypatch):
-    """2.5: агент индикатора обязан вернуть выжимку для эксперта — узел просит строгий VerdictOutput."""
+    """2.5: агент индикатора обязан вернуть выжимку для эксперта. 14.10: у всех 12 свои контракты с обязательной
+    выжимкой; общий VerdictOutput — запасной для номера без своего контракта."""
     from app.contracts import VerdictOutput
+    assert set(verdicts_module.INDICATOR_OUTPUT) == set(range(1, 13))
+    assert all(cls.model_fields["rationale_brief"].is_required() for cls in verdicts_module.INDICATOR_OUTPUT.values())
     mock = Mock(side_effect=_default_side_effect)
     monkeypatch.setattr(verdicts_module, "call", mock)
-    run_verdicts("текст акта", run_id, indicators=[12])   # 14.10: у 1–11 свои контракты, 12 — общий
+    monkeypatch.delitem(verdicts_module.INDICATOR_OUTPUT, 12)
+    run_verdicts("текст акта", run_id, indicators=[12])
     assert mock.call_args.args[2] is VerdictOutput
 
 
@@ -526,6 +530,8 @@ def test_indicator01_uses_own_contract_and_saves_checked_documents(run_id, tmp_p
     assert INDICATOR_OUTPUT[10] is Indicator10Output   # и у индикатора 10
     from app.contracts import Indicator11Output
     assert INDICATOR_OUTPUT[11] is Indicator11Output   # и у индикатора 11
+    from app.contracts import Indicator12Output
+    assert INDICATOR_OUTPUT[12] is Indicator12Output   # и у индикатора 12
     assert load_json(run_id, "03_verdicts/01.json", Verdict).verdict == "нарушен"
     checks = json.loads((run_dir(run_id) / "03_verdicts/01.checks.json").read_text(encoding="utf-8"))
     assert checks["checked_documents"][0]["held_by_state"] is True
@@ -560,11 +566,12 @@ def test_group_leaders_start_before_followers(run_id, tmp_prompts_dir, monkeypat
         return _default_side_effect(instruction, document, model_cls, **kwargs)
 
     monkeypatch.setattr(verdicts_module, "call", Mock(side_effect=_effect))
-    # 14.10: у 1–11 свои контракты — каждый сам себе группа; чтобы проверить механизм, 11 возвращаем
-    # на общий контракт: тогда 11 и 12 (интернет и Гарант, общий контракт) — одна группа, лидер 11
-    monkeypatch.delitem(verdicts_module.INDICATOR_OUTPUT, 11)
+    # 14.10: у всех 12 свои контракты — каждый сам себе группа; чтобы проверить механизм, 1 и 2 возвращаем
+    # на общий контракт: тогда 1 и 2 (без инструментов, общий контракт) — одна группа, лидер 1
+    monkeypatch.delitem(verdicts_module.INDICATOR_OUTPUT, 1)
+    monkeypatch.delitem(verdicts_module.INDICATOR_OUTPUT, 2)
     result = run_verdicts("текст акта", run_id)
-    leaders = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}
+    leaders = set(range(1, 13)) - {2}
     assert len(result) == 12
     assert max(started[n] for n in leaders) + 0.25 <= min(t for n, t in started.items() if n not in leaders)
 

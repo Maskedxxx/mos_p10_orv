@@ -184,16 +184,14 @@ def _brief_block(path) -> str:
     return text[text.index(_BRIEF_OPEN):text.index(_BRIEF_CLOSE)]
 
 
-def test_indicator_prompts_share_one_brief_block_and_key():
-    """Блок выжимки одинаков во всех 12 промптах индикаторов — правило пишется одно на всех;
-    ключ rationale_brief есть в примере ответа каждого."""
-    paths = [PROMPTS_DIR / f"02_indicator_{n:02d}.md" for n in range(1, 13) if n not in RUBRIC_INDICATORS]
-    blocks = {_brief_block(p) for p in paths}
-    assert len(blocks) == 1
-    block = blocks.pop()
-    assert "rationale_brief" in block and "Смотрел:" in block and "Не нашёл:" in block
-    for p in paths:
-        assert '"rationale_brief": [' in p.read_text(encoding="utf-8"), p.name
+def test_indicator_contracts_share_one_brief_rule():
+    """Правило выжимки одно на все 12 индикаторов. 14.10: у всех свои контракты — правило в описании поля
+    rationale_brief, одинаковом у всех; в промптах блока выжимки нет."""
+    descriptions = {cls.model_fields["rationale_brief"].description for cls in INDICATOR_OUTPUT.values()}
+    assert len(descriptions) == 1
+    rule = descriptions.pop()
+    assert "Смотрел:" in rule and "Не нашёл:" in rule
+    assert RUBRIC_INDICATORS == set(range(1, 13))
 
 
 def test_hypotheses_prompts_share_one_brief_block():
@@ -251,7 +249,7 @@ _ITER4_ADDED = {
     9: ["можно понять двумя способами"],   # АБ — 13.10 в контракте
     10: ["доклад о виде государственного контроля (надзора) (ст. 30)"],
     11: ["срок подачи заявки", "срок исполнения обязанности", "в рабочих днях, другие — в календарных"],   # АД, АЕ, АГ — 14.10 в контракте
-    12: ["Несоразмерное требование к участнику"],
+    12: ["Навязанный исполнитель"],   # АЗ — 14.10: требование к опыту — не нарушение (оценка), в контракте
 }
 
 
@@ -352,7 +350,7 @@ def test_iter4_garant_in_indicator_prompts():
         named = set(re.findall(r"garant_[a-z_]+", text))
         assert named <= set(tools), (n, named - set(tools))   # агент не зовёт то, чего у него нет
         assert "{{" not in fill_prompt_labels(text, limit=7)
-    for n in (3, 4, 10, 11, 12):
+    for n in (3, 4, 10, 11):
         assert "{{ПОТОЛОК_ЗАХОДОВ}} ЗАХОДОВ ПОИСКА В ИНТЕРНЕТЕ" in prompt_path(n).read_text(encoding="utf-8"), n
     t3 = prompt_path(3).read_text(encoding="utf-8").lower()
     assert "высокий риск" not in t3 and "низкий риск" not in t3 and "garant_find_hyperlinks" in t3
