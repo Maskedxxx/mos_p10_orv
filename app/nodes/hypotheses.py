@@ -39,6 +39,7 @@ _add_cost_to_meta про границы применимости).
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -51,10 +52,10 @@ from app.config import (
     PROMPT_HYPOTHESES_NO_DATA,
     PROMPT_HYPOTHESES_VIOLATED,
 )
-from app.contracts import ActPassport, Buckets, HypothesisSet, HypothesisSetOutput, RunMeta, Verdict
+from app.contracts import ActPassport, Buckets, DataItem, HypothesisSet, HypothesisSetOutput, RunMeta, Verdict
 from app.logger import get_run_logger
 from app.runner import call
-from app.trace import load_json, save_json, update_meta
+from app.trace import load_json, run_dir, save_json, update_meta
 
 # Длина, до которой обрезается текст ошибки в why_this_many при провале вызова
 _ERROR_TEXT_LIMIT = 2000
@@ -110,13 +111,63 @@ def _shared_context(document_md: str, passport_block_text: str) -> str:
     return "\n".join(parts)
 
 
-def _verdict_card(verdict: Verdict) -> str:
+def _verdict_card(verdict: Verdict, to_request: list[dict] | None = None) -> str:
     """
     Своё у каждого агента: карточка вердикта — в stdin, после общего текста акта
     и паспорта. Сериализуется читаемо (indent=2, кириллица без escape).
+    14.10: числа для органа из вердикта (to_request) — отдельным блоком, как есть.
     """
     verdict_json = json.dumps(verdict.model_dump(mode="json"), ensure_ascii=False, indent=2)
-    return "## КАРТОЧКА ВЕРДИКТА (JSON)\n\n" f"```json\n{verdict_json}\n```\n"
+    card = "## КАРТОЧКА ВЕРДИКТА (JSON)\n\n" f"```json\n{verdict_json}\n```\n"
+    if to_request:
+        requests_json = json.dumps(to_request, ensure_ascii=False, indent=2)
+        card += "\n## ЧИСЛА ДЛЯ ОРГАНА (JSON)\n\n" f"```json\n{requests_json}\n```\n"
+    return card
+
+
+def _to_request(run_id: str, n: int, trace_prefix: str) -> list[dict]:
+    """
+    Числа для органа, которые агент индикатора записал при «нет данных» (14.10, индикатор 10) — из таблицы
+    рядом с вердиктом (03_verdicts/NN.checks.json). Нет файла или поля — пусто.
+    """
+    for prefix in dict.fromkeys((trace_prefix, "")):
+        path = run_dir(run_id) / f"{prefix}03_verdicts/{n:02d}.checks.json"
+        if path.is_file():
+            try:
+                return list(json.loads(path.read_text(encoding="utf-8")).get("to_request") or [])
+            except (OSError, ValueError, AttributeError):
+                return []
+    return []
+
+
+def _metric_key(text: str) -> str:
+    """Ключ сравнения показателей: без скобок (пункты, приложения), знаков и регистра — агент гипотез часто
+    вставляет пункт в середину названия («… (приложение 1, п. 2.1), ед.»), это то же число."""
+    no_brackets = re.sub(r"\([^)]*\)", " ", text.casefold())
+    return " ".join(re.findall(r"[0-9a-zа-яё]+", no_brackets))
+
+
+def _ensure_requests(hset: HypothesisSet, to_request: list[dict]) -> tuple[HypothesisSet, list[str]]:
+    """
+    14.10: каждое число из списка индикатора доходит до гипотез — результат предыдущего узла истина.
+    Число, которого агент не положил ни в одну гипотезу, код дописывает в данные первой гипотезы.
+    Возвращает набор и список дописанных чисел.
+    """
+    if not hset.hypotheses or not to_request:
+        return hset, []
+    present = [_metric_key(d.metric) for h in hset.hypotheses for d in h.data]
+    added: list[DataItem] = []
+    for item in to_request:
+        metric = str(item.get("metric", "")).strip()
+        if metric and not any(_metric_key(metric) in p for p in present):
+            unit, clause = str(item.get("unit", "")).strip(), str(item.get("clause", "")).strip()
+            text = metric + (f", {unit}" if unit else "") + (f" ({clause})" if clause else "")
+            added.append(DataItem(metric=text, source="запрос органу"))
+    if not added:
+        return hset, []
+    first = hset.hypotheses[0]
+    hypotheses = [first.model_copy(update={"data": [*first.data, *added]}), *hset.hypotheses[1:]]
+    return hset.model_copy(update={"hypotheses": hypotheses}), [d.metric for d in added]
 
 
 def _after(delay_s: float, fn, *args):
@@ -163,9 +214,10 @@ def _run_one_hypothesis(
     """
     n = verdict.indicator
     try:
+        to_request = _to_request(run_id, n, trace_prefix)
         result = call(
             instruction,
-            _verdict_card(verdict),
+            _verdict_card(verdict, to_request),
             HypothesisSetOutput,   # 2.5: выжимки для эксперта в ответе обязательны
             run_id=run_id,
             trace_name=f"{trace_prefix}05_hypotheses/{n:02d}.raw.json",
@@ -182,6 +234,10 @@ def _run_one_hypothesis(
         # не могла разъехаться с номером/именем индикатора, под которым сохраняется
         # артефакт NN.json — по аналогии с перезаписью attempts в узле [2]
         hset = result.value.model_copy(update={"indicator": n, "name": verdict.name})
+        hset, added = _ensure_requests(hset, to_request)
+        if added:
+            get_run_logger(run_id).getChild("05_hypotheses").info(
+                "индикатор %d: код дописал в данные числа из списка индикатора: %s", n, added)
         return n, hset, result.cost_usd, True
 
     except Exception as exc:  # исключение внутри потока не должно ронять весь прогон

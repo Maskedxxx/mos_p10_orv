@@ -1025,7 +1025,9 @@ def _f10(mark: str) -> dict:
 
 
 def _ind10(verdict: str, rows: list, applicability: str = "применим") -> dict:
-    extra = {"missing_data": "число заявок (п. 2)"} if verdict == "нет данных" else {}
+    extra = ({"missing_data": "нет сведений о заявках",
+              "to_request": [{"metric": "число поданных заявок", "unit": "ед.", "clause": "п. 2"}]}
+             if verdict == "нет данных" else {})
     return {"indicator": 10, "name": "учёт практики применения", "applicability_basis": "акт действует",
             "applicability": applicability, "searches": ["суды", "новости", "доклады"], "findings": rows,
             "rationale": "полный разбор", "verdict": verdict, "rationale_brief": _B, **extra}
@@ -1190,3 +1192,15 @@ def test_hypothesis_set_output_rejects_empty_list():
                             why_this_many='одна",\n<parameter name="hypotheses">[...]', hypotheses=[])
     from app.contracts import HypothesisSet
     assert HypothesisSet(indicator=1, name="н", why_this_many="сбой вызова", hypotheses=[]).hypotheses == []
+
+
+def test_indicator10_to_request_only_and_always_with_no_data():
+    """14.10: числа для органа — списком, только и обязательно при «нет данных»."""
+    from app.contracts import Indicator10Output
+    with pytest.raises(ValidationError):
+        Indicator10Output(**{**_ind10("нет данных", []), "to_request": []})
+    with pytest.raises(ValidationError):
+        Indicator10Output(**{**_ind10("нарушен", [_f10("не работает")]),
+                             "to_request": [{"metric": "число заявок", "unit": "ед.", "clause": "п. 1"}]})
+    order = list(Indicator10Output.model_json_schema()["properties"])
+    assert order.index("findings") < order.index("to_request") < order.index("verdict")

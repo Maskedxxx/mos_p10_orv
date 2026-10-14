@@ -429,3 +429,48 @@ def test_first_hypothesis_call_starts_before_others(run_id, tmp_prompts, monkeyp
     monkeypatch.setattr(hyp_module, "call", Mock(side_effect=_effect))
     run_hypotheses_violated(_buckets_violated([7, 8, 9]), "текст", run_id)
     assert started[7] + 0.25 <= min(started[8], started[9])
+
+
+# ---- 14.10: числа для органа из вердикта доходят до гипотез целиком ----
+
+
+def test_to_request_goes_to_card_and_missing_numbers_added_by_code(run_id, tmp_prompts, monkeypatch):
+    """Список to_request индикатора (03_verdicts/10.checks.json) — в карточку агенту отдельным блоком; число,
+    которое агент не положил в data, код дописывает в первую гипотезу; уже положенное не дублируется."""
+    import json
+    to_request = [{"metric": "число заявок", "unit": "ед.", "clause": "п. 2"},
+                  {"metric": "число несостоявшихся отборов", "unit": "ед.", "clause": "п. 2.19"}]
+    path = run_dir(run_id) / "03_verdicts/10.checks.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"findings": [], "to_request": to_request}, ensure_ascii=False), encoding="utf-8")
+    mock = Mock(side_effect=_default_side_effect)
+    monkeypatch.setattr(hyp_module, "call", mock)
+    sets = run_hypotheses_no_data(_buckets_no_data([10]), "текст акта", run_id)
+    assert "## ЧИСЛА ДЛЯ ОРГАНА (JSON)" in mock.call_args.args[1] and "несостоявшихся" in mock.call_args.args[1]
+    metrics = [d.metric for d in sets[0].hypotheses[0].data]
+    assert metrics == ["число заявок", "число несостоявшихся отборов, ед. (п. 2.19)"]   # «число заявок» уже было
+    assert sets[0].hypotheses[0].data[-1].source == "запрос органу"
+    saved = load_json(run_id, "05_hypotheses/10.json", HypothesisSet)
+    assert [d.metric for d in saved.hypotheses[0].data] == metrics
+
+
+def test_no_to_request_card_unchanged(run_id, tmp_prompts, monkeypatch):
+    """Без таблицы индикатора карточка прежняя — блока чисел нет, данные агента не трогаются."""
+    mock = Mock(side_effect=_default_side_effect)
+    monkeypatch.setattr(hyp_module, "call", mock)
+    sets = run_hypotheses_violated(_buckets_violated([4]), "текст акта", run_id)
+    assert "ЧИСЛА ДЛЯ ОРГАНА" not in mock.call_args.args[1]
+    assert [d.metric for d in sets[0].hypotheses[0].data] == ["число заявок"]
+
+
+def test_ensure_requests_recognizes_reworded_metric():
+    """Проба 152-ПП 14.10: агент вставил пункт в середину названия — это то же число, дубль не дописывается."""
+    from app.nodes.hypotheses import _ensure_requests
+    hset = _ok_call_result(10).value
+    first = hset.hypotheses[0].model_copy(update={"data": [DataItem(
+        metric="число поданных заявок на субсидию (приложение 1, п. 2.1), ед., по годам 2023-2025",
+        source="запрос органу")]})
+    hset = hset.model_copy(update={"hypotheses": [first]})
+    out, added = _ensure_requests(hset, [{"metric": "число поданных заявок на субсидию (приложение 1)",
+                                          "unit": "ед.", "clause": "п. 2.1"}])
+    assert added == [] and len(out.hypotheses[0].data) == 1
