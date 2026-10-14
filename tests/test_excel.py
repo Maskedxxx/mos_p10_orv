@@ -1335,3 +1335,17 @@ def test_violated_without_map_row_goes_to_errors_sheet(tmp_runs_dir):
     assert len(cells) == 1
     assert "отсутствие ограничения конкуренции" in cells[0][0]
     assert "гипотезы по нему не построены" in cells[0][1]
+
+
+@pytest.mark.parametrize("clause, head", [
+    ("преамбула", "Норма акта, преамбула"),
+    ("приложение 1, п. 1.20", "Норма акта, приложение 1, п. 1.20"),
+    ("п. 2.2, 2.3", "Норма акта, п. 2.2, 2.3"),
+    ("пункт 4", "Норма акта, п. 4"),
+    ("п 5.1", "Норма акта, п. 5.1"),
+    ("5.1.4", "Норма акта, п. 5.1.4"),
+])
+def test_basis_cell_clause_prefix_keeps_words(clause, head):
+    """14.10, ошибка 13 аудита: «п» без точки больше не съедает первую букву («п. реамбула», «п. риложение»)."""
+    from app.nodes.excel import _render_basis_cell
+    assert _render_basis_cell("цитата", clause, []).startswith(head)

@@ -197,8 +197,9 @@ def _row_to_request_nums(request: DataRequest, *, questions: bool = False) -> di
 
 # Номер пункта модель пишет и как «4», и как «п. 2.2, 2.3, 4-6» — свой префикс
 # в подписи клетки добавляем сами, поэтому чужой снимаем, чтобы не вышло
-# «Норма акта, п. п. 2.2».
-_CLAUSE_PREFIX_RE = re.compile(r"^\s*(?:п\.?|пункт[а-я]*)\s*", re.IGNORECASE)
+# «Норма акта, п. п. 2.2». 14.10 (ошибка 13 аудита): снимаем только «п.», «п » перед цифрой и «пункт…» — раньше
+# «п» без точки съедало первую букву слова: «п. реамбула», «п. риложение 2».
+_CLAUSE_PREFIX_RE = re.compile(r"^\s*(?:пункт[а-я]*\s+|п\.\s*|п\s+(?=\d))", re.IGNORECASE)
 
 
 def _points(brief: list[str] | None, full: str) -> str:
@@ -230,7 +231,8 @@ def _render_basis_cell(
     if clause:
         cleaned = _CLAUSE_PREFIX_RE.sub("", clause).strip()
         if cleaned:
-            head += f", п. {cleaned}"
+            # «п.» — только перед номером; «преамбула», «приложение 1» — как есть
+            head += f", п. {cleaned}" if cleaned[0].isdigit() else f", {cleaned}"
 
     if proof:
         body = f"«{proof}»"
