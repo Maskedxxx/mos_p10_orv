@@ -1177,3 +1177,16 @@ def test_indicator12_reasoning_before_choice():
     assert order.index("allocation") < order.index("limits") < order.index("rationale") < order.index("verdict")
     row = list(CompetitionLimit.model_json_schema()["properties"])
     assert row.index("assessment") < row.index("mark")
+
+
+# ---- 14.10, ошибка 1 аудита: гипотеза не может молча пропасть ----
+
+
+def test_hypothesis_set_output_rejects_empty_list():
+    """В ответе модели гипотез хотя бы одна: сломанный ответ (гипотеза внутри текста why_this_many,
+    список пуст — 646-ПП 13.10) отвергается и переспрашивается. Пустой набор хранения — только у сбоя узла."""
+    with pytest.raises(ValidationError):
+        HypothesisSetOutput(indicator=1, name="н", violation_kind="издержки",
+                            why_this_many='одна",\n<parameter name="hypotheses">[...]', hypotheses=[])
+    from app.contracts import HypothesisSet
+    assert HypothesisSet(indicator=1, name="н", why_this_many="сбой вызова", hypotheses=[]).hypotheses == []

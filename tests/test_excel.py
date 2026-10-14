@@ -1320,3 +1320,18 @@ def test_developers_in_map_header_and_request_caption(tmp_runs_dir):
 def test_request_caption_without_developers_unchanged(tmp_runs_dir):
     wb = load_workbook(build_excel(_map(), _request(), _buckets(with_failed=False), _passport(), "run_nodev"))
     assert str(wb["Запрос показателей"].cell(1, 1).value).startswith("Данные, которых нет в открытом доступе. Заполняет орган-разработчик")
+
+
+def test_violated_without_map_row_goes_to_errors_sheet(tmp_runs_dir):
+    """14.10, ошибка 1 аудита: «нарушен», по которому нет строки карты (гипотезы не построены), — строка листа
+    «Ошибки прогона», а не молчаливое «—»."""
+    buckets = _buckets(with_failed=False)
+    buckets.violated.append(Verdict(indicator=12, name="отсутствие ограничения конкуренции", verdict="нарушен",
+                                    rationale="навязанный исполнитель", proof="цитата", clause="4.5"))
+    path = build_excel(_map(), _request(), buckets, _passport(), "run_err1")
+    ws = load_workbook(path)["Ошибки прогона"]
+    hdr = _find_header_row(ws, "Что случилось")
+    cells = [(ws.cell(row=r, column=1).value, ws.cell(row=r, column=2).value) for r in range(hdr + 1, ws.max_row + 1)]
+    assert len(cells) == 1
+    assert "отсутствие ограничения конкуренции" in cells[0][0]
+    assert "гипотезы по нему не построены" in cells[0][1]

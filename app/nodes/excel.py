@@ -498,6 +498,20 @@ def _unverified_verdicts(hyp_map: HypothesisMap, buckets: Buckets) -> list[Verdi
     return [v for v in buckets.no_data if v.indicator not in covered]
 
 
+def _violated_without_hypotheses(hyp_map: HypothesisMap, buckets: Buckets) -> list[Verdict]:
+    """
+    14.10 (ошибка 1 аудита): вердикты «нарушен», не представленные ни одной строкой карты, — гипотезы по ним
+    не построены (сбой узла гипотез). Раньше такой индикатор молча пропадал из карты и бланка; теперь он —
+    строка листа «Ошибки прогона».
+    """
+    covered = {n for row in hyp_map.rows for n in row.indicators}
+    return [
+        Verdict(indicator=v.indicator, name=v.name, verdict="ошибка", attempts=v.attempts,
+                rationale="Найдено нарушение, но гипотезы по нему не построены — проверьте индикатор вручную.")
+        for v in buckets.violated if v.indicator not in covered
+    ]
+
+
 def _unverified_row_ids(
     hyp_map: HypothesisMap, buckets: Buckets, fixed: dict[int, int] | None = None,
 ) -> dict[int, int]:
@@ -998,7 +1012,7 @@ def build_excel(
         unverified, marks,
     )
     _render_failed_sheet(
-        wb, buckets.failed,
+        wb, buckets.failed + _violated_without_hypotheses(hypothesis_map, buckets),
         f"Индикаторы, проверка которых не завершилась. "
         f"Пусто — значит все {total} отработали.",
     )

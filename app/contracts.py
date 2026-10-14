@@ -2115,8 +2115,15 @@ class HypothesisSetOutput(HypothesisSet):
 
     model_config = ConfigDict(title="HypothesisSet")
 
+    # 14.10 (ошибка 1 аудита): пустой список в ответе модели запрещён — по «нарушен» и по «нет данных» практики
+    # всегда есть что проверить; сломанный ответ (гипотеза внутри текста другого поля) теперь отвергается и
+    # переспрашивается, а не проходит молча. Пустой HypothesisSet остаётся только у сбоя узла (_empty_set).
     hypotheses: list[HypothesisOutput] = Field(
-        default_factory=list, description=HypothesisSet.model_fields["hypotheses"].description,
+        min_length=1,
+        description=(
+            "Гипотезы — хотя бы одна: по найденному нарушению или пробелу в практике всегда есть что проверить, "
+            "как минимум охват — сколько лиц и каких расходов под нормой."
+        ),
     )
 
 
