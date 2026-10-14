@@ -1249,3 +1249,10 @@ def test_hypothesis_proof_checked_against_act_only_with_context():
         HypothesisOutput.model_validate(bad, context={"act_text": _ACT})
     good = {**_hyp_out(), "proof": "не является аффилированным лицом банка"}
     assert HypothesisOutput.model_validate(good, context={"act_text": _ACT}).proof
+
+
+def test_breakdown_without_values_in_act_becomes_question():
+    """14.10 (ошибка 3, 166-ПП): разрез из карты без значений в акте — не выкидывать, а открытый вопрос органу."""
+    from app.contracts import RequestItem
+    d = " ".join(RequestItem.model_fields["breakdown"].description.split())
+    assert "не выкидывай" in d and "открытый вопрос органу" in d
