@@ -233,6 +233,84 @@ def test_mark_not_tracked_changes_source_and_drops_item(rid):
     assert j.kind == "решение эксперта" and j.reason == "такой статистики не ведут"
 
 
+def test_mark_not_tracked_keeps_mandatory_item(rid):
+    """15.10 (код-ревью): позиция с обязательным показателем не удаляется вместе с цифрой — она остаётся без ссылки
+    на строку карты (обязательные показатели в бланке всегда, решение Р4)."""
+    req = _req(rid)
+    save_json(rid, "07_request.json", req.model_copy(update={"items": [req.items[0].model_copy(update={"mandatory": ["ГП-1"]})]}))
+    run_step(rid, MarkNotTracked(kind="пометить: нигде не ведётся", row_id=1, metric="п1", reason="не ведут"))
+    items = _req(rid).items
+    assert [it.num for it in items] == ["1"] and items[0].mandatory == ["ГП-1"]
+    assert items[0].sources == [] and items[0].for_rows == []
+
+
+def test_old_passport_does_not_block_operations(rid):
+    """15.10 (код-ревью): паспорт прогона до итерации 4 («внешним лицам» при процедуре и контроле «есть» — так у трёх
+    прогонов прода) не роняет правки диалога: это правило проверяет только свежий ответ модели."""
+    from pathlib import Path
+    old = json.loads((Path(__file__).parent / "fixtures" / "passport_before_iter4.json").read_text(encoding="utf-8"))
+    save_json(rid, "02_passport.json", old)
+    res = run_step(rid, EditText(kind="правка текста", sheet="строка карты", key="1", field="гипотеза",
+                                  new_text="короче", reason="вода"))
+    assert res.version == 1
+
+
+def _failed_rows(rid) -> list[list]:
+    ws = load_workbook(run_dir(rid) / "08_result.xlsx")["Ошибки прогона"]
+    return [[c for c in row if c is not None] for row in ws.iter_rows(values_only=True)]
+
+
+def test_expert_deleting_rows_is_not_a_run_error(rid):
+    """15.10 (код-ревью): эксперт сам удалил все строки карты нарушенного индикатора — это его решение, не сбой
+    прогона: на листе «Ошибки прогона» про гипотезы ничего нет."""
+    run_step(rid, DeleteMapRow(kind="удалить строку карты", row_id=1, reason="несостоятельна"))
+    run_step(rid, DeleteMapRow(kind="удалить строку карты", row_id=2, reason="несостоятельна"))
+    assert not any("гипотезы по нему не построены" in str(c) for row in _failed_rows(rid) for c in row)
+
+
+def test_pipeline_gap_stays_on_errors_sheet_after_edits(rid):
+    """Сбой узла гипотез при разборе («нарушен» без строки карты уже в v0) остаётся на листе «Ошибки прогона»
+    и после правок эксперта."""
+    v5 = Verdict(indicator=5, name="индикатор 5", verdict="нарушен", rationale="нарушение без гипотез")
+    save_json(rid, "03_verdicts/05.json", v5)
+    buckets = load_json(rid, "04_buckets.json", Buckets)
+    save_json(rid, "04_buckets.json", buckets.model_copy(update={
+        "violated": buckets.violated + [v5], "checked": [v for v in buckets.checked if v.indicator != 5]}))
+    run_step(rid, EditText(kind="правка текста", sheet="строка карты", key="1", field="гипотеза",
+                            new_text="короче", reason="вода"))
+    assert any("гипотезы по нему не построены" in str(c) for row in _failed_rows(rid) for c in row)
+
+
+def test_mark_not_tracked_open_question_with_code_does_not_block(rid):
+    """15.10 (повторное ревью): открытый вопрос без строки карты невозможен — даже с обязательным кодом он уходит
+    вместе с цифрой, а операция не отклоняется."""
+    item = RequestItem(num="1", kind="открытый вопрос", metric="Какие основания отказа чаще всего? (п. 1)",
+                       clause="п. 1", for_rows=[1], sources=[SourceRef(row_id=1, metric="п1")], mandatory=["ГП-1"])
+    save_json(rid, "07_request.json", _req(rid).model_copy(update={"items": [item]}))
+    run_step(rid, MarkNotTracked(kind="пометить: нигде не ведётся", row_id=1, metric="п1", reason="не ведут"))
+    assert _req(rid).items == []
+
+
+def test_expert_built_then_deleted_rows_not_a_run_error(rid, monkeypatch):
+    """15.10 (повторное ревью): сбой гипотез при разборе эксперт закрыл сам («построить гипотезы»), потом удалил эти
+    строки — это уже его решение, на листе «Ошибки прогона» индикатора нет."""
+    v5 = Verdict(indicator=5, name="индикатор 5", verdict="нарушен", rationale="нарушение без гипотез")
+    save_json(rid, "03_verdicts/05.json", v5)
+    buckets = load_json(rid, "04_buckets.json", Buckets)
+    save_json(rid, "04_buckets.json", buckets.model_copy(update={
+        "violated": buckets.violated + [v5], "checked": [v for v in buckets.checked if v.indicator != 5]}))
+    hset = HypothesisSet(indicator=5, name="индикатор 5", violation_kind="издержки", why_this_many="один механизм",
+                         hypotheses=[Hypothesis(hypothesis="отказ без исправления", grounds="п. 5",
+                                                effects=[_EFFECT], data=[DataItem(metric="число отказов",
+                                                                                  source="запрос органу")],
+                                                clause="5")])
+    monkeypatch.setattr(ops_module, "run_hypotheses_violated", Mock(return_value=[hset]))
+    accept(rid, run_step(rid, BuildHypotheses(kind="построить гипотезы", indicator=5, reason="эксперт")).candidate)
+    new_row = next(r.row_id for r in _map(rid).rows if r.indicators == [5])
+    run_step(rid, DeleteMapRow(kind="удалить строку карты", row_id=new_row, reason="несостоятельна"))
+    assert not any("гипотезы по нему не построены" in str(c) for row in _failed_rows(rid) for c in row)
+
+
 def test_mark_not_tracked_unknown_metric_refused(rid):
     with pytest.raises(OperationError):
         run_step(rid, MarkNotTracked(kind="пометить: нигде не ведётся", row_id=1, metric="нет такой", reason="x"))

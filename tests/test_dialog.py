@@ -157,8 +157,9 @@ def test_second_turn_resumes_with_version_line(rid, monkeypatch):
 
 def test_lost_session_falls_back_to_new_with_history(rid, monkeypatch):
     """Продолжить сессию не удалось — тот же ход идёт новой сессией с историей чата; стоимость — обе попытки."""
-    failed = CallResult(value=None, ok=False, attempts=3, cost_usd=0.05, session_id=None, error="нет сессии",
-                        permission_denials=[], duration_s=1.0)
+    failed = CallResult(value=None, ok=False, attempts=3, cost_usd=0.05, session_id=None,
+                        error="процесс завершился с кодом 1: No conversation found with session ID: dead",
+                        permission_denials=[], duration_s=1.0)   # так CLI отвечает на --resume без сессии (проба 15.10)
     new = CallResult(value=DialogTurn(reply="ок"), ok=True, attempts=1, cost_usd=0.2, session_id="sess-B",
                      error=None, permission_denials=[], duration_s=1.0)
     dialog_module._save_session(rid, {"session_id": "dead", "started": "x", "last_turn": "x", "version_seen": 0})
@@ -171,17 +172,72 @@ def test_lost_session_falls_back_to_new_with_history(rid, monkeypatch):
     assert dialog_module.load_session(rid)["session_id"] == "sess-B"
 
 
+def _write_turn_stream(rid, n: int, tool: str) -> None:
+    """Файл хода помощника (его пишет runner): один вызов инструмента."""
+    import json
+    path = run_dir(rid) / "dialog" / "turns" / f"{n:04d}.stream.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"ts": "t", "attempt": 1, "event": {"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": "e1", "name": tool, "input": {"topic": 1}}]}}}) + "\n", encoding="utf-8")
+
+
 def test_exports_reported_only_when_spent(rid, monkeypatch):
-    """Выгрузки помощник делает сам; потратил — строка сервиса «потрачено N, осталось M», не тратил — строки нет."""
+    """Выгрузки помощник делает сам; потратил — строка сервиса «потрачено N, осталось M», не тратил — строки нет.
+    15.10: «потрачено» — по удачным вызовам выгрузки самого помощника в этом ходе; строка — перед ответом
+    помощника, чтобы его план оставался последней репликой и ждал решения (web.pending_plan)."""
+    op = SetVerdict(kind="смена вердикта", indicator=7, verdict="нарушен", rationale="15 форм", reason="эксперт")
+
+    def _effect(*a, **kw):
+        _write_turn_stream(rid, 1, "mcp__garant__garant_export_block_html")
+        return _ok(DialogTurn(reply="ок", plan=[op]))
+    monkeypatch.setattr(dialog_module, "call", Mock(side_effect=_effect))
+    monkeypatch.setattr(dialog_module.garant_limits, "limits", lambda fresh=False: {"Экспорт": 20})
+    dialog_module.turn(rid, "выгрузи п. 5")
+    chat = dialog_module.read_chat(rid)
+    assert chat[-1]["role"] == "ассистент" and chat[-1]["plan"][0]["kind"] == "смена вердикта"
+    assert chat[-2]["text"] == "Выгрузок Гаранта потрачено: 1, осталось 20 в этом месяце (на всех пользователей)."
+    monkeypatch.setattr(dialog_module, "call", Mock(return_value=_ok(DialogTurn(reply="ок"))))
+    dialog_module.turn(rid, "а теперь вопрос")
+    assert dialog_module.read_chat(rid)[-1]["role"] == "ассистент"
+
+
+def test_exports_of_parallel_run_not_attributed_to_assistant(rid, monkeypatch):
+    """15.10 (код-ревью): остаток выгрузок общий — пока помощник отвечал, выгрузку потратил параллельный прогон;
+    помощник ничего не выгружал — строки «потрачено» нет."""
     monkeypatch.setattr(dialog_module, "call", Mock(return_value=_ok(DialogTurn(reply="ок"))))
     left = iter([21, 20, 20, 20])
     monkeypatch.setattr(dialog_module.garant_limits, "limits", lambda fresh=False: {"Экспорт": next(left)})
-    dialog_module.turn(rid, "выгрузи п. 5")
-    chat = dialog_module.read_chat(rid)
-    assert chat[-2]["role"] == "ассистент"
-    assert chat[-1]["text"] == "Выгрузок Гаранта потрачено: 1, осталось 20 в этом месяце (на всех пользователей)."
-    dialog_module.turn(rid, "а теперь вопрос")
+    dialog_module.turn(rid, "вопрос")
     assert dialog_module.read_chat(rid)[-1]["role"] == "ассистент"
+
+
+def test_temporary_resume_failure_keeps_session(rid, monkeypatch):
+    """15.10 (код-ревью): сбой продолжения разговора (таймаут, ошибка API) — память помощника не стирается и новая
+    сессия не запускается: ход — «не получилось», следующий ход продолжит ту же сессию."""
+    failed = CallResult(value=None, ok=False, attempts=3, cost_usd=0.05, session_id=None,
+                        error="процесс завершился с кодом 1: таймаут", permission_denials=[], duration_s=1.0)
+    dialog_module._save_session(rid, {"session_id": "alive", "started": "x", "last_turn": "x", "version_seen": 0})
+    mock = Mock(return_value=failed)
+    monkeypatch.setattr(dialog_module, "call", mock)
+    res = dialog_module.turn(rid, "вопрос")
+    assert mock.call_count == 1 and "не получилось" in res.reply.lower()
+    assert dialog_module.load_session(rid)["session_id"] == "alive"
+
+
+def test_turn_without_garant_token_works_without_garant(rid, monkeypatch, tmp_path):
+    """15.10 (код-ревью): нет файла токена Гаранта — помощник отвечает без Гаранта (только файлы прогона и интернет),
+    ход не падает. Повторное ревью: предупреждение — служебной строкой во входе модели (помощник скажет сам), а не
+    репликой чата: та сбивала номер хода для живых шагов и засоряла историю разговора."""
+    import app.runner as runner_mod
+    monkeypatch.setattr(runner_mod, "GARANT_TOKEN_FILE", tmp_path / "нет_файла")
+    mock = Mock(return_value=_ok(DialogTurn(reply="ок")))
+    monkeypatch.setattr(dialog_module, "call", mock)
+    dialog_module.turn(rid, "вопрос")
+    kw = mock.call_args.kwargs
+    assert kw["mcp_tools"] == dialog_module.RUN_TOOLS
+    assert "garant" not in __import__("json").loads(open(kw["mcp_config"], encoding="utf-8").read())["mcpServers"]
+    assert "Гарант сейчас недоступен" in mock.call_args.args[1]
+    assert [e["role"] for e in dialog_module.read_chat(rid)] == ["пользователь", "ассистент"]
 
 
 def test_turn_steps_from_stream(rid):
@@ -203,3 +259,49 @@ def test_turn_steps_from_stream(rid):
     assert dialog_module.turn_steps(rid, 3) == ["читаю 03_verdicts/03.json", "ищу в Гаранте: Number(166-ПП)",
                                                  "открываю https://mos.ru/x"]
     assert dialog_module.turn_steps(rid, 5) == []
+
+
+def test_resume_failing_two_turns_in_a_row_starts_new_session(rid, monkeypatch):
+    """15.10 (повторное ревью): сессия, которую не удаётся продолжить второй ход подряд (длинная история, сбой
+    истории), — сломана: второй ход идёт новой сессией с историей чата, а не «не получилось» навсегда."""
+    failed = CallResult(value=None, ok=False, attempts=3, cost_usd=0.05, session_id=None,
+                        error="ошибка API: Prompt is too long", permission_denials=[], duration_s=1.0)
+    new = CallResult(value=DialogTurn(reply="ок"), ok=True, attempts=1, cost_usd=0.2, session_id="sess-B",
+                     error=None, permission_denials=[], duration_s=1.0)
+    dialog_module._save_session(rid, {"session_id": "stuck", "started": "x", "last_turn": "x", "version_seen": 0})
+    mock = Mock(side_effect=[failed, failed, new])
+    monkeypatch.setattr(dialog_module, "call", mock)
+    assert "не получилось" in dialog_module.turn(rid, "первый").reply.lower()
+    assert dialog_module.load_session(rid)["session_id"] == "stuck"
+    assert dialog_module.turn(rid, "второй").reply == "ок"
+    assert mock.call_count == 3 and dialog_module.load_session(rid)["session_id"] == "sess-B"
+
+
+def test_failed_resume_updates_cost_base(rid, monkeypatch):
+    """15.10 (повторное ревью): CLI сообщает стоимость сессии нарастающим итогом; после неудачного продолжения база
+    обновляется — иначе следующий ход ещё раз посчитает деньги упавшего хода."""
+    failed = CallResult(value=None, ok=False, attempts=3, cost_usd=0.9, session_id="alive", error="ответ не по схеме",
+                        permission_denials=[], duration_s=1.0, session_cost_usd=1.9)
+    dialog_module._save_session(rid, {"session_id": "alive", "started": "x", "last_turn": "x", "version_seen": 0,
+                                      "cost_reported": 1.0})
+    monkeypatch.setattr(dialog_module, "call", Mock(return_value=failed))
+    dialog_module.turn(rid, "вопрос")
+    assert dialog_module.load_session(rid)["cost_reported"] == 1.9
+
+
+def test_failed_export_call_not_counted(rid, monkeypatch):
+    """15.10 (повторное ревью): вызов выгрузки, на который Гарант ответил ошибкой (лимит, нет документа), выгрузку
+    не тратит — строки «потрачено» нет."""
+    import json
+
+    def _effect(*a, **kw):
+        _write_turn_stream(rid, 1, "mcp__garant__garant_export_block_html")
+        with open(run_dir(rid) / "dialog" / "turns" / "0001.stream.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": "t", "attempt": 1, "event": {"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "e1", "is_error": True,
+                 "content": [{"type": "text", "text": "лимит исчерпан"}]}]}}}) + "\n")
+        return _ok(DialogTurn(reply="ок"))
+    monkeypatch.setattr(dialog_module, "call", Mock(side_effect=_effect))
+    monkeypatch.setattr(dialog_module.garant_limits, "limits", lambda fresh=False: {"Экспорт": 0})
+    dialog_module.turn(rid, "выгрузи п. 5")
+    assert [e["role"] for e in dialog_module.read_chat(rid)] == ["пользователь", "ассистент"]

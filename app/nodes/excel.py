@@ -500,17 +500,28 @@ def _unverified_verdicts(hyp_map: HypothesisMap, buckets: Buckets) -> list[Verdi
     return [v for v in buckets.no_data if v.indicator not in covered]
 
 
-def _violated_without_hypotheses(hyp_map: HypothesisMap, buckets: Buckets) -> list[Verdict]:
+def violated_without_rows(hyp_map: HypothesisMap, buckets: Buckets) -> set[int]:
+    """Индикаторы «нарушен», не представленные ни одной строкой карты."""
+    covered = {n for row in hyp_map.rows for n in row.indicators}
+    return {v.indicator for v in buckets.violated if v.indicator not in covered}
+
+
+def _violated_without_hypotheses(hyp_map: HypothesisMap, buckets: Buckets,
+                                 run_gaps: set[int] | None = None) -> list[Verdict]:
     """
     14.10 (ошибка 1 аудита): вердикты «нарушен», не представленные ни одной строкой карты, — гипотезы по ним
     не построены (сбой узла гипотез). Раньше такой индикатор молча пропадал из карты и бланка; теперь он —
     строка листа «Ошибки прогона».
+    run_gaps (15.10, код-ревью) — такие индикаторы на момент разбора (версия v0): в версиях диалога на листе
+    только они — строку, удалённую экспертом, и смену вердикта экспертом сбоем прогона не называем.
     """
-    covered = {n for row in hyp_map.rows for n in row.indicators}
+    gaps = violated_without_rows(hyp_map, buckets)
+    if run_gaps is not None:
+        gaps &= run_gaps
     return [
         Verdict(indicator=v.indicator, name=v.name, verdict="ошибка", attempts=v.attempts,
                 rationale="Найдено нарушение, но гипотезы по нему не построены — проверьте индикатор вручную.")
-        for v in buckets.violated if v.indicator not in covered
+        for v in buckets.violated if v.indicator in gaps
     ]
 
 
@@ -944,6 +955,7 @@ def build_excel(
     unverified_ids: dict[int, int] | None = None,
     analyzed_at: datetime.datetime | None = None,
     act_types: list[str] | None = None,
+    run_gaps: set[int] | None = None,
 ) -> Path:
     """
     Узел [7] — собрать единый .xlsx из готовых карты, запроса и куч вердиктов.
@@ -960,7 +972,8 @@ def build_excel(
     version, journal, marks, unverified_ids, analyzed_at — для версий диалогового
     режима (план итерации 3, шаг 1.5); без них книга прежняя. act_types (2.7, АМ) —
     тип акта, выбранный при загрузке: строка на листе «Как заполнять» и подзаголовок
-    обязательных показателей на листе запроса.
+    обязательных показателей на листе запроса. run_gaps (15.10) — «нарушен» без строки карты на момент
+    разбора; в версиях диалога лист «Ошибки прогона» показывает только их.
     """
     logger = get_run_logger(run_id).getChild("08_excel")
 
@@ -1014,7 +1027,7 @@ def build_excel(
         unverified, marks,
     )
     _render_failed_sheet(
-        wb, buckets.failed + _violated_without_hypotheses(hypothesis_map, buckets),
+        wb, buckets.failed + _violated_without_hypotheses(hypothesis_map, buckets, run_gaps),
         f"Индикаторы, проверка которых не завершилась. "
         f"Пусто — значит все {total} отработали.",
     )

@@ -560,6 +560,8 @@ def op_title(op: Operation) -> str:
     if kind == "слить строки карты":
         rows = ", ".join(map(str, op.row_ids))
         return f"Слить строки карты {rows} в одну: «{shorten(op.hypothesis, 300)}»"
+    if kind == "пометить: нигде не ведётся":
+        return f"Пометить: нигде не ведётся — строка карты {op.row_id}, цифра «{shorten(op.metric, 200)}»"
     if kind == "удалить позицию запроса":
         return f"Удалить позицию запроса {op.num}"
     if kind == "разделить позицию запроса":

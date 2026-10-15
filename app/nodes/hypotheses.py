@@ -125,19 +125,22 @@ def _verdict_card(verdict: Verdict, to_request: list[dict] | None = None) -> str
     return card
 
 
-def _to_request(run_id: str, n: int, trace_prefix: str) -> list[dict]:
+def _to_request(run_id: str, verdict: Verdict) -> list[dict]:
     """
     Числа для органа, которые агент индикатора записал при «нет данных» (14.10, индикатор 10) — из таблицы
     рядом с вердиктом (03_verdicts/NN.checks.json). Нет файла или поля — пусто.
+    15.10 (код-ревью): только из принятой версии — корня прогона (таблица отклонённой перепроверки лежит в папке
+    шага dialog/vN/ и сюда не попадает) и только для «нет данных»: при другом вердикте таблица — от прежнего.
     """
-    for prefix in dict.fromkeys((trace_prefix, "")):
-        path = run_dir(run_id) / f"{prefix}03_verdicts/{n:02d}.checks.json"
-        if path.is_file():
-            try:
-                return list(json.loads(path.read_text(encoding="utf-8")).get("to_request") or [])
-            except (OSError, ValueError, AttributeError):
-                return []
-    return []
+    if verdict.verdict != "нет данных":
+        return []
+    path = run_dir(run_id) / f"03_verdicts/{verdict.indicator:02d}.checks.json"
+    if not path.is_file():
+        return []
+    try:
+        return list(json.loads(path.read_text(encoding="utf-8")).get("to_request") or [])
+    except (OSError, ValueError, AttributeError):
+        return []
 
 
 def _questions_to_data(value: HypothesisSetOutput) -> HypothesisSet:
@@ -231,7 +234,7 @@ def _run_one_hypothesis(
     """
     n = verdict.indicator
     try:
-        to_request = _to_request(run_id, n, trace_prefix)
+        to_request = _to_request(run_id, verdict)
         result = call(
             instruction,
             _verdict_card(verdict, to_request),

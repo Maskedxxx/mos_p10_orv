@@ -261,6 +261,10 @@ def _mcp_isolation_flags(mcp_config: str | None) -> list[str]:
 # Срок кэша 5 минут для вызовов пайплайна: чтения внутри прогона идут через секунды и минуты
 _SHORT_CACHE_ENV = {"FORCE_PROMPT_CACHING_5M": "1"}
 
+# Запасной ответ (принятый CLI после переписывания) вместо битого JSON первого ответа берётся, только если он
+# не короче этой доли первого: иначе он урезан. Замер 15.10 на 40 случаях: 0,70–1,0; паспорт 13.10 — 0,49.
+MIN_FALLBACK_SHARE = 0.6
+
 # Имя инструмента, через который CLI принимает ответ по --json-schema
 _STRUCTURED_TOOL = "StructuredOutput"
 
@@ -270,7 +274,8 @@ def _first_structured_answer(events: list[Any]) -> str | None:
     Полный текст ПЕРВОГО ответа модели в StructuredOutput — из частичных сообщений
     (--include-partial-messages). Битый JSON CLI отвергает, модель переписывает ответ
     и урезает содержимое (паспорт приютов: 16,6 тыс. символов → 8,1 тыс.), поэтому берётся
-    первый ответ, а битый — чинится по схеме (app/json_fix.py). None — частичных сообщений нет.
+    первый ответ, а битый — чинится по схеме (app/json_fix.py). Не починился или не прошёл контракт — call()
+    берёт ответ, принятый CLI, если он не урезан (15.10, MIN_FALLBACK_SHARE). None — частичных сообщений нет.
     """
     current: int | None = None
     parts: list[str] = []
@@ -299,18 +304,39 @@ def _shared_context_file(run_id: str, shared_context: str) -> str:
     return str(save_bytes(run_id, relname, data))
 
 
-def _mcp_env() -> dict[str, str]:
-    """
-    Окружение процесса агента с Гарантом: токен из файла машины и прокси из настроек CLI.
-    Токен никуда не пишется — ни в команду, ни в лог, ни в трейс.
-    """
+def _garant_token() -> str:
+    """Токен Гаранта из файла машины; нет файла, пуст или испорчен — RuntimeError с понятной причиной."""
     try:
         token = GARANT_TOKEN_FILE.read_text(encoding="utf-8").strip()
     except (OSError, UnicodeDecodeError) as exc:
         raise RuntimeError(f"нет файла с токеном Гаранта или он не читается ({GARANT_TOKEN_FILE})") from exc
     if not token or any(ch.isspace() for ch in token):
         raise RuntimeError(f"файл с токеном Гаранта пуст или испорчен ({GARANT_TOKEN_FILE})")
-    env = {"GARANT_TOKEN": token, **_NO_AUTO_MEMORY_ENV}
+    return token
+
+
+def garant_available() -> bool:
+    """
+    Можно ли дать агенту Гарант: файл токена есть и он исправен (15.10, код-ревью). Где Гарант — подсказка
+    (паспорт, помощник), без токена агент работает без него; индикаторам Гарант нужен — там call() падает с
+    понятной причиной, как раньше.
+    """
+    try:
+        _garant_token()
+    except RuntimeError:
+        return False
+    return True
+
+
+def _mcp_env(with_garant: bool = True) -> dict[str, str]:
+    """
+    Окружение процесса агента с инструментами MCP: прокси из настроек CLI и, если у агента есть инструменты
+    Гаранта, токен из файла машины (15.10: свои инструменты — чтение артефактов прогона — токена не требуют).
+    Токен никуда не пишется — ни в команду, ни в лог, ни в трейс.
+    """
+    env = {**_NO_AUTO_MEMORY_ENV}
+    if with_garant:
+        env["GARANT_TOKEN"] = _garant_token()
     # Прокси: файл настроек может отсутствовать (на машине без прокси это нормально) —
     # тогда переменных нет; испорченный файл не роняет вызов, но и прокси не даёт
     try:
@@ -340,6 +366,22 @@ def _parse_answer(answer: str | None, schema: dict[str, Any]) -> Any:
         return json.loads(answer)
     except json.JSONDecodeError:
         return json.loads(repair_json(answer, schema))
+
+
+def _accept_answer(answer: str | None, schema: dict[str, Any], model_cls: type[ModelT],
+                   validation_context: dict[str, Any] | None) -> tuple[ModelT | None, str, str]:
+    """
+    Один ответ модели → (значение контракта, вид сбоя, текст ошибки). Значение None — ответ не подошёл:
+    «result_json_error» — не разбирается и не чинится, «validation_error» — не проходит контракт.
+    """
+    try:
+        parsed = _parse_answer(answer, schema)
+    except (json.JSONDecodeError, TypeError) as exc:
+        return None, "result_json_error", f"поле result не разбирается как JSON: {exc}"
+    try:
+        return model_cls.model_validate(parsed, context=validation_context), "ok", ""
+    except ValidationError as exc:
+        return None, "validation_error", str(exc)
 
 
 def _retry_message(error_text: str) -> str:
@@ -666,7 +708,8 @@ def call(
     system_file = _shared_context_file(run_id, shared_context) if shared_context is not None else None
     env = {**os.environ, **_SHORT_CACHE_ENV} if short_cache_ttl else None
     if mcp_tools:
-        env = {**(env if env is not None else os.environ), **_mcp_env()}
+        with_garant = any(_mcp_tool_name(tool).startswith(_GARANT_TOOL_PREFIX) for tool in mcp_tools)
+        env = {**(env if env is not None else os.environ), **_mcp_env(with_garant)}
     _log_agent_started(run_id, trace_name, model, allowed_tools, mcp_tools, timeout_s)
 
     # Состояние следующей попытки: что слать и слать ли документ в stdin.
@@ -709,40 +752,50 @@ def call(
                 break
             continue
 
-        # Первый ответ модели; битый — чинится по схеме. Без частичных сообщений — принятый CLI
-        answer = outcome.first_answer if outcome.first_answer is not None else outcome.result_text
-        try:
-            parsed = _parse_answer(answer, schema)
-        except (json.JSONDecodeError, TypeError) as exc:
-            last_error = f"поле result не разбирается как JSON: {exc}"
+        # Первый ответ модели; битый — чинится по схеме. Не подошёл (не чинится или не проходит контракт) —
+        # ответ, принятый CLI после переписывания (15.10: иначе лишний повтор через --resume). Без частичных
+        # сообщений — сразу принятый CLI
+        answers = [a for a in (outcome.first_answer, outcome.result_text) if a is not None] or [None]
+        if len(answers) == 2 and answers[0] == answers[1]:
+            answers = answers[:1]
+        value, failures = None, []
+        for answer in answers:
+            value, kind, error = _accept_answer(answer, schema, model_cls, validation_context)
+            if (value is not None and failures and not _is_json(answers[0])
+                    and len(answer) < MIN_FALLBACK_SHARE * len(answers[0])):
+                # Первый ответ — битый JSON (CLI его отверг, модель переписала), а переписанный сильно короче —
+                # урезан (паспорт 13.10: 16,6 → 8,1 тыс.): не берём. Первый — целый JSON, отвергнутый за схему
+                # (длинные выжимки), — сокращение законно, берём
+                value, kind, error = None, "answer_truncated", (
+                    f"исправленный ответ урезан: {len(answer)} знаков против {len(answers[0])} в первом ответе — "
+                    "верни ответ полностью, ничего не сокращая")
+            if value is not None:
+                if isinstance(answer, str) and not _is_json(answer):
+                    logger.warning("call: artifact=%s attempt=%d — JSON ответа починен по схеме", trace_name, attempt)
+                    log_event(run_id, "json_repaired", who=_agent_label(trace_name), trace=trace_name,
+                              attempt=attempt)
+                if failures:
+                    logger.warning("call: artifact=%s attempt=%d — первый ответ не подошёл (%s), принят ответ CLI",
+                                   trace_name, attempt, failures[0][0])
+                    log_event(run_id, "first_answer_rejected", who=_agent_label(trace_name), trace=trace_name,
+                              attempt=attempt, reason=failures[0][0], error=failures[0][1][:500])
+                break
+            failures.append((kind, error))
+
+        if value is None:
+            # Модели при повторе — ошибка последнего проверенного ответа: сессия CLI кончилась на нём; если тот
+            # отбракован как урезанный — и ошибка первого ответа, иначе модель повторит её
+            kind, last_error = failures[-1]
+            if kind == "answer_truncated":
+                last_error = f"{failures[0][1]}\n\n{last_error}"
             _log_attempt(logger, trace_name, attempt, max_attempts, outcome.duration_s,
-                         attempt_cost, outcome.num_turns, "result_json_error", run_id=run_id, error=last_error)
+                         attempt_cost, outcome.num_turns, kind, run_id=run_id, error=last_error)
             if outcome.session_id is not None:
                 resume_session_id, message, send_document = (
                     outcome.session_id, _retry_message(last_error), False
                 )
             else:
                 # Защита: без session_id resume невозможен — начинаем заново
-                resume_session_id, message, send_document = base_resume, instruction, base_resume is None
-            if _budget_exhausted(cost_total, max_budget_usd):
-                break
-            continue
-
-        if isinstance(answer, str) and not _is_json(answer):
-            logger.warning("call: artifact=%s attempt=%d — JSON ответа починен по схеме", trace_name, attempt)
-            log_event(run_id, "json_repaired", who=_agent_label(trace_name), trace=trace_name, attempt=attempt)
-
-        try:
-            value = model_cls.model_validate(parsed, context=validation_context)
-        except ValidationError as exc:
-            last_error = str(exc)
-            _log_attempt(logger, trace_name, attempt, max_attempts, outcome.duration_s,
-                         attempt_cost, outcome.num_turns, "validation_error", run_id=run_id, error=last_error)
-            if outcome.session_id is not None:
-                resume_session_id, message, send_document = (
-                    outcome.session_id, _retry_message(last_error), False
-                )
-            else:
                 resume_session_id, message, send_document = base_resume, instruction, base_resume is None
             if _budget_exhausted(cost_total, max_budget_usd):
                 break

@@ -463,6 +463,36 @@ def test_no_to_request_card_unchanged(run_id, tmp_prompts, monkeypatch):
     assert [d.metric for d in sets[0].hypotheses[0].data] == ["число заявок"]
 
 
+def _write_to_request(run_id, relpath: str) -> None:
+    import json
+    path = run_dir(run_id) / relpath
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"findings": [], "to_request": [{"metric": "число отозванных заявок", "unit": "ед.",
+                                                                "clause": "п. 3"}]}, ensure_ascii=False),
+                    encoding="utf-8")
+
+
+def test_to_request_only_from_accepted_version(run_id, tmp_prompts, monkeypatch):
+    """15.10 (код-ревью): таблица отклонённой перепроверки (папка шага dialog/vN/) в гипотезы не попадает — числа
+    для органа только из принятой версии (корень прогона)."""
+    _write_to_request(run_id, "dialog/v1/03_verdicts/10.checks.json")
+    mock = Mock(side_effect=_default_side_effect)
+    monkeypatch.setattr(hyp_module, "call", mock)
+    run_hypotheses_no_data(_buckets_no_data([10]), "текст акта", run_id, trace_prefix="dialog/v1/", save=False)
+    assert "ЧИСЛА ДЛЯ ОРГАНА" not in mock.call_args.args[1]
+
+
+def test_to_request_not_used_for_violated_verdict(run_id, tmp_prompts, monkeypatch):
+    """15.10 (код-ревью): числа для органа агент индикатора пишет при «нет данных»; эксперт сменил вердикт на
+    «нарушен» — таблица прежнего вердикта гипотезам по нарушению не передаётся и в данные не дописывается."""
+    _write_to_request(run_id, "03_verdicts/10.checks.json")
+    mock = Mock(side_effect=_default_side_effect)
+    monkeypatch.setattr(hyp_module, "call", mock)
+    sets = run_hypotheses_violated(_buckets_violated([10]), "текст акта", run_id)
+    assert "ЧИСЛА ДЛЯ ОРГАНА" not in mock.call_args.args[1]
+    assert "число отозванных заявок" not in [d.metric for d in sets[0].hypotheses[0].data]
+
+
 def test_ensure_requests_recognizes_reworded_metric():
     """Проба 152-ПП 14.10: агент вставил пункт в середину названия — это то же число, дубль не дописывается."""
     from app.nodes.hypotheses import _ensure_requests

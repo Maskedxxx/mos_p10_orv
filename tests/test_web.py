@@ -824,6 +824,35 @@ def test_op_title_is_human_readable():
     assert "агентом запроса" in web.op_title(AppendRequest(kind="дополнить запрос", row_ids=[8, 9], reason="x"))
 
 
+def test_op_title_for_every_operation_kind():
+    """15.10 (код-ревью): у каждого вида операции диалога есть подпись — иначе карточка плана падает и шаг из
+    интерфейса не применить (так было с «пометить: нигде не ведётся»). Новый вид без образца здесь — тест красный."""
+    import typing
+    from app.contracts import (AddMapRow, DataItemOutput, DeleteRequestItem, Effect, MarkNotTracked, MergeMapRows,
+                               Operation, SplitPart, SplitRequestItem)
+    effect = Effect(affected="бизнес", metric="издержки, руб.", how_to_calculate="сумма", expected_trend="рост")
+    samples = [
+        EditText(kind="правка текста", sheet="строка карты", key="3", field="гипотеза", new_text="коротко", reason="x"),
+        SetVerdict(kind="смена вердикта", indicator=7, verdict="нарушен", rationale="15 форм", reason="x"),
+        DeleteMapRow(kind="удалить строку карты", row_id=4, reason="x"),
+        AddMapRow(kind="добавить строку карты", indicators=[10], hypothesis="h", grounds="эксперт", effects=[effect],
+                  data=[DataItemOutput(metric="число вольеров", source="запрос органу")], reason="x"),
+        MergeMapRows(kind="слить строки карты", row_ids=[1, 2], hypothesis="одна проблема", reason="x"),
+        MarkNotTracked(kind="пометить: нигде не ведётся", row_id=2, metric="число жалоб", reason="x"),
+        DeleteRequestItem(kind="удалить позицию запроса", num="5", reason="x"),
+        SplitRequestItem(kind="разделить позицию запроса", num="5", reason="x", parts=[
+            SplitPart(metric="сумма (п. 1)", unit="тыс. руб."), SplitPart(metric="количество (п. 1)", unit="ед.")]),
+        RecheckIndicator(kind="перепроверить индикатор", indicator=3, clarification="проверь приказы", reason="x"),
+        BuildHypotheses(kind="построить гипотезы", indicator=7, reason="x"),
+        AppendRequest(kind="дополнить запрос", row_ids=[8, 9], reason="x"),
+    ]
+    kinds = {typing.get_args(m.model_fields["kind"].annotation)[0] for m in typing.get_args(Operation)}
+    assert {op.kind for op in samples} == kinds
+    assert all(web.op_title(op) for op in samples)
+    title = web.op_title(samples[5])
+    assert "строка карты 2" in title and "число жалоб" in title and "нигде не ведётся" in title
+
+
 def test_estimate_cost_from_raw_traces_of_the_run(tmp_runs_dir):
     rid = "run_cost"
     trace.save_bytes(rid, "03_verdicts/03.raw.json", json.dumps([{"type": "x"}, {"total_cost_usd": 2.2}]).encode())

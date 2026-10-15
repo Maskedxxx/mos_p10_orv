@@ -97,6 +97,37 @@ def test_report_on_run_without_journal(tmp_runs_dir):
     assert "журнала нет" in text and "03_verdicts/03" in text
 
 
+def test_report_agent_cost_from_journal_not_cumulative(tmp_runs_dir):
+    """15.10 (код-ревью): при --resume CLI сообщает стоимость всей сессии нарастающим итогом — стоимость агента
+    в отчёте берётся из журнала попыток (там она уже за попытку), а не суммой сырых ответов."""
+    rid = new_run("акт.docx")
+    for name, total in (("0001.raw.json", 0.5), ("0001.raw.attempt2.json", 0.8)):
+        path = run_dir(rid) / "dialog" / "turns" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps([{"type": "result", "total_cost_usd": total, "num_turns": 2,
+                                     "duration_ms": 1000}]), encoding="utf-8")
+    log_event(rid, "agent_attempt", trace="dialog/turns/0001.raw.json", attempt=1, max_attempts=3,
+              outcome="validation_error", duration_s=1.0, cost_usd=0.5)
+    log_event(rid, "agent_attempt", trace="dialog/turns/0001.raw.json", attempt=2, max_attempts=3,
+              outcome="ok", duration_s=1.0, cost_usd=0.3)
+    line = next(ln for ln in session_report.report(rid).splitlines() if ln.startswith("dialog/turns/0001"))
+    assert "$0.80" in line
+
+
+def test_report_cost_line_splits_run_and_dialog(tmp_runs_dir):
+    """15.10 (повторное ревью): после правок progress хранит итог вместе с диалогом — строка стоимости отчёта делит
+    разбор и диалог так же, как итог сессии (одна функция sessions.run_costs)."""
+    from app.contracts import RunMeta
+    from app.dialog import append_chat
+    rid = new_run("акт.docx")
+    save_json(rid, "progress.json", {"run_id": rid, "status": "готов", "total_cost_usd": 13.0, "nodes": []})
+    save_json(rid, "meta.json", RunMeta(run_id=rid, act_filename="акт.docx", started_at="2026-10-13T10:00:00",
+                                        finished_at="2026-10-13T10:08:00", status="finished", cost_usd=13.0))
+    log_event(rid, "run_finished", status="готов", cost_usd=10.0)
+    append_chat(rid, "ассистент", "ответ", cost_usd=3.0)
+    assert "стоимость: разбор $10.00 · диалог $3.00 · всего $13.00" in session_report.report(rid)
+
+
 def test_watch_merges_journal_and_agent_stream(tmp_runs_dir, capsys):
     rid = _run(tmp_runs_dir)
     assert watch.main([rid]) == 0

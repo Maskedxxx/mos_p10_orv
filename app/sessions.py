@@ -78,6 +78,25 @@ def idle_sessions(now: datetime, idle_s: int = config.SESSION_IDLE_S) -> list[st
     return found
 
 
+def split_costs(events: list[dict], meta_cost: float | None, progress_cost: float | None,
+                chat: list[dict]) -> dict[str, float]:
+    """
+    Стоимость сессии {"разбор", "диалог", "всего"} по журналу, meta.json, progress.json и чату — одна разбивка для
+    итога сессии и отчёта scripts/session_report.py.
+    15.10 (код-ревью): после применённой правки progress и meta уже содержат стоимость диалога — второй раз её не
+    прибавляем. Разбор — стоимость на конец разбора (событие run_finished), всего — meta.json; без события (прогон
+    до 2.7) — как раньше: progress + чат.
+    """
+    finished = next((e for e in reversed(events) if e.get("event") == "run_finished" and "cost_usd" in e), None)
+    if finished is not None:
+        run_cost = round(float(finished["cost_usd"] or 0), 4)
+        total = round(meta_cost, 4) if meta_cost is not None else run_cost
+        return {"разбор": run_cost, "диалог": round(max(total - run_cost, 0.0), 4), "всего": total}
+    run_cost = round(progress_cost or 0.0, 4)
+    dialog_cost = round(sum(float(e.get("cost_usd") or 0) for e in chat), 4)
+    return {"разбор": run_cost, "диалог": dialog_cost, "всего": round(run_cost + dialog_cost, 4)}
+
+
 def _summary(run_id: str, by: str, now: datetime) -> dict:
     """Итог сессии — из meta.json, progress.json, чата, версий и журнала."""
     events = read_events(run_id)
@@ -89,8 +108,8 @@ def _summary(run_id: str, by: str, now: datetime) -> dict:
     chat = dialog.read_chat(run_id)
     state = versions.load_state(run_id)
     started = meta.started_at if meta is not None else (events[0]["ts"] if events else None)
-    run_cost = round(progress.total_cost_usd, 4) if progress is not None else 0.0
-    dialog_cost = round(sum(float(e.get("cost_usd") or 0) for e in chat), 4)
+    costs = split_costs(events, meta.cost_usd if meta is not None else None,
+                        progress.total_cost_usd if progress is not None else None, chat)
     roles: dict[str, int] = {}
     for e in chat:
         if e.get("role") in ("пользователь", "ассистент"):
@@ -106,7 +125,7 @@ def _summary(run_id: str, by: str, now: datetime) -> dict:
         "last_activity": events[-1]["ts"] if events else None,
         "run_status": progress.status if progress is not None else None,
         "verdicts": progress.summary.model_dump(mode="json") if progress is not None and progress.summary else None,
-        "cost_usd": {"разбор": run_cost, "диалог": dialog_cost, "всего": round(run_cost + dialog_cost, 4)},
+        "cost_usd": costs,
         "version": state.current if state is not None else 0,
         "chat": roles,
         "user_actions": [{"ts": e["ts"], "action": e.get("action")} for e in events if e["event"] == "user_action"],

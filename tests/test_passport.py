@@ -49,10 +49,11 @@ def test_make_passport_saves_artifact_and_returns_model(run_id, monkeypatch, val
     assert result == passport
     saved = load_json(run_id, "02_passport.json", ActPassport)
     assert saved.requisites.authority == "Департамент"
-    # stdin — только текст акта под меткой; схема — ActPassport; без инструментов; свой таймаут
+    # stdin — только текст акта под меткой; схема — ответ модели ActPassportOutput (15.10); без инструментов; свой таймаут
     args, kwargs = mock_call.call_args
     assert args[1] == "## ПОЛНЫЙ ТЕКСТ АКТА\n\nТЕКСТ АКТА"
-    assert args[2] is ActPassport
+    from app.contracts import ActPassportOutput
+    assert args[2] is ActPassportOutput
     assert kwargs["allowed_tools"] == []
     assert kwargs["timeout_s"] == PASSPORT_TIMEOUT_S
     assert kwargs["trace_name"] == "02_passport.raw.json"
@@ -104,8 +105,12 @@ def test_passport_effective_year_none_without_passport():
 # ---- 2.7 (итерация 4, А): орган-разработчик ----
 
 
-def test_passport_agent_gets_garant_search(run_id, monkeypatch, valid_passport):
+def test_passport_agent_gets_garant_search(run_id, monkeypatch, valid_passport, tmp_path):
     """Разработчика агент паспорта ищет и в Гаранте: кто издаёт приказы во исполнение акта."""
+    import app.runner as runner_mod
+    token = tmp_path / "token"
+    token.write_text("T-1\n", encoding="utf-8")
+    monkeypatch.setattr(runner_mod, "GARANT_TOKEN_FILE", token)
     mock_call = Mock(return_value=_ok(ActPassport(**valid_passport)))
     monkeypatch.setattr(passport_module, "call", mock_call)
     passport_module.make_passport("текст", run_id)
@@ -145,10 +150,40 @@ def test_placeholder_justification_rejected(valid_passport):
 
 @pytest.mark.parametrize("block", ["procedure", "control"])
 def test_outside_only_scope_contradicts_organ_duties(valid_passport, block):
-    """Есть процедура или контроль органа — у органа обязанности по акту: «внешним лицам» — противоречие."""
+    """Есть процедура или контроль органа — у органа обязанности по акту: «внешним лицам» — противоречие.
+    15.10 (код-ревью): правило — в контракте ответа модели; сохранённый паспорт с таким выбором читается."""
+    from app.contracts import ActPassportOutput
     bad = dict(valid_passport)
     bad[block] = dict(valid_passport[block], state="есть", clauses=["п. 3"])
     with pytest.raises(ValidationError, match="внешним лицам"):
-        ActPassport(**bad)
+        ActPassportOutput(**bad)
+    assert ActPassport(**bad).addressee.scope == "внешним лицам"
     bad["addressee"] = dict(valid_passport["addressee"], scope="и тем и другим")
-    assert ActPassport(**bad).addressee.scope == "и тем и другим"
+    assert ActPassportOutput(**bad).addressee.scope == "и тем и другим"
+
+
+def test_passport_before_iter4_reads_but_model_answer_rejected():
+    """15.10 (код-ревью): настоящий паспорт прода до итерации 4 (1112-ПП: «внешним лицам» при процедуре и контроле
+    «есть») читается из файла — диалог по старому прогону работает; от модели такой ответ не принимается."""
+    import json
+    from pathlib import Path
+    from app.contracts import ActPassportOutput
+    old = json.loads((Path(__file__).parent / "fixtures" / "passport_before_iter4.json").read_text(encoding="utf-8"))
+    assert ActPassport.model_validate(old).addressee.scope == "внешним лицам"
+    with pytest.raises(ValidationError, match="внешним лицам"):
+        ActPassportOutput.model_validate(old)
+
+
+def test_passport_without_garant_token_runs_without_garant(run_id, monkeypatch, valid_passport, tmp_path):
+    """15.10 (код-ревью): нет файла токена Гаранта — паспорт делается без Гаранта (поиск разработчика — подсказка),
+    прогон не падает; в журнале — событие garant_unavailable."""
+    import app.runner as runner_mod
+    from app.trace import read_events
+    monkeypatch.setattr(runner_mod, "GARANT_TOKEN_FILE", tmp_path / "нет_файла")
+    mock_call = Mock(return_value=_ok(ActPassport(**valid_passport)))
+    monkeypatch.setattr(passport_module, "call", mock_call)
+    assert passport_module.make_passport("текст", run_id) is not None
+    assert not mock_call.call_args.kwargs.get("mcp_tools")
+    assert [e for e in read_events(run_id) if e["event"] == "garant_unavailable"]
+    # повторное ревью: описание поля developers велит искать в Гаранте — модели сказано, что его в этот раз нет
+    assert "Гаранта в этом прогоне нет" in mock_call.call_args.args[0]

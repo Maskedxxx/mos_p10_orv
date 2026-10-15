@@ -111,3 +111,17 @@ def test_last_activity_is_last_event(tmp_runs_dir):
     _age_journal(rid, 30)
     assert sessions.last_activity(rid) == _NOW - timedelta(minutes=30)
     assert sessions.last_activity("нет_такого") is None
+
+
+def test_dialog_cost_not_counted_twice(tmp_runs_dir):
+    """15.10 (код-ревью): после применённой правки progress и meta уже содержат стоимость ходов помощника — итог
+    сессии не прибавляет её второй раз: «разбор» — по событию конца разбора, «всего» — по meta.json."""
+    from app.contracts import RunMeta
+    rid = _finished_run(cost=13.0)                      # progress после правки = meta: разбор 10 + диалог 3
+    save_json(rid, "meta.json", RunMeta(run_id=rid, act_filename="акт.docx", started_at="2026-10-13T10:00:00",
+                                        finished_at="2026-10-13T10:08:00", status="finished", cost_usd=13.0))
+    log_event(rid, "run_finished", status="готов", cost_usd=10.0)
+    dialog.append_chat(rid, "ассистент", "ответ", cost_usd=3.0)
+    sessions.close_session(rid, by="пользователь", now=_NOW)
+    summary = json.loads((run_dir(rid) / sessions.SESSION_SUMMARY_FILE).read_text(encoding="utf-8"))
+    assert summary["cost_usd"] == {"разбор": 10.0, "диалог": 3.0, "всего": 13.0}

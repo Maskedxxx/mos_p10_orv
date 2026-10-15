@@ -25,11 +25,11 @@ import json
 import re
 
 from app.config import ALLOWED_TOOLS_TEXT, PASSPORT_TIMEOUT_S, PROMPT_PASSPORT
-from app.contracts import ActPassport, Developer
+from app.contracts import ActPassport, ActPassportOutput, Developer
 from app.logger import get_run_logger
 from app.nodes.hypotheses import _add_cost_to_meta
-from app.runner import call
-from app.trace import save_json
+from app.runner import call, garant_available
+from app.trace import log_event, save_json
 
 _YEAR_RE = re.compile(r"\b(?:19|20)\d{2}\b")
 
@@ -37,6 +37,10 @@ _YEAR_RE = re.compile(r"\b(?:19|20)\d{2}\b")
 def _build_document(document_md: str) -> str:
     """Документ для stdin: только полный текст акта под заголовком-меткой."""
     return "## ПОЛНЫЙ ТЕКСТ АКТА\n\n" + document_md
+
+
+# Строка задания, когда файла токена Гаранта нет (15.10): без неё модель пытается вызвать garant_search
+GARANT_OFF_NOTE = "Гаранта в этом прогоне нет — разработчика определяй только по тексту акта."
 
 
 def make_passport(
@@ -54,18 +58,25 @@ def make_passport(
     """
     logger = get_run_logger(run_id).getChild("02_passport")
     instruction = PROMPT_PASSPORT.read_text(encoding="utf-8")
+    # Гарант агенту паспорта — подсказка для поиска разработчика: без токена паспорт делается без него (15.10)
+    garant = garant_available()
+    if not garant:
+        logger.warning("passport: файла токена Гаранта нет или он испорчен — паспорт без Гаранта")
+        log_event(run_id, "garant_unavailable", who="агент 02_passport", reason="нет рабочего файла токена Гаранта")
+        # описание поля developers велит искать и в Гаранте — модели сказано, что в этот раз его нет
+        instruction += f"\n\n{GARANT_OFF_NOTE}\n"
 
     result = call(
         instruction,
         _build_document(document_md),
-        ActPassport,
+        ActPassportOutput,   # 15.10: правила для ответа модели; сохранённый паспорт читается как ActPassport
         run_id=run_id,
         trace_name="02_passport.raw.json",
         allowed_tools=ALLOWED_TOOLS_TEXT,
         timeout_s=timeout_s,
         max_budget_usd=max_budget_usd,
         # 2.7 (А): кто издаёт приказы во исполнение акта — подсказка, какой орган ведёт процедуру
-        mcp_tools=["garant_search"],
+        mcp_tools=["garant_search"] if garant else None,
     )
     _add_cost_to_meta(run_id, result.cost_usd)
 

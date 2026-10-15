@@ -26,6 +26,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app import trace  # noqa: E402
+from app.sessions import split_costs  # noqa: E402
 from scripts._monitor import SCHEMA_RETRY, STRUCTURED_OUTPUT, load_raw, tool_calls  # noqa: E402
 
 _RAW = re.compile(r"\.raw(?:\.attempt(\d+))?\.json$")
@@ -43,6 +44,14 @@ def _journal(run_path: Path) -> list[dict]:
     if not path.is_file():
         return []
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+
+
+def _lines(path: Path) -> list[str]:
+    """Непустые строки файла; нет файла — пусто."""
+    try:
+        return [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    except OSError:
+        return []
 
 
 def _resolve(run: str) -> Path:
@@ -78,6 +87,10 @@ def agents(run_path: Path, journal: list[dict]) -> list[dict]:
         attempts = outcomes.get(base) or []
         if attempts:
             seconds = sum(a.get("duration_s") or 0 for a in attempts)
+        if attempts and all("cost_usd" in a for a in attempts):
+            # 15.10 (код-ревью): при --resume CLI сообщает стоимость сессии нарастающим итогом — сумма сырых ответов
+            # её завышает; в журнале попыток стоимость уже за попытку (runner.call)
+            cost = sum(float(a["cost_usd"] or 0) for a in attempts)
         result.append({
             "agent": base, "attempts": len(files),
             "outcomes": [a["outcome"] for a in attempts],
@@ -112,8 +125,11 @@ def report(run: str, compare: str | None = None) -> str:
     # --- сессия
     add(f"== Сессия {run_path.name}")
     add(f"акт: {meta.get('act_filename')} · тип: {', '.join(meta.get('act_types') or []) or '—'}")
+    chat = [json.loads(ln) for ln in _lines(run_path / "dialog" / "chat.jsonl")]
+    # 15.10: та же разбивка, что в итоге сессии (progress после правок — уже итог вместе с диалогом)
+    costs = split_costs(journal, meta.get("cost_usd"), progress.get("total_cost_usd"), chat)
     add(f"начат: {meta.get('started_at')} · разбор: {progress.get('status')} · "
-        f"стоимость разбора ${float(progress.get('total_cost_usd') or meta.get('cost_usd') or 0):.2f}")
+        f"стоимость: разбор ${costs['разбор']:.2f} · диалог ${costs['диалог']:.2f} · всего ${costs['всего']:.2f}")
     if summary:
         add(f"закрыта: {summary.get('closed_at')} ({summary.get('closed_by')}) · "
             f"всего ${summary['cost_usd']['всего']:.2f} · версия {summary.get('version')}")

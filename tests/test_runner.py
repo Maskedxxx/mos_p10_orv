@@ -1039,6 +1039,135 @@ def test_broken_first_answer_is_repaired_by_schema(tmp_runs_dir, valid_verdict_o
     assert [e for e in read_events(rid) if e["event"] == "json_repaired"]
 
 
+def test_unrepairable_first_answer_falls_back_to_cli_answer(tmp_runs_dir, valid_verdict_ok, monkeypatch):
+    """Первый ответ не чинится (в JSON попала разметка параметров) — берётся ответ, принятый CLI, без повтора;
+    в журнале first_answer_rejected (перепрогон 15.10: 32 лишних повтора у гипотез)."""
+    from app.trace import read_events, new_run
+    rid = new_run("акт.docx")
+    broken = '{"indicator": 3, "hypotheses": \n<parameter name="grounds">текст'
+    stdout = _stdout_with_events(*_structured_answer(broken),
+                                 _result_event(json.dumps(valid_verdict_ok, ensure_ascii=False)))
+    mock_run = Mock(return_value=_proc(stdout))
+    monkeypatch.setattr(subprocess, "run", mock_run)
+
+    result = call("инструкция", "текст акта", Verdict,
+                  run_id=rid, trace_name="05_hypotheses/03.raw.json", allowed_tools=[])
+
+    assert result.ok is True and result.attempts == 1 and mock_run.call_count == 1
+    assert result.value == Verdict.model_validate(valid_verdict_ok)
+    assert [e for e in read_events(rid) if e["event"] == "first_answer_rejected"]
+
+
+def test_invalid_first_answer_falls_back_to_cli_answer(tmp_runs_dir, valid_verdict_ok, monkeypatch):
+    """Первый ответ разбирается, но не проходит контракт (CLI его отверг, модель исправила) — берётся принятый CLI."""
+    first = dict(valid_verdict_ok, verdict="непонятно")
+    stdout = _stdout_with_events(*_structured_answer(json.dumps(first, ensure_ascii=False)),
+                                 _result_event(json.dumps(valid_verdict_ok, ensure_ascii=False)))
+    mock_run = Mock(return_value=_proc(stdout))
+    monkeypatch.setattr(subprocess, "run", mock_run)
+
+    result = call("инструкция", "текст акта", Verdict,
+                  run_id="run1", trace_name="03_verdicts/08.raw.json", allowed_tools=[])
+
+    assert result.ok is True and result.attempts == 1 and mock_run.call_count == 1
+    assert result.value.verdict == valid_verdict_ok["verdict"]
+
+
+def test_both_answers_bad_retry_reports_last_error(tmp_runs_dir, valid_verdict_ok, monkeypatch):
+    """Не подошёл ни первый ответ (битый JSON), ни принятый CLI (не проходит контракт) — повтор через --resume;
+    модели уходит ошибка принятого CLI ответа: сессия кончилась на нём, про битый JSON ей писать неверно."""
+    accepted_bad = json.dumps(dict(valid_verdict_ok, verdict="непонятно"), ensure_ascii=False)
+    bad = _stdout_with_events(*_structured_answer('{"x": \n<parameter'), _result_event(accepted_bad, session_id="s-1"))
+    mock_run = Mock(side_effect=[_proc(bad), _proc(_ok_stdout(valid_verdict_ok))])
+    monkeypatch.setattr(subprocess, "run", mock_run)
+
+    result = call("инструкция", "текст акта", Verdict,
+                  run_id="run1", trace_name="03_verdicts/08.raw.json", allowed_tools=[])
+
+    assert result.ok is True and result.attempts == 2 and mock_run.call_count == 2
+    retry = _extract_message(mock_run.call_args_list[1].args[0])
+    assert "verdict" in retry and "не разбирается как JSON" not in retry
+
+
+def test_much_shorter_cli_answer_is_not_taken(tmp_runs_dir, valid_verdict_ok, monkeypatch):
+    """15.10 (код-ревью): принятый CLI ответ сильно короче первого (урезан при переписывании — паспорт 13.10:
+    16,6 → 8,1 тыс. знаков) — не берётся: повтор через --resume, как раньше."""
+    broken_long = '{"indicator": 1, "rationale": "' + "подробный разбор " * 200 + '", \n<parameter name="x">'
+    first = _stdout_with_events(*_structured_answer(broken_long),
+                                _result_event(json.dumps(valid_verdict_ok, ensure_ascii=False), session_id="s-1"))
+    mock_run = Mock(side_effect=[_proc(first), _proc(_ok_stdout(valid_verdict_ok))])
+    monkeypatch.setattr(subprocess, "run", mock_run)
+
+    result = call("инструкция", "текст акта", Verdict,
+                  run_id="run1", trace_name="02_passport.raw.json", allowed_tools=[])
+
+    assert result.ok is True and result.attempts == 2 and mock_run.call_count == 2
+
+
+def test_shortened_answer_after_contract_error_is_taken(tmp_runs_dir, valid_verdict_ok, monkeypatch):
+    """15.10 (повторное ревью): первый ответ CLI отверг за нарушение схемы (длинные выжимки) — модель законно его
+    сокращает; такой короткий ответ не считается урезанным и берётся с первой попытки."""
+    first = json.dumps(dict(valid_verdict_ok, verdict="непонятно", rationale="длинный разбор " * 300),
+                       ensure_ascii=False)
+    stdout = _stdout_with_events(*_structured_answer(first),
+                                 _result_event(json.dumps(valid_verdict_ok, ensure_ascii=False)))
+    mock_run = Mock(return_value=_proc(stdout))
+    monkeypatch.setattr(subprocess, "run", mock_run)
+    result = call("и", "т", Verdict, run_id="run1", trace_name="03_verdicts/08.raw.json", allowed_tools=[])
+    assert result.ok is True and result.attempts == 1 and mock_run.call_count == 1
+
+
+def test_truncated_retry_message_keeps_first_error(tmp_runs_dir, valid_verdict_ok, monkeypatch):
+    """15.10 (повторное ревью): принятый CLI ответ отбракован как урезанный — в повторе модели и ошибка первого
+    ответа, и просьба не сокращать."""
+    broken_long = '{"indicator": 1, "rationale": "' + "подробный разбор " * 200 + '", \n<parameter name="x">'
+    first = _stdout_with_events(*_structured_answer(broken_long),
+                                _result_event(json.dumps(valid_verdict_ok, ensure_ascii=False), session_id="s-1"))
+    mock_run = Mock(side_effect=[_proc(first), _proc(_ok_stdout(valid_verdict_ok))])
+    monkeypatch.setattr(subprocess, "run", mock_run)
+    assert call("и", "т", Verdict, run_id="run1", trace_name="02_passport.raw.json", allowed_tools=[]).ok
+    retry = _extract_message(mock_run.call_args_list[1].args[0])
+    assert "урезан" in retry and "не разбирается как JSON" in retry
+
+
+def test_repaired_but_invalid_first_answer_guards_truncation(tmp_runs_dir, valid_verdict_ok, monkeypatch):
+    """15.10 (советник): первый ответ — битый JSON (потеряна скобка, как паспорт 13.10), починка удалась, но
+    починенный не проходит контракт; принятый CLI ответ сильно короче — урезан: повтор, в нём и ошибка контракта,
+    и просьба не сокращать."""
+    first = json.dumps(dict(valid_verdict_ok, verdict="непонятно", rationale="подробный разбор " * 200),
+                       ensure_ascii=False)[:-1]
+    stdout = _stdout_with_events(*_structured_answer(first),
+                                 _result_event(json.dumps(valid_verdict_ok, ensure_ascii=False), session_id="s-1"))
+    mock_run = Mock(side_effect=[_proc(stdout), _proc(_ok_stdout(valid_verdict_ok))])
+    monkeypatch.setattr(subprocess, "run", mock_run)
+    result = call("и", "т", Verdict, run_id="run1", trace_name="02_passport.raw.json", allowed_tools=[])
+    assert result.ok is True and result.attempts == 2
+    retry = _extract_message(mock_run.call_args_list[1].args[0])
+    assert "урезан" in retry and "verdict" in retry
+
+
+def test_fallback_to_cli_answer_is_logged(tmp_runs_dir, valid_verdict_ok, monkeypatch):
+    """15.10 (код-ревью): ответ, принятый CLI вместо первого, виден и в логе прогона (run.log), не только событием
+    журнала."""
+    from app.trace import run_dir
+    stdout = _stdout_with_events(*_structured_answer('{"indicator": 3, \n<parameter name="grounds">'),
+                                 _result_event(json.dumps(valid_verdict_ok, ensure_ascii=False)))
+    monkeypatch.setattr(subprocess, "run", Mock(return_value=_proc(stdout)))
+    assert call("и", "т", Verdict, run_id="run1", trace_name="05_hypotheses/03.raw.json", allowed_tools=[]).ok
+    assert "принят ответ CLI" in (run_dir("run1") / "run.log").read_text(encoding="utf-8")
+
+
+def test_own_mcp_tools_need_no_garant_token(tmp_runs_dir, valid_verdict_ok, monkeypatch, tmp_path):
+    """15.10 (код-ревью): без файла токена Гаранта вызов только со своими инструментами MCP (чтение артефактов
+    прогона) работает — токен нужен лишь там, где есть инструменты Гаранта."""
+    monkeypatch.setattr(runner_mod, "GARANT_TOKEN_FILE", tmp_path / "нет_файла")
+    monkeypatch.setattr(subprocess, "run", Mock(return_value=_proc(_ok_stdout(valid_verdict_ok))))
+    result = call("и", "т", Verdict, run_id="run1", trace_name="dialog/turns/0001.raw.json", allowed_tools=[],
+                  mcp_tools=["mcp__p10run__read_artifact"], mcp_config="/r/dialog/mcp.json")
+    assert result.ok is True
+    assert runner_mod.garant_available() is False
+
+
 def test_own_mcp_config_and_full_tool_names():
     """Помощник (14.10): свой файл серверов вместо файла Гаранта; полные имена «mcp__…» одобряются как есть,
     не прячутся --disallowedTools; неразрешённые инструменты Гаранта по-прежнему скрыты."""

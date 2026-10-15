@@ -148,6 +148,16 @@ def valid_passport() -> dict:
 
 
 @pytest.fixture(autouse=True)
+def _garant_token_file(tmp_path_factory, monkeypatch):
+    """15.10 (повторное ревью): тесты не зависят от файла токена Гаранта на машине — у каждого свой тестовый файл;
+    тест «без токена» подменяет его на несуществующий."""
+    import app.runner as runner_module
+    token = tmp_path_factory.mktemp("garant") / "token"
+    token.write_text("TEST-TOKEN\n", encoding="utf-8")
+    monkeypatch.setattr(runner_module, "GARANT_TOKEN_FILE", token)
+
+
+@pytest.fixture(autouse=True)
 def _no_cache_warmup(monkeypatch):
     """Сдвиг старта агентов ради кэша (2.6) в тестах не ждём: 12 секунд на тест ни к чему.
     Тест самого сдвига ставит своё значение поверх."""

@@ -30,7 +30,7 @@ from app.config import ALLOWED_TOOLS_WEB, DIALOG_MODEL, GARANT_ALL_TOOLS, GARANT
 from app.contracts import DialogTurn, Operation, Remark
 from app.nodes.hypotheses import _add_cost_to_meta
 from app.run_map import build_run_map
-from app.runner import call
+from app.runner import call, garant_available
 from app.trace import log_event, run_dir, save_bytes
 
 CHAT = "dialog/chat.jsonl"
@@ -42,12 +42,19 @@ HISTORY_MESSAGES = 16       # сколько последних реплик ч�
 # Сессия CLI помощника: session_id, started, last_turn, version_seen, cost_reported (стоимость сессии, как её
 # сообщил CLI в прошлом ходе: при --resume он сообщает сумму с начала сессии — runner вычитает её)
 SESSION = "dialog/session.json"
+# Что CLI пишет, когда сессии для --resume у него нет (проба 15.10: код 1, «No conversation found with session ID»)
+SESSION_GONE = "No conversation found"
+# Сколько ходов подряд сессия может не продолжиться, прежде чем помощник начнёт новую (15.10, повторное ревью)
+RESUME_FAILS_TO_RESET = 2
+# Пометка служебной строки хода, когда файла токена Гаранта нет (15.10)
+GARANT_OFF_NOTE = ("Гарант сейчас недоступен (нет файла токена): инструментов Гаранта в этом ходе нет. "
+                   "Если пользователь просит найти или проверить в Гаранте — скажи ему об этом.")
 MCP_CONFIG = "dialog/mcp.json"    # серверы MCP помощника: Гарант + чтение артефактов прогона
 # Инструменты чтения артефактов прогона (app/mcp_run.py, сервер p10run в dialog/mcp.json)
 RUN_TOOLS = ["mcp__p10run__list_artifacts", "mcp__p10run__read_artifact"]
 # Гарант в чате (решение владельца 14.10): все инструменты всегда, и лимитированные. Набор за сессию не меняется —
 # смена инструментов посреди сессии сбрасывает кэш. Выгрузки (30 в месяц на всех) помощник делает сам и предупреждает:
-# пишет в ответе, а после хода с выгрузкой сервис дописывает в чат «потрачено N, осталось M» (_report_exports)
+# пишет в ответе, а в ходе с выгрузкой сервис дописывает в чат «потрачено N, осталось M» перед ответом (_report_exports)
 GARANT_TOOLS = list(GARANT_ALL_TOOLS)
 # Задание первого хода новой сессии; роль и правила — в системном промпте (промпт 07)
 NEW_SESSION_INSTRUCTION = "Ответь на сообщение пользователя — оно последним блоком входа."
@@ -105,12 +112,13 @@ def shared_context(run_id: str) -> str:
     return "\n".join(parts)
 
 
-def mcp_config(run_id: str) -> str:
+def mcp_config(run_id: str, with_garant: bool = True) -> str:
     """
     Файл серверов MCP помощника в папке прогона: Гарант (как в пайплайне, токен — из окружения) и p10run —
     чтение артефактов ЭТОГО прогона (app/mcp_run.py, папка — в P10_RUN_DIR). Выход: путь файла.
+    with_garant=False (15.10) — без Гаранта: файла токена нет, помощник работает без него.
     """
-    servers = json.loads(GARANT_MCP_CONFIG.read_text(encoding="utf-8"))["mcpServers"]
+    servers = json.loads(GARANT_MCP_CONFIG.read_text(encoding="utf-8"))["mcpServers"] if with_garant else {}
     servers["p10run"] = {"type": "stdio", "command": sys.executable,
                          "args": [str(PROJECT_ROOT / "app" / "mcp_run.py")],
                          "env": {"P10_RUN_DIR": str(run_dir(run_id).resolve())}}
@@ -142,56 +150,83 @@ def version_line(run_id: str, version_seen: int | None) -> str:
     return line + (" С прошлого хода изменено: " + "; ".join(changes) + "." if changes else " С прошлого хода изменений нет.")
 
 
-def build_document(run_id: str, message: str, history: list[dict]) -> str:
+def _service(run_id: str, version_seen: int | None, note: str) -> str:
+    """Блок «СЛУЖЕБНО»: версия и что изменилось; note — пометка хода (15.10: Гарант недоступен)."""
+    return f"## СЛУЖЕБНО\n\n{version_line(run_id, version_seen)}\n" + (f"\n{note}\n" if note else "")
+
+
+def build_document(run_id: str, message: str, history: list[dict], note: str = "") -> str:
     """Вход первого хода новой сессии (stdin): служебная строка, история чата, сообщение пользователя — последним.
     Акт, паспорт, карта прогона — в системном промпте; вердикты, карту, бланк помощник читает инструментом."""
     lines = [f"{m['role']}: {m['text']}" for m in history] or ["(начало диалога)"]
     return "\n".join([
-        f"## СЛУЖЕБНО\n\n{version_line(run_id, None)}\n",
+        _service(run_id, None, note),
         "## ИСТОРИЯ ДИАЛОГА\n\n" + "\n\n".join(lines) + "\n",
         f"## СООБЩЕНИЕ ПОЛЬЗОВАТЕЛЯ\n\n{message}\n",
     ])
 
 
-def resume_message(run_id: str, message: str, version_seen: int) -> str:
+def resume_message(run_id: str, message: str, version_seen: int, note: str = "") -> str:
     """Вход следующего хода той же сессии: служебная строка о версии и сообщение пользователя."""
-    return f"## СЛУЖЕБНО\n\n{version_line(run_id, version_seen)}\n\n## СООБЩЕНИЕ ПОЛЬЗОВАТЕЛЯ\n\n{message}\n"
+    return f"{_service(run_id, version_seen, note)}\n## СООБЩЕНИЕ ПОЛЬЗОВАТЕЛЯ\n\n{message}\n"
 
 
 def turn(run_id: str, message: str, *, session: str | None = None, timeout_s: int = 900) -> TurnResult:
     """
     Ответить на сообщение пользователя: текст и план. Реплики и стоимость — в чат и meta; session — чья реплика
-    (сессия браузера). Есть сессия CLI — продолжаем её; продолжить не удалось — новая сессия с историей чата.
+    (сессия браузера). Есть сессия CLI — продолжаем её; у CLI её больше нет — новая сессия с историей чата;
+    временный сбой продолжения — ход «не получилось», сессия сохраняется (15.10).
     """
     versions.recover(run_id)
     versions.ensure_v0(run_id)
     history = read_chat(run_id)[-HISTORY_MESSAGES:]
     n = len(read_chat(run_id)) + 1
     append_chat(run_id, "пользователь", message, session=session)
-    # Инструменты хода: интернет, весь Гарант, чтение артефактов; остаток выгрузок — до хода (запрос бесплатный)
-    mcp_tools = GARANT_TOOLS + RUN_TOOLS
-    exports_before = (garant_limits.limits(fresh=True) or {}).get(garant_limits.EXPORT)
+    # Инструменты хода: интернет, весь Гарант, чтение артефактов. Нет файла токена Гаранта (15.10) — ход без
+    # Гаранта, а не сбой; пометка — в служебной строке входа (не репликой чата: та сбивает номер хода для живых
+    # шагов и засоряет историю разговора), помощник скажет сам
+    garant = garant_available()
+    note = "" if garant else GARANT_OFF_NOTE
+    if not garant:
+        log_event(run_id, "garant_unavailable", who="помощник", reason="нет рабочего файла токена Гаранта")
+    mcp_tools = GARANT_TOOLS + RUN_TOOLS if garant else list(RUN_TOOLS)
     common = dict(run_id=run_id, allowed_tools=ALLOWED_TOOLS_WEB, timeout_s=timeout_s, model=DIALOG_MODEL,
-                  shared_context=shared_context(run_id), mcp_tools=mcp_tools, mcp_config=mcp_config(run_id),
+                  shared_context=shared_context(run_id), mcp_tools=mcp_tools, mcp_config=mcp_config(run_id, garant),
                   short_cache_ttl=False)   # срок кэша 1 час: человек думает между сообщениями дольше 5 минут
     cli = load_session(run_id)
     cost = 0.0
     result = None
     if cli is not None:
         # Продолжение разговора: модель помнит прошлые ходы, служебная строка — что изменилось
-        result = call(resume_message(run_id, message, cli["version_seen"]), None, DialogTurn,
+        result = call(resume_message(run_id, message, cli["version_seen"], note), None, DialogTurn,
                       trace_name=f"dialog/turns/{n:04d}.raw.json", resume_session_id=cli["session_id"],
                       resume_cost_base=float(cli.get("cost_reported", 0.0)), **common)
         cost += result.cost_usd
         if result.ok and result.value is not None:
             log_event(run_id, "dialog_session_resumed", session_id=cli["session_id"])
-        else:
+        elif SESSION_GONE in (result.error or ""):
             log_event(run_id, "dialog_session_lost", session_id=cli["session_id"], error=(result.error or "")[:300])
             (run_dir(run_id) / SESSION).unlink(missing_ok=True)   # мёртвую сессию больше не продолжаем
             cli = None
+        else:
+            # 15.10 (код-ревью): сбой продолжения (таймаут, ошибка API) — память помощника не стираем: ход
+            # «не получилось», следующий продолжит ту же сессию. Не продолжилась второй ход подряд — сессия сломана
+            # (длинная или испорченная история): новая с историей чата (повторное ревью)
+            fails = int(cli.get("resume_failures", 0)) + 1
+            if result.session_id == cli["session_id"] and result.session_cost_usd:
+                cli = {**cli, "cost_reported": result.session_cost_usd}   # CLI считает сессию нарастающим итогом
+            if fails >= RESUME_FAILS_TO_RESET:
+                log_event(run_id, "dialog_session_lost", session_id=cli["session_id"],
+                          error=(result.error or "")[:300])
+                (run_dir(run_id) / SESSION).unlink(missing_ok=True)
+                cli = None
+            else:
+                log_event(run_id, "dialog_resume_failed", session_id=cli["session_id"],
+                          error=(result.error or "")[:300])
+                _save_session(run_id, {**cli, "resume_failures": fails})
     if cli is None:
         # Новая сессия: история чата — во входе, всё остальное — в системном промпте и инструментах
-        result = call(NEW_SESSION_INSTRUCTION, build_document(run_id, message, history), DialogTurn,
+        result = call(NEW_SESSION_INSTRUCTION, build_document(run_id, message, history, note), DialogTurn,
                       trace_name=f"dialog/turns/{n:04d}{'.new' if result is not None else ''}.raw.json", **common)
         cost += result.cost_usd
         if result.ok and result.value is not None and result.session_id:
@@ -203,6 +238,8 @@ def turn(run_id: str, message: str, *, session: str | None = None, timeout_s: in
     ok = result.ok and result.value is not None
     log_event(run_id, "dialog_turn", ok=ok, version=current, cost_usd=round(cost, 4),
               session_id=cli["session_id"] if cli else None)
+    # Строка о выгрузках — перед ответом помощника: его план должен остаться последней репликой (web.pending_plan)
+    _report_exports(run_id, n, session)
     if not ok:
         reply = f"Не получилось ответить: {result.error or 'неизвестная ошибка'}. Попробуйте ещё раз."
         append_chat(run_id, "ассистент", reply, cost_usd=round(cost, 4), mark="сбой")
@@ -210,12 +247,11 @@ def turn(run_id: str, message: str, *, session: str | None = None, timeout_s: in
     else:
         if cli is not None:
             _save_session(run_id, {**cli, "last_turn": _now(), "version_seen": current,
-                                   "cost_reported": result.session_cost_usd})
+                                   "cost_reported": result.session_cost_usd, "resume_failures": 0})
         value = result.value
         append_chat(run_id, "ассистент", value.reply, plan=[op.model_dump(mode="json") for op in value.plan],
                     sources=value.sources or None, steps=turn_steps(run_id, n) or None, cost_usd=round(cost, 4))
         out = TurnResult(reply=value.reply, plan=list(value.plan), cost_usd=cost, sources=list(value.sources))
-    _report_exports(run_id, exports_before, session)   # строка о выгрузках — после ответа помощника, если тратил
     return out
 
 
@@ -258,40 +294,61 @@ def _step_text(name: str, args: dict) -> str | None:
     return _STEP_TITLES.get(name, f"вызываю {name.removeprefix('mcp__')}")
 
 
-def turn_steps(run_id: str, n: int) -> list[str]:
+def _turn_tools(run_id: str, n: int) -> tuple[list[dict], set[str]]:
     """
-    Шаги хода n по порядку — из файлов хода dialog/turns/NNNN*.stream.jsonl (их пишет runner по ходу работы).
-    Вход: прогон, номер хода (номер реплики пользователя в чате). Выход: строки «что делает помощник».
+    Вызовы инструментов хода n по порядку (без дублей событий) и id вызовов, на которые инструмент ответил
+    ошибкой, — из файлов хода dialog/turns/NNNN*.stream.jsonl (их пишет runner по ходу работы).
     """
-    steps: list[str] = []
+    uses: list[dict] = []
     seen: set[str] = set()
+    errors: set[str] = set()
     for path in sorted((run_dir(run_id) / "dialog" / "turns").glob(f"{n:04d}*.stream.jsonl")):
         for line in path.read_text(encoding="utf-8").splitlines():
             try:
                 event = json.loads(line).get("event") or {}
             except (ValueError, AttributeError):
                 continue
-            if not isinstance(event, dict) or event.get("type") != "assistant":
+            if not isinstance(event, dict) or event.get("type") not in ("assistant", "user"):
                 continue
             for block in (event.get("message") or {}).get("content") or []:
-                if not isinstance(block, dict) or block.get("type") != "tool_use" or block.get("id") in seen:
+                if not isinstance(block, dict):
                     continue
-                seen.add(block.get("id"))
-                text = _step_text(block.get("name", ""), block.get("input") or {})
-                if text:
-                    steps.append(text)
-    return steps
+                if block.get("type") == "tool_result" and block.get("is_error"):
+                    errors.add(str(block.get("tool_use_id")))
+                elif block.get("type") == "tool_use" and block.get("id") not in seen:
+                    seen.add(block.get("id"))
+                    uses.append(block)
+    return uses, errors
 
 
-def _report_exports(run_id: str, before: int | None, session: str | None) -> None:
-    """После хода, в котором помощник потратил выгрузки Гаранта, — строка в чат: сколько потрачено и осталось.
-    Не тратил или остаток узнать не удалось — строки нет (выгрузки видно и в шагах хода)."""
-    after = (garant_limits.limits(fresh=True) or {}).get(garant_limits.EXPORT)
-    if before is None or after is None or before <= after:
+def turn_steps(run_id: str, n: int) -> list[str]:
+    """
+    Шаги хода n по порядку — из файлов хода (_turn_tools).
+    Вход: прогон, номер хода (номер реплики пользователя в чате). Выход: строки «что делает помощник».
+    """
+    uses, _ = _turn_tools(run_id, n)
+    steps = [_step_text(u.get("name", ""), u.get("input") or {}) for u in uses]
+    return [s for s in steps if s]
+
+
+def _turn_exports(run_id: str, n: int) -> int:
+    """Сколько выгрузок Гаранта сделал помощник в ходе n: удачные вызовы выгрузки (ошибка Гаранта — не трата)."""
+    uses, errors = _turn_tools(run_id, n)
+    return sum(1 for u in uses if str(u.get("name", "")).startswith("mcp__garant__garant_export")
+               and str(u.get("id")) not in errors)
+
+
+def _report_exports(run_id: str, n: int, session: str | None) -> None:
+    """После хода, в котором помощник выгружал из Гаранта, — строка в чат: сколько потрачено и сколько осталось.
+    15.10 (код-ревью): «потрачено» — по вызовам выгрузки самого помощника в этом ходе: общий остаток тратят и
+    параллельные прогоны. Не выгружал — строки нет."""
+    spent = _turn_exports(run_id, n)
+    if not spent:
         return
-    append_chat(run_id, "сервис", f"Выгрузок Гаранта потрачено: {before - after}, осталось {after} в этом месяце "
-                f"(на всех пользователей).", mark="лимиты", session=session)
-    log_event(run_id, "garant_exports_spent", spent=before - after, left=after)
+    left = (garant_limits.limits(fresh=True) or {}).get(garant_limits.EXPORT)
+    tail = f", осталось {left} в этом месяце (на всех пользователей)" if left is not None else ""
+    append_chat(run_id, "сервис", f"Выгрузок Гаранта потрачено: {spent}{tail}.", mark="лимиты", session=session)
+    log_event(run_id, "garant_exports_spent", spent=spent, left=left)
 
 
 def _now() -> str:

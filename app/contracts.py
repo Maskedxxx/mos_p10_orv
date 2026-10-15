@@ -1622,8 +1622,10 @@ class DeadlineCheck(_Base):
     @field_validator("federal")
     @classmethod
     def _federal_read_from_page(cls, v: str) -> str:
-        """Федеральная норма — только прочитанная: с адресом страницы; без него — «нет» (14.10, без «по памяти»)."""
-        if v.strip().lower().rstrip(".") != "нет" and "http" not in v:
+        """Федеральная норма — только прочитанная: с адресом страницы; без него — «нет» (14.10, без «по памяти»).
+        15.10 (владелец: проверки кодом не строже нужного): «нет» можно с пояснением — «нет (статью открыть не
+        удалось)»."""
+        if not re.match(r"нет(\W|$)", v.strip().lower()) and "http" not in v:
             raise ValueError("federal: укажи адрес страницы, где прочитана норма, или «нет» — по памяти не заполняй")
         return v
 
@@ -3489,16 +3491,6 @@ class ActPassport(_Base):
         return self
 
     @model_validator(mode="after")
-    def _check_scope_matches_organ_duties(self) -> "ActPassport":
-        """Процедура или контроль органа «есть» — у органа обязанности по акту: «внешним лицам» быть не может."""
-        if self.addressee.scope == "внешним лицам" and "есть" in (self.procedure.state, self.control.state):
-            raise ValueError(
-                "addressee.scope «внешним лицам», но в акте есть процедура или контроль органа — "
-                "у органа есть обязанности по акту, выбери «и тем и другим»"
-            )
-        return self
-
-    @model_validator(mode="after")
     def _check_project_has_no_requisites(self) -> "ActPassport":
         """Проект узнаётся по отсутствию номера и даты принятия."""
         if self.status.status == "проект" and self.requisites.number and self.requisites.date:
@@ -3519,6 +3511,26 @@ class ActPassport(_Base):
         if not has_amend and self.nature.input_kind != "акт изменений не вносит":
             raise ValueError(
                 "акт изменений не вносит, но input_kind заполнен так, будто вносит"
+            )
+        return self
+
+
+class ActPassportOutput(ActPassport):
+    """
+    Паспорт в ответе агента паспорта: правила, которые добавлены для модели после прежних прогонов, проверяются
+    только здесь (15.10, код-ревью). Сохранённый паспорт читается как ActPassport — прогоны, сделанные до этих
+    правил, открываются в диалоге (правило 6 плана итерации 4). Схема для модели та же, что у ActPassport.
+    """
+
+    model_config = ConfigDict(title="ActPassport")
+
+    @model_validator(mode="after")
+    def _check_scope_matches_organ_duties(self) -> "ActPassportOutput":
+        """Процедура или контроль органа «есть» — у органа обязанности по акту: «внешним лицам» быть не может."""
+        if self.addressee.scope == "внешним лицам" and "есть" in (self.procedure.state, self.control.state):
+            raise ValueError(
+                "addressee.scope «внешним лицам», но в акте есть процедура или контроль органа — "
+                "у органа есть обязанности по акту, выбери «и тем и другим»"
             )
         return self
 

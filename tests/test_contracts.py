@@ -1117,9 +1117,11 @@ def test_indicator11_reasoning_before_choice():
 @pytest.mark.parametrize("federal, ok", [
     ("нет", True), ("Нет.", True), ("174-ФЗ, ст. 14, https://www.consultant.ru/x", True),
     ("248-ФЗ, ст. 49 — 20 рабочих дней (по памяти)", False),
+    # 15.10 (владелец: проверки кодом не строже нужного): «нет» с пояснением — тоже «нет» (перепрогон: 2 лишних повтора)
+    ("нет (статью 49 открыть не удалось)", True), ("Нет — глава 2.1 не открывалась", True),
 ])
 def test_indicator11_federal_norm_only_from_read_page(federal, ok):
-    """14.10: федеральная норма — только с адресом прочитанной страницы, иначе «нет»."""
+    """14.10: федеральная норма — только с адресом прочитанной страницы, иначе «нет» (15.10: можно с пояснением)."""
     from app.contracts import DeadlineCheck
     row = {**_d11("в пределах"), "federal": federal}
     if ok:

@@ -21,6 +21,7 @@ Excel (код, секунды) → снимок версии, строка жу�
 from __future__ import annotations
 
 import datetime
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -34,7 +35,7 @@ from app.contracts import (
     EditText, HypothesisMap, HypothesisSet, JournalEntry, MapRow, MergeMapRows, Operation, RecheckIndicator,
     RequestItem, RunMeta, RunProgress, SetVerdict, SplitRequestItem, Verdict, VersionState,
 )
-from app.nodes.excel import _points, _unverified_verdicts, build_excel
+from app.nodes.excel import _points, _unverified_verdicts, build_excel, violated_without_rows
 from app.nodes.hypotheses import run_hypotheses_no_data, run_hypotheses_violated
 from app.nodes.merge import _clause_tokens, _fallback_map, _flatten_hypotheses
 from app.nodes.request import build_request
@@ -321,7 +322,8 @@ def _mark_not_tracked(ctx: _Ctx, op: MarkNotTracked) -> Change:
     """
     Ж3 (2.7): эксперт сказал, что такую цифру не ведёт никто. Источник цифры — «нигде
     не ведётся»; цифра уходит из позиций бланка, позиция без единой цифры удаляется
-    (у органа нечего спрашивать). «Как считать» переписывает следующая операция плана —
+    (у органа нечего спрашивать), кроме позиции с обязательным показателем — она остаётся
+    без ссылки на цифру (15.10). «Как считать» переписывает следующая операция плана —
     «правка текста» (промпт диалога).
     """
     row = _row(ctx, op.row_id)
@@ -338,6 +340,10 @@ def _mark_not_tracked(ctx: _Ctx, op: MarkNotTracked) -> Change:
         sources = [s for s in it.sources if not (s.row_id == op.row_id and _norm(s.metric) == key)]
         if len(sources) == len(it.sources):
             items.append(it)
+        elif not sources and it.mandatory and it.kind != "открытый вопрос":
+            # обязательный показатель в бланке всегда (Р4): остаётся, только без ссылки на эту цифру (15.10);
+            # открытый вопрос без строки карты невозможен — он уходит вместе с цифрой
+            items.append(_valid(RequestItem, it, for_rows=[], sources=[]))
         elif not sources:
             dropped.append(it.num)
             ctx.state.marks.stale_items.pop(it.num, None)
@@ -411,6 +417,11 @@ def _accept_recheck(ctx: _Ctx, cand: Candidate) -> Change:
     return Change(f"Вердикты, инд. {new.indicator}", "вердикт перепроверен агентом индикатора", before, new.verdict)
 
 
+# Цель записи журнала «гипотезы построены» — её читает и _run_gaps
+_BUILT_PREFIX = "Карта гипотез, инд. "
+_BUILT_TARGET = re.compile(re.escape(_BUILT_PREFIX) + r"(\d+)")
+
+
 def _prepare_hypotheses(ctx: _Ctx, op: BuildHypotheses, prefix: str) -> Candidate:
     v = ctx.verdicts[op.indicator]
     if not _in_work(op.indicator, v.verdict):
@@ -445,7 +456,7 @@ def _accept_hypotheses(ctx: _Ctx, cand: Candidate) -> Change:
     ctx.new_sets[hset.indicator] = hset
     ctx.state.marks.stale_verdicts.pop(hset.indicator, None)
     after = "; ".join(f"стр. {r.row_id}" for r in rows) + ("\n" + "\n".join(near) if near else "")
-    return Change(f"Карта гипотез, инд. {hset.indicator}", "гипотезы построены агентом гипотез", None, after)
+    return Change(f"{_BUILT_PREFIX}{hset.indicator}", "гипотезы построены агентом гипотез", None, after)
 
 
 def _prepare_request(ctx: _Ctx, op: AppendRequest, prefix: str) -> Candidate:
@@ -565,16 +576,34 @@ def _commit(ctx: _Ctx, op: Operation, change: Change, cost: float) -> StepResult
                 state.unverified_ids[v.indicator] = _new_row_id(ctx)
         meta = load_json(run_id, "meta.json", RunMeta)
         analyzed = datetime.datetime.fromisoformat(meta.finished_at) if meta.finished_at else None
+        journal = versions.read_journal(run_id) + [entry]
         excel = build_excel(ctx.hyp_map, ctx.request, buckets, ctx.passport, run_id, version=n,
-                            journal=versions.read_journal(run_id) + [entry], marks=state.marks,
+                            journal=journal, marks=state.marks,
                             unverified_ids=state.unverified_ids, analyzed_at=analyzed,
-                            act_types=meta.act_types)
+                            act_types=meta.act_types, run_gaps=_run_gaps(run_id, journal))
         versions.commit(run_id, state, [entry])
         _refresh_progress(run_id, ctx, excel)
     except Exception:
         versions.restore(run_id, state.current)
         raise
     return StepResult(version=n, change=change, cost_usd=cost)
+
+
+def _run_gaps(run_id: str, journal: list[JournalEntry]) -> set[int] | None:
+    """
+    «Нарушен» без строки карты на момент разбора — по снимку версии v0 (15.10, код-ревью): это сбой узла
+    гипотез, он остаётся на листе «Ошибки прогона»; то, что эксперт сделал сам, — нет. Эксперт построил гипотезы
+    по такому индикатору (журнал: «Карта гипотез, инд. N») — сбой закрыт, дальше строки — его решение
+    (повторное ревью). Снимка нет — None.
+    """
+    v0 = f"{versions.VERSIONS}/v0"
+    try:
+        gaps = violated_without_rows(load_json(run_id, f"{v0}/06_map.json", HypothesisMap),
+                                     load_json(run_id, f"{v0}/04_buckets.json", Buckets))
+    except (OSError, ValueError):
+        return None
+    built = {int(m.group(1)) for e in journal if (m := _BUILT_TARGET.fullmatch(e.target))}
+    return gaps - built
 
 
 def _short(text: str | None, limit: int = 1500) -> str | None:
