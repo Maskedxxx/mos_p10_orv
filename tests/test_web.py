@@ -530,7 +530,7 @@ def test_login_page_is_open_without_session():
     assert web.is_public_path(web.LOGIN_PATH) is True
 
 
-@pytest.mark.parametrize("path", ["/", "/history", "/run/20260825_080000_abcdef", "/garant", "/garant/abc123"])
+@pytest.mark.parametrize("path", ["/", "/history", "/run/20260825_080000_abcdef", "/garant", "/garant/abc123", "/feedback"])
 def test_pages_are_closed_without_session(path: str):
     assert web.is_public_path(path) is False
 

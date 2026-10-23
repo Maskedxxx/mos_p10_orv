@@ -44,6 +44,8 @@ NICEGUI_STORAGE_DIR = PROJECT_ROOT / "var" / "nicegui"
 
 # Логи сервиса вне прогонов: журнал действий на странице (actions.jsonl) и лог сервиса (service.log)
 LOGS_DIR = PROJECT_ROOT / "var" / "logs"
+# 23.10: замечания «Сообщить о проблеме» (app/problems.py) — одна таблица на весь сервис
+FEEDBACK_DIR = PROJECT_ROOT / "var" / "feedback"
 
 # Сколько прогонов идёт одновременно (веб-страница app/web.py): остальные ждут в
 # очереди и стартуют сами, как только освободится слот. Один прогон — семь минут

@@ -82,7 +82,7 @@ from nicegui.storage import Storage
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.responses import Response
 
-from app import config, dialog, feedback, garant_limits, garant_page, operations, sessions, trace, versions
+from app import config, dialog, feedback, garant_limits, garant_page, operations, problems, sessions, trace, versions
 from app.actions import Who, log_action, session_label
 from app.config import ACCEPTED_EXTENSIONS, SEARCH_LIMITS, all_indicators
 from app.mandatory_indicators import ACT_TYPES, NO_TYPE
@@ -1121,7 +1121,12 @@ def _layout(who: Who) -> None:
         with ui.row().classes("items-center gap-2"):
             ui.button(icon="menu", on_click=lambda: drawer.toggle()).props("flat dense round color=white")
             ui.label("Платформа ОРВ · модуль П-10").classes("text-lg font-medium")
-        ui.button("Выйти", on_click=lambda: _logout(who)).props("flat dense color=white")
+        with ui.row().classes("items-center gap-2"):
+            # 23.10: замечание о проблеме — с любой страницы, адрес страницы запоминается сам
+            path = ui.context.client.request.url.path if ui.context.client.request is not None else ""
+            ui.button("Сообщить о проблеме", icon="report_problem",
+                      on_click=lambda: _report_problem(who, path)).props("flat dense color=white")
+            ui.button("Выйти", on_click=lambda: _logout(who)).props("flat dense color=white")
     with ui.left_drawer(value=True).classes("bg-gray-50 px-4 py-6 gap-1") as drawer:
         # Разделы платформы: у каждого свои страницы
         ui.label("Анализ ОРВ").classes("text-xs uppercase tracking-wide text-gray-500 font-medium")
@@ -1130,6 +1135,41 @@ def _layout(who: Who) -> None:
         ui.separator().classes("my-3")
         ui.label("Гарант-помощник").classes("text-xs uppercase tracking-wide text-gray-500 font-medium")
         ui.link("Беседы", "/garant").classes("text-sm no-underline text-gray-900 py-1")
+        ui.separator().classes("my-3")
+        ui.link("Обратная связь", "/feedback").classes("text-sm no-underline text-gray-900 py-1")
+
+
+def _report_problem(who: Who, path: str) -> None:
+    """
+    Окно «Сообщить о проблеме» (23.10): человек выбирает, где проблема, и описывает её; страницу, прогон
+    или беседу и окно браузера сервис записывает сам (app/problems.py).
+    """
+    parts = path.strip("/").split("/")
+    run_id = parts[1] if len(parts) == 2 and parts[0] == "run" else None
+    chat_id = parts[1] if len(parts) == 2 and parts[0] == "garant" else None
+    with ui.dialog() as box, ui.card().classes("w-[36rem] max-w-full gap-3"):
+        ui.label("Сообщить о проблеме").classes("text-lg font-medium")
+        section = ui.select(list(problems.SECTIONS), value=problems.section_for_path(path),
+                            label="Где проблема?").classes("w-full")
+        text = ui.textarea(label="Что не так?",
+                           placeholder="Опишите, что увидели и что ожидали. Например: «индикатор 3 — нарушен, "
+                                       "а в п. 2.4 всё есть»").props("outlined autogrow").classes("w-full")
+
+        def send() -> None:
+            if not (text.value or "").strip():
+                ui.notify("Опишите проблему — хотя бы одной фразой", type="warning")
+                return
+            act = read_act_filename(run_id) if run_id and trace.run_dir(run_id).is_dir() else None
+            num = problems.add_problem(section.value, text.value, page=path, session=who.session,
+                                       run_id=run_id, act=act, chat_id=chat_id)
+            log_action(who, "сообщить о проблеме", run_id, number=num, section=section.value)
+            box.close()
+            ui.notify(f"Спасибо, замечание № {num} записано", type="positive")
+
+        with ui.row().classes("w-full justify-end gap-2"):
+            ui.button("Отмена", on_click=box.close).props("flat")
+            ui.button("Отправить", on_click=send).props("unelevated")
+    box.open()
 
 
 # Раздел «Гарант-помощник» (23.10): страницы /garant и /garant/<беседа> — app/garant_page.py, общие шапка и вход
@@ -1973,6 +2013,34 @@ def page_run(run_id: str, request: Request) -> None:
 
     log_action(who, "открытие прогона", run_id)
     _RunView(run_id, who)
+
+
+@ui.page("/feedback")
+def page_feedback(request: Request) -> None:
+    """Раздел «Обратная связь» (23.10): все замечания «Сообщить о проблеме», свежие сверху, и выгрузка в Excel."""
+    who = _who(request)
+    _layout(who)
+    rows = list(reversed(problems.read_problems()))
+    with ui.column().classes("w-full items-center p-8"):
+        with ui.card().classes("w-full max-w-5xl p-6 gap-4"):
+            ui.label("Обратная связь").classes("text-xl font-medium")
+            ui.label("Замечания, отправленные кнопкой «Сообщить о проблеме» в шапке. Для разбора скачайте их "
+                     "одной таблицей.").classes("text-sm text-gray-700")
+            ui.button("Скачать Excel", icon="download",
+                      on_click=lambda: ui.download.content(problems.to_xlsx(), "Замечания_П-10.xlsx")).props("unelevated")
+            if not rows:
+                ui.label("Замечаний пока нет.").classes("text-sm text-gray-600")
+                return
+            columns = [
+                {"name": "num", "label": "№", "field": "num", "align": "left"},
+                {"name": "at", "label": "Когда", "field": "at", "align": "left"},
+                {"name": "section", "label": "Где проблема", "field": "section", "align": "left"},
+                {"name": "text", "label": "Что не так", "field": "text", "align": "left"},
+                {"name": "where", "label": "Где был человек", "field": "where", "align": "left"},
+            ]
+            data = [{"num": r["num"], "at": r["at"].replace("T", " "), "section": r["section"], "text": r["text"],
+                     "where": problems.where_text(r)} for r in rows]
+            ui.table(columns=columns, rows=data, row_key="num").props("wrap-cells flat bordered").classes("w-full")
 
 
 @ui.page("/history")

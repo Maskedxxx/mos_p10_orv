@@ -79,6 +79,14 @@ _BORDER = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
 _EXPERT_FILL = PatternFill("solid", fgColor="FFF2CC")   # клетки для оценки экспертами (пул 3, п. 6.1)
 # 2.7 (итерация 4, В): строки «нет данных» на листе «Вердикты» — эксперту нужна доп. проверка
 _NO_DATA_FILL = PatternFill("solid", fgColor="FDE9D9")
+# 23.10 (владелец): блоки листа «Запрос показателей» — подпись блока и его строки своим цветом, чтобы
+# обязательные показатели и запрошенные моделью по гипотезам не смешивались; шрифт листа — 14
+_REQUEST_BLOCK_FILLS = {
+    "обязательные": (PatternFill("solid", fgColor="BDD7EE"), PatternFill("solid", fgColor="DDEBF7")),   # синий
+    "из гипотез": (PatternFill("solid", fgColor="C6E0B4"), PatternFill("solid", fgColor="E2EFDA")),     # зелёный
+    "перечни": (PatternFill("solid", fgColor="D9D9D9"), PatternFill("solid", fgColor="F2F2F2")),        # серый
+}
+_REQUEST_FONT_SIZE = 14
 
 _SHEET_HOWTO = "Как заполнять"   # лист-инструкция для эксперта, первый в книге (пул 3, 6.2)
 _SHEET_MAP = "Карта гипотез"
@@ -767,6 +775,11 @@ def _render_request_sheet(
     row_indicators = {row.row_id: row.indicators for row in hyp_map.rows}
     empty_years = [None] * len(years)
     dash_years = ["—"] * len(years)          # у перечня клеток годов нет (Г2)
+    blocks: list[tuple[str, int, int, int]] = []  # блок: подпись (0 — без неё), первая и последняя строка
+
+    def _close_block(name: str, caption_row: int, first_row: int) -> None:
+        if ws.max_row >= first_row:
+            blocks.append((name, caption_row, first_row, ws.max_row))
 
     def _append_item(item, year_cells) -> None:
         ws.append([
@@ -787,13 +800,19 @@ def _render_request_sheet(
         # 2.7 (АМ): сначала обязательные показатели по типу акта, затем — из гипотез
         types = ", ".join(t for t in (act_types or []) if t) or "не указан"
         ws.append(["", f"Обязательные показатели (тип акта: {types})", "", "", *[""] * len(years)])
-    for item in mandatory_counters:
-        _append_item(item, empty_years)
+        caption = ws.max_row
+        for item in mandatory_counters:
+            _append_item(item, empty_years)
+        _close_block("обязательные", caption, caption + 1)
     other_counters = [it for it in counters if not it.mandatory]
+    caption = 0
     if mandatory_counters and other_counters:
         ws.append(["", "Показатели из гипотез", "", "", *[""] * len(years)])
+        caption = ws.max_row
+    first = ws.max_row + 1
     for item in other_counters:
         _append_item(item, empty_years)
+    _close_block("из гипотез", caption, first)
     if lists:
         # ОС экспертов (2026-09-04, Г2): «перечень — это надо не в этой таблице»,
         # «должно быть отдельным реестром» — перечни идут своим блоком, без годов
@@ -801,13 +820,37 @@ def _render_request_sheet(
             "", "Перечни и реестры — заполняются отдельным документом, без разбивки по годам",
             "", "", *[""] * len(years),
         ])
+        caption = ws.max_row
         for item in lists:
             _append_item(item, dash_years)
+        _close_block("перечни", caption, caption + 1)
 
     _format_request_sheet(ws, header_row)
+    # Блоки цветом: подпись — насыщеннее и жирным, строки блока — светлее (колонки бланка, без экспертных)
+    width = 4 + len(years)
+    for name, caption_row, first_row, last in blocks:
+        head_fill, body_fill = _REQUEST_BLOCK_FILLS[name]
+        for r in range(caption_row or first_row, last + 1):
+            for col in range(1, width + 1):
+                ws.cell(row=r, column=col).fill = head_fill if r == caption_row else body_fill
+        if caption_row:
+            ws.cell(row=caption_row, column=2).font = Font(bold=True, size=11)
     if marks is not None:
         _append_marks_column(ws, header_row, _item_key, marks.edited_items, marks.stale_items)
     _append_expert_columns(ws, header_row, *_EXPERT_SCORE_COLUMNS)
+    _enlarge_font(ws, _REQUEST_FONT_SIZE)
+
+
+def _enlarge_font(ws: Worksheet, size: int) -> None:
+    """Шрифт всего листа — size (жирность и цвет сохраняются), колонки шире в той же пропорции."""
+    for row in ws.iter_rows():
+        for c in row:
+            f = c.font
+            c.font = Font(name=f.name, bold=f.bold, italic=f.italic, color=f.color, underline=f.underline, size=size)
+    scale = size / 11
+    for dim in ws.column_dimensions.values():
+        if dim.width:
+            dim.width = round(dim.width * scale, 1)
 
 
 def _render_questions_sheet(
