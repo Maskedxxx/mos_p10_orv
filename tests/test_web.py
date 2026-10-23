@@ -1051,14 +1051,6 @@ def test_start_needs_file_and_type():
     assert can_start(True, {"нет подходящего типа"})
 
 
-def test_clamp_limits():
-    from app.config import SEARCH_LIMIT_MAX, SEARCH_LIMITS
-    from app.web import clamp_limits
-    limits = clamp_limits({3: 999, 4: 0, 10: "абв", 11: 12.0})
-    assert limits[3] == SEARCH_LIMIT_MAX and limits[4] == 1 and limits[10] == SEARCH_LIMITS[10]
-    assert limits[11] == 12 and set(limits) == set(SEARCH_LIMITS)
-
-
 # ---- 2.7: конец сессии (мониторинг, шаг 3) ----
 
 

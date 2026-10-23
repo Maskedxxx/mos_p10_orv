@@ -84,7 +84,7 @@ from starlette.responses import Response
 
 from app import config, dialog, feedback, garant_limits, operations, sessions, trace, versions
 from app.actions import Who, log_action, session_label
-from app.config import ACCEPTED_EXTENSIONS, SEARCH_LIMIT_MAX, SEARCH_LIMITS, all_indicators
+from app.config import ACCEPTED_EXTENSIONS, SEARCH_LIMITS, all_indicators
 from app.mandatory_indicators import ACT_TYPES, NO_TYPE
 from app.contracts import (
     Buckets, DataRequest, HypothesisMap, Marks, NodeState, NodeStatus, Operation, RunMeta, RunProgress, RunStatus,
@@ -192,7 +192,7 @@ def input_filename(act_filename: str) -> str:
     return f"{INPUT_STEM}{suffix}"
 
 
-# ---- 2.7 (итерация 4): тип акта и «Настройки прогона» на странице загрузки ----
+# ---- 2.7 (итерация 4): тип акта на странице загрузки («Настройки прогона» убраны 23.10 — потолки по умолчанию) ----
 
 
 def toggle_act_type(selected: set[str], changed: str, checked: bool) -> set[str]:
@@ -205,18 +205,6 @@ def toggle_act_type(selected: set[str], changed: str, checked: bool) -> set[str]
     if changed == NO_TYPE:
         return {NO_TYPE}
     return (selected - {NO_TYPE}) | {changed}
-
-
-def clamp_limits(values: dict[int, object]) -> dict[int, int]:
-    """Потолки поиска (Л) из полей страницы: целые от 1 до SEARCH_LIMIT_MAX; пусто — значение по умолчанию."""
-    out: dict[int, int] = {}
-    for n, default in SEARCH_LIMITS.items():
-        try:
-            value = int(values.get(n)) if values.get(n) not in (None, "") else default
-        except (TypeError, ValueError):
-            value = default
-        out[n] = min(max(value, 1), SEARCH_LIMIT_MAX)
-    return out
 
 
 def can_start(has_file: bool, act_types: set[str]) -> bool:
@@ -1862,7 +1850,6 @@ def page_index(request: Request) -> None:
     pending: dict[str, object] = {}
     act_types: set[str] = set()
     type_boxes: dict[str, ui.checkbox] = {}
-    limit_inputs: dict[int, ui.number] = {}
 
     def refresh_start() -> None:
         """Кнопка активна, только когда есть файл и тип акта (2.7)."""
@@ -1913,7 +1900,8 @@ def page_index(request: Request) -> None:
             ui.notify("Отметьте тип акта", type="warning")
             return
         types = [t for t in ACT_TYPES if t in act_types]          # порядок — как на странице
-        limits = clamp_limits({n: box.value for n, box in limit_inputs.items()})
+        # 23.10 (владелец): «Настройки прогона» убраны со страницы — потолки поиска всегда по умолчанию из конфига
+        limits = dict(SEARCH_LIMITS)
         run_id = trace.new_run(name, act_types=types, search_limits=limits)
         input_name = input_filename(name)
         trace.save_bytes(run_id, input_name, data)
@@ -1952,16 +1940,6 @@ def page_index(request: Request) -> None:
                 type_boxes[name] = ui.checkbox(
                     name, on_change=lambda e, n=name: on_type(n, bool(e.value)),
                 ).classes("text-sm")
-
-            # 2.7 (Л): «Настройки прогона» — потолки поиска, по умолчанию из конфига, хранятся в прогоне.
-            # 14.10: поле «Регионы сравнения» (К) убрано — сравнение с регионами снято до БЛ-3
-            with ui.expansion("Настройки прогона").classes("w-full text-sm"):
-                ui.label(f"Потолок заходов поиска в интернете (от 1 до {SEARCH_LIMIT_MAX})").classes("text-sm")
-                names = {ind.number: ind.name for ind in all_indicators()}
-                for n, default in SEARCH_LIMITS.items():
-                    limit_inputs[n] = ui.number(
-                        label=f"{n}. {names.get(n, '')}", value=default, min=1, max=SEARCH_LIMIT_MAX, step=1,
-                    ).classes("w-full")
 
             start = ui.button("Проанализировать", on_click=start_run).props("unelevated")
             start.disable()
