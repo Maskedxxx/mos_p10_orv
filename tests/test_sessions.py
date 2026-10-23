@@ -74,6 +74,25 @@ def test_summary_counts_agent_failures(tmp_runs_dir):
     assert summary["node_failures"] == [{"node": "sort", "error": "сбой"}]
 
 
+def test_reopen_session_keeps_summaries(tmp_runs_dir):
+    """23.10: закрытая сессия открывается заново — итог в sessions/01.json, журнал пишется, второе закрытие —
+    итог сессии № 2 с началом от момента открытия."""
+    rid = _finished_run()
+    assert sessions.reopen_session(rid) is False            # открытую не трогаем
+    sessions.close_session(rid, by="пользователь", now=_NOW)
+    assert sessions.reopen_session(rid) is True
+    assert not sessions.is_closed(rid)
+    first = json.loads((run_dir(rid) / "sessions" / "01.json").read_text(encoding="utf-8"))
+    assert first["closed_by"] == "пользователь" and first["session_no"] == 1
+    reopened = [e for e in read_events(rid) if e["event"] == "session_reopened"]
+    assert len(reopened) == 1 and reopened[0]["previous"] == 1
+    sessions.close_session(rid, by="таймер", now=_NOW + timedelta(hours=3))
+    second = json.loads((run_dir(rid) / sessions.SESSION_SUMMARY_FILE).read_text(encoding="utf-8"))
+    assert second["session_no"] == 2 and second["started_at"] == reopened[0]["ts"]
+    assert sessions.reopen_session(rid) is True
+    assert (run_dir(rid) / "sessions" / "02.json").is_file()
+
+
 def test_closed_session_journal_is_frozen(tmp_runs_dir):
     """После закрытия журнал не пишется: папка сессии больше не меняется."""
     rid = _finished_run()

@@ -3,8 +3,9 @@
 
 Сессия = одна загрузка акта = папка runs/<run_id>/: разбор, Excel, работа в чате. Конечная
 точка — закрытие: кнопка «Завершить работу» на странице прогона или сама, если в журнале
-сессии (events.jsonl) нет событий SESSION_IDLE_S секунд. Закрытая сессия навсегда —
-открыть снова нельзя (решение владельца: позже, не сейчас).
+сессии (events.jsonl) нет событий SESSION_IDLE_S секунд. С 23.10 (владелец: чат в любом
+завершённом прогоне) закрытая сессия открывается заново первым действием в чате (reopen_session):
+итог закрытой уходит в sessions/NN.json, журнал пишется дальше, следующее закрытие — новый итог.
 
 При закрытии пишется событие session_closed и итог session_summary.json: сколько длилась,
 сколько стоила (разбор и диалог), чем кончился разбор, сколько версий, что делал
@@ -23,7 +24,7 @@ from datetime import datetime
 from app import config, dialog, trace, versions
 from app.contracts import RunMeta, RunProgress
 from app.trace import (
-    EVENTS_FILE, SESSION_SUMMARY_FILE, load_json, log_event, log_service_event, read_events, run_dir, save_json,
+    EVENTS_FILE, SESSION_SUMMARY_FILE, SESSIONS_DIR, load_json, log_event, log_service_event, read_events, run_dir, save_json,
 )
 
 PROGRESS_FILE = "progress.json"   # то же имя, что в pipeline.PROGRESS_FILE (pipeline здесь не нужен целиком)
@@ -115,8 +116,14 @@ def _summary(run_id: str, by: str, now: datetime) -> dict:
         if e.get("role") in ("пользователь", "ассистент"):
             roles[e["role"]] = roles.get(e["role"], 0) + 1
     agents_done = [e for e in events if e["event"] == "agent_finished"]
+    # Сессия, открытая заново (23.10): начало — момент открытия, номер — следующий за прошлыми итогами;
+    # стоимость остаётся нарастающим итогом прогона
+    reopened = next((e for e in reversed(events) if e["event"] == "session_reopened"), None)
+    if reopened is not None:
+        started = reopened["ts"]
     return {
         "run_id": run_id,
+        "session_no": int(reopened["previous"]) + 1 if reopened is not None else 1,
         "act_filename": meta.act_filename if meta is not None else None,
         "started_at": started,
         "closed_at": now.isoformat(timespec="seconds"),
@@ -152,4 +159,20 @@ def close_session(run_id: str, *, by: str, now: datetime | None = None) -> bool:
     log_event(run_id, "session_closed", by=by, cost_usd=summary["cost_usd"]["всего"], version=summary["version"])
     save_json(run_id, SESSION_SUMMARY_FILE, summary)
     log_service_event("session_closed", run_id=run_id, by=by)
+    return True
+
+
+def reopen_session(run_id: str) -> bool:
+    """
+    Открыть закрытую сессию заново (23.10): итог закрытой переносится в sessions/NN.json (номер по
+    порядку), после этого журнал снова пишется — событие session_reopened. False — сессия не закрыта.
+    """
+    if not is_closed(run_id):
+        return False
+    folder = run_dir(run_id) / SESSIONS_DIR
+    folder.mkdir(exist_ok=True)
+    n = len(list(folder.glob("[0-9][0-9].json"))) + 1
+    (run_dir(run_id) / SESSION_SUMMARY_FILE).rename(folder / f"{n:02d}.json")
+    log_event(run_id, "session_reopened", previous=n)
+    log_service_event("session_reopened", run_id=run_id, previous=n)
     return True

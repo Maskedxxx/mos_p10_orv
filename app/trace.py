@@ -56,6 +56,7 @@ ModelT = TypeVar("ModelT", bound=BaseModel)
 EVENTS_FILE = "events.jsonl"
 # Итог закрытой сессии (2.7, app/sessions.py): есть файл — сессия закрыта, журнал больше не пишется
 SESSION_SUMMARY_FILE = "session_summary.json"
+SESSIONS_DIR = "sessions"   # 23.10: итоги прошлых сессий прогона, открытого заново — sessions/01.json, …
 # Служебные файлы, которые пишутся часто (каждое изменение прогресса, статус диалога), и снимки
 # версий (о них — событие version_created): как артефакты не журналируются, иначе шум
 _NOT_ARTIFACTS = {"meta.json", "progress.json", "dialog/status.json", EVENTS_FILE}

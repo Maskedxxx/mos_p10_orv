@@ -82,7 +82,7 @@ from nicegui.storage import Storage
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.responses import Response
 
-from app import config, dialog, feedback, garant_limits, operations, sessions, trace, versions
+from app import config, dialog, feedback, garant_limits, garant_page, operations, sessions, trace, versions
 from app.actions import Who, log_action, session_label
 from app.config import ACCEPTED_EXTENSIONS, SEARCH_LIMITS, all_indicators
 from app.mandatory_indicators import ACT_TYPES, NO_TYPE
@@ -483,14 +483,12 @@ def session_closed_text(run_id: str) -> str | None:
         by = "кнопкой «Завершить работу»" if summary.get("closed_by") == "пользователь" else "сама — простой больше часа"
     except (OSError, ValueError):
         when, by = "—", "причина не прочитана"
-    return f"Сессия закрыта {when} ({by}): чат и правки недоступны, Excel можно скачать."
+    return f"Сессия закрыта {when} ({by}). Напишите сообщение в чат — работа продолжится."
 
 
 def dialog_unavailable(run_id: str, progress: RunProgress | None) -> str | None:
-    """Почему диалог по прогону недоступен; None — доступен (сессия открыта, завершён без сбоя, артефакты v2.4+)."""
-    closed = session_closed_text(run_id)
-    if closed is not None:
-        return closed
+    """Почему диалог по прогону недоступен; None — доступен (завершён без сбоя, артефакты v2.4+). С 23.10 закрытая
+    сессия чат не прячет: первое действие в чате открывает её заново (DialogJobs.start)."""
     if progress is None or progress.status != "готов":
         return "Диалог доступен после успешного завершения прогона."
     try:
@@ -752,10 +750,11 @@ class DialogJobs:
             item[2].set_result(accepted)
 
     def start(self, run_id: str, job: Coroutine) -> bool:
-        """Запустить действие, если по прогону ничего не идёт и сессия открыта; False — занято или закрыта."""
-        if self.busy(run_id) or sessions.is_closed(run_id):
+        """Запустить действие, если по прогону ничего не идёт; False — занято. Закрытая сессия открывается заново (23.10)."""
+        if self.busy(run_id):
             job.close()
             return False
+        sessions.reopen_session(run_id)
         self._tasks[run_id] = asyncio.get_running_loop().create_task(job)
         return True
 
@@ -1113,14 +1112,28 @@ def _logout(who: Who) -> None:
 
 
 def _layout(who: Who) -> None:
-    """Общая шапка сервиса: название, переходы между экранами и выход."""
+    """
+    Общая шапка и меню слева (23.10, платформа): раздел «Анализ ОРВ» — прогоны по 12 индикаторам,
+    раздел «Гарант-помощник» — беседы с агентом по Гаранту (app/garant_page.py); выход — в шапке.
+    """
     ui.page_title("Платформа ОРВ · П-10")
     with ui.header().classes("items-center justify-between px-6 py-3"):
-        ui.label("Платформа ОРВ · модуль П-10").classes("text-lg font-medium")
-        with ui.row().classes("gap-6 items-center"):
-            ui.link("Новый прогон", "/").classes("text-white no-underline")
-            ui.link("История", "/history").classes("text-white no-underline")
-            ui.button("Выйти", on_click=lambda: _logout(who)).props("flat dense color=white")
+        with ui.row().classes("items-center gap-2"):
+            ui.button(icon="menu", on_click=lambda: drawer.toggle()).props("flat dense round color=white")
+            ui.label("Платформа ОРВ · модуль П-10").classes("text-lg font-medium")
+        ui.button("Выйти", on_click=lambda: _logout(who)).props("flat dense color=white")
+    with ui.left_drawer(value=True).classes("bg-gray-50 px-4 py-6 gap-1") as drawer:
+        # Разделы платформы: у каждого свои страницы
+        ui.label("Анализ ОРВ").classes("text-xs uppercase tracking-wide text-gray-500 font-medium")
+        ui.link("Новый прогон", "/").classes("text-sm no-underline text-gray-900 py-1")
+        ui.link("История", "/history").classes("text-sm no-underline text-gray-900 py-1")
+        ui.separator().classes("my-3")
+        ui.label("Гарант-помощник").classes("text-xs uppercase tracking-wide text-gray-500 font-medium")
+        ui.link("Беседы", "/garant").classes("text-sm no-underline text-gray-900 py-1")
+
+
+# Раздел «Гарант-помощник» (23.10): страницы /garant и /garant/<беседа> — app/garant_page.py, общие шапка и вход
+garant_page.register(_layout, _who)
 
 
 def _status_icon(status: NodeStatus) -> None:
@@ -1400,7 +1413,8 @@ class _RunView:
         """Подтверждение конца сессии: закрытие нельзя отменить — поэтому спрашиваем."""
         with ui.dialog() as box, ui.card():
             ui.label("Завершить работу с актом?").classes("text-lg font-medium")
-            ui.label("Сессия закроется насовсем: чат и правки станут недоступны, Excel останется для скачивания.")\
+            ui.label("Сессия закроется. Продолжить можно в любой момент: откройте прогон из истории и напишите "
+                     "в чат. Excel останется для скачивания.")\
                 .classes("text-sm text-gray-700")
             with ui.row().classes("w-full justify-end gap-2"):
                 ui.button("Отмена", on_click=box.close).props("flat")
@@ -1413,7 +1427,7 @@ class _RunView:
         if error is not None:
             ui.notify(error, type="warning")
             return
-        ui.navigate.reload()   # страница заново: без панели чата, со строкой «Сессия закрыта»
+        ui.navigate.reload()   # страница заново: со строкой «Сессия закрыта … напишите — продолжится»
 
 
 class _DialogView:
@@ -1543,11 +1557,10 @@ class _DialogView:
             # нужна сразу — иначе первая секунда кнопок молча не работает
             return
         rid = self._run_id
-        # Сессия закрылась (кнопкой в другом окне или по простою) — панель только для просмотра
+        # Сессия закрыта (кнопкой или по простою) — панель работает, над чатом строка «напишите — продолжится»
         closed = session_closed_text(rid)
-        self._editable = closed is None and DIALOG_LOCK.acquire(rid, self._client_id, time.monotonic())
-        if closed is not None:
-            _RunView._set_text(self._lock_note, closed)
+        self._editable = DIALOG_LOCK.acquire(rid, self._client_id, time.monotonic())
+        _RunView._set_text(self._lock_note, closed if closed is not None and self._editable else DIALOG_READ_ONLY)
         chat = dialog.read_chat(rid)
         busy = DIALOG_JOBS.busy(rid)
         waiting = DIALOG_JOBS.waiting(rid)
@@ -1570,7 +1583,7 @@ class _DialogView:
         self._known_version = current
 
         self._render_state(panel_state(chat, dialog.read_status(rid), self._editable, current, datetime.now()))
-        self._lock_note.set_visibility(not self._editable)
+        self._lock_note.set_visibility(not self._editable or closed is not None)
         self._render_controls(chat, active=self._editable and not busy)
 
     def _render_state(self, state: PanelState) -> None:

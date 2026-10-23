@@ -130,6 +130,11 @@ def report(run: str, compare: str | None = None) -> str:
     costs = split_costs(journal, meta.get("cost_usd"), progress.get("total_cost_usd"), chat)
     add(f"начат: {meta.get('started_at')} · разбор: {progress.get('status')} · "
         f"стоимость: разбор ${costs['разбор']:.2f} · диалог ${costs['диалог']:.2f} · всего ${costs['всего']:.2f}")
+    # 23.10: прогон можно открыть заново — итоги прошлых сессий в sessions/NN.json
+    for past in sorted((run_path / trace.SESSIONS_DIR).glob("[0-9][0-9].json")):
+        old = _json(past) or {}
+        add(f"сессия {old.get('session_no', past.stem)}: {old.get('started_at')} — {old.get('closed_at')} "
+            f"({old.get('closed_by')}) · всего ${old['cost_usd']['всего']:.2f} · версия {old.get('version')}")
     if summary:
         add(f"закрыта: {summary.get('closed_at')} ({summary.get('closed_by')}) · "
             f"всего ${summary['cost_usd']['всего']:.2f} · версия {summary.get('version')}")

@@ -85,10 +85,11 @@ def _read(path) -> str:
 
 
 def test_prompts_dir_has_exactly_the_expected_files():
-    """17 промптов: паспорт + 12 индикаторов + 04a, 04b, 05, 06. Саммари больше нет."""
+    """19 промптов: паспорт + 12 индикаторов + 04a, 04b, 05, 06, помощник 07, Гарант-помощник 08. Саммари больше нет."""
     names = sorted(p.name for p in PROMPTS_DIR.glob("*.md"))
     expected = sorted(
-        ["01_passport.md", "04a_hypotheses.md", "04b_hypotheses.md", "05_merge.md", "06_request.md", "07_dialog.md"]
+        ["01_passport.md", "04a_hypotheses.md", "04b_hypotheses.md", "05_merge.md", "06_request.md", "07_dialog.md",
+         "08_garant_chat.md"]
         + [f"02_indicator_{n:02d}.md" for n in range(1, 13)]
     )
     assert names == expected

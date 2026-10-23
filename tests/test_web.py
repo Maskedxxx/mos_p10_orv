@@ -530,7 +530,7 @@ def test_login_page_is_open_without_session():
     assert web.is_public_path(web.LOGIN_PATH) is True
 
 
-@pytest.mark.parametrize("path", ["/", "/history", "/run/20260825_080000_abcdef"])
+@pytest.mark.parametrize("path", ["/", "/history", "/run/20260825_080000_abcdef", "/garant", "/garant/abc123"])
 def test_pages_are_closed_without_session(path: str):
     assert web.is_public_path(path) is False
 
@@ -1065,29 +1065,34 @@ def _ready_run(rid: str, status: str = "готов") -> RunProgress:
     return progress
 
 
-def test_dialog_unavailable_for_closed_session(tmp_runs_dir):
-    """Закрытая сессия: панель диалога не показывается — вместо неё строка «Сессия закрыта …»."""
+def test_dialog_available_for_closed_session(tmp_runs_dir):
+    """23.10: закрытая сессия чат не прячет; строка о закрытии говорит, как продолжить."""
     from app import sessions
     rid = "20261013_100000_aaaaaa"
     ready = _ready_run(rid)
-    assert web.dialog_unavailable(rid, ready) is None
     sessions.close_session(rid, by="таймер", now=datetime(2026, 10, 13, 12, 0))
-    text = web.dialog_unavailable(rid, ready)
-    assert text.startswith("Сессия закрыта 13.10.2026 12:00") and "простой" in text and "скачать" in text
+    assert web.dialog_unavailable(rid, ready) is None
+    text = web.session_closed_text(rid)
+    assert text.startswith("Сессия закрыта 13.10.2026 12:00") and "простой" in text and "продолжится" in text
 
 
-def test_dialog_jobs_refuse_closed_session(tmp_runs_dir):
-    """Сервер отклоняет действие диалога по закрытой сессии, даже если окно его прислало."""
+def test_dialog_jobs_reopen_closed_session(tmp_runs_dir):
+    """23.10: первое действие в чате открывает закрытую сессию заново — итог прошлой в sessions/01.json."""
     from app import sessions
     rid = "20261013_100000_bbbbbb"
     _ready_run(rid)
     sessions.close_session(rid, by="пользователь")
 
+    async def job():
+        return None
+
     async def scenario():
         jobs = web.DialogJobs()
-        assert jobs.start(rid, jobs.turn(rid, "ещё")) is False
+        assert jobs.start(rid, job()) is True
 
     asyncio.run(scenario())
+    assert not sessions.is_closed(rid)
+    assert (trace.run_dir(rid) / "sessions" / "01.json").is_file()
 
 
 def test_close_by_user(tmp_runs_dir, tmp_path, monkeypatch):
