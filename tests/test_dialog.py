@@ -12,7 +12,7 @@ import pytest
 import app.dialog as dialog_module
 from app.contracts import DialogTurn, RunMeta, SetVerdict
 from app.runner import CallResult
-from app.trace import load_json, run_dir, save_json
+from app.trace import load_json, read_events, run_dir, save_json
 from test_versions import _write_run
 
 
@@ -26,8 +26,6 @@ def rid(tmp_runs_dir, tmp_path, monkeypatch) -> str:
     prompt = tmp_path / "07_dialog.md"
     prompt.write_text("Промпт 07_dialog (фикстура).", encoding="utf-8")
     monkeypatch.setattr(dialog_module, "PROMPT_DIALOG", prompt)
-    # остаток выгрузок Гаранта — не настоящий запрос к API (каждый ход спрашивает его до и после)
-    monkeypatch.setattr(dialog_module.garant_limits, "limits", lambda fresh=False: None)
     return rid
 
 
@@ -181,34 +179,37 @@ def _write_turn_stream(rid, n: int, tool: str) -> None:
         {"type": "tool_use", "id": "e1", "name": tool, "input": {"topic": 1}}]}}}) + "\n", encoding="utf-8")
 
 
-def test_exports_reported_only_when_spent(rid, monkeypatch):
-    """Выгрузки помощник делает сам; потратил — строка сервиса «потрачено N, осталось M», не тратил — строки нет.
-    15.10: «потрачено» — по удачным вызовам выгрузки самого помощника в этом ходе; строка — перед ответом
-    помощника, чтобы его план оставался последней репликой и ждал решения (web.pending_plan)."""
+def _exports_logged(rid: str) -> list[dict]:
+    return [e for e in read_events(rid) if e["event"] == "garant_exports_spent"]
+
+
+def test_exports_logged_only_when_spent(rid, monkeypatch):
+    """Выгрузки помощник делает сам; потратил — запись «потрачено N» в журнале прогона, не тратил — записи нет. 15.10: «потрачено» — по удачным вызовам выгрузки самого помощника в этом ходе. 27.10: в чат эксперту строка
+    не пишется — его план остаётся последней репликой и ждёт решения (web.pending_plan)."""
     op = SetVerdict(kind="смена вердикта", indicator=7, verdict="нарушен", rationale="15 форм", reason="эксперт")
 
     def _effect(*a, **kw):
         _write_turn_stream(rid, 1, "mcp__garant__garant_export_block_html")
         return _ok(DialogTurn(reply="ок", plan=[op]))
     monkeypatch.setattr(dialog_module, "call", Mock(side_effect=_effect))
-    monkeypatch.setattr(dialog_module.garant_limits, "limits", lambda fresh=False: {"Экспорт": 20})
     dialog_module.turn(rid, "выгрузи п. 5")
     chat = dialog_module.read_chat(rid)
-    assert chat[-1]["role"] == "ассистент" and chat[-1]["plan"][0]["kind"] == "смена вердикта"
-    assert chat[-2]["text"] == "Выгрузок Гаранта потрачено: 1, осталось 20 в этом месяце (на всех пользователей)."
+    assert [e["role"] for e in chat] == ["пользователь", "ассистент"]
+    assert chat[-1]["plan"][0]["kind"] == "смена вердикта"
+    assert [e["spent"] for e in _exports_logged(rid)] == [1]
     monkeypatch.setattr(dialog_module, "call", Mock(return_value=_ok(DialogTurn(reply="ок"))))
     dialog_module.turn(rid, "а теперь вопрос")
     assert dialog_module.read_chat(rid)[-1]["role"] == "ассистент"
+    assert len(_exports_logged(rid)) == 1
 
 
 def test_exports_of_parallel_run_not_attributed_to_assistant(rid, monkeypatch):
     """15.10 (код-ревью): остаток выгрузок общий — пока помощник отвечал, выгрузку потратил параллельный прогон;
-    помощник ничего не выгружал — строки «потрачено» нет."""
+    помощник ничего не выгружал — записи «потрачено» нет."""
     monkeypatch.setattr(dialog_module, "call", Mock(return_value=_ok(DialogTurn(reply="ок"))))
-    left = iter([21, 20, 20, 20])
-    monkeypatch.setattr(dialog_module.garant_limits, "limits", lambda fresh=False: {"Экспорт": next(left)})
     dialog_module.turn(rid, "вопрос")
     assert dialog_module.read_chat(rid)[-1]["role"] == "ассистент"
+    assert _exports_logged(rid) == []
 
 
 def test_temporary_resume_failure_keeps_session(rid, monkeypatch):
@@ -291,7 +292,7 @@ def test_failed_resume_updates_cost_base(rid, monkeypatch):
 
 def test_failed_export_call_not_counted(rid, monkeypatch):
     """15.10 (повторное ревью): вызов выгрузки, на который Гарант ответил ошибкой (лимит, нет документа), выгрузку
-    не тратит — строки «потрачено» нет."""
+    не тратит — записи «потрачено» нет."""
     import json
 
     def _effect(*a, **kw):
@@ -302,6 +303,6 @@ def test_failed_export_call_not_counted(rid, monkeypatch):
                  "content": [{"type": "text", "text": "лимит исчерпан"}]}]}}}) + "\n")
         return _ok(DialogTurn(reply="ок"))
     monkeypatch.setattr(dialog_module, "call", Mock(side_effect=_effect))
-    monkeypatch.setattr(dialog_module.garant_limits, "limits", lambda fresh=False: {"Экспорт": 0})
     dialog_module.turn(rid, "выгрузи п. 5")
     assert [e["role"] for e in dialog_module.read_chat(rid)] == ["пользователь", "ассистент"]
+    assert _exports_logged(rid) == []

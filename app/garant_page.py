@@ -29,8 +29,8 @@ MAX_UPLOAD_MB = 20                          # как на странице за�
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 POLL_S = 1.0                                # как часто страница смотрит, не появилось ли новое в беседе
 _URL_RE = re.compile(r"https?://[^\s<>\"']+")
-# Строки сервиса в беседе: метка → значок и цвет
-_MARKS = {"документ": ("description", "primary"), "лимиты": ("account_balance_wallet", "amber-8"),
+# Строки сервиса в беседе: метка → значок и цвет (27.10: «документ» тёмно-серым — красный только у сбоя)
+_MARKS = {"документ": ("description", "ink"), "лимиты": ("account_balance_wallet", "amber-8"),
           "сбой": ("error", "negative")}
 
 
@@ -73,7 +73,7 @@ def register(layout: Callable[[Who], None], who_of: Callable[[Request], Who]) ->
 
         with ui.column().classes("w-full items-center p-8"):
             with ui.card().classes("w-full max-w-3xl p-6 gap-4"):
-                ui.label("Гарант-помощник").classes("text-xl font-medium")
+                ui.label("Гарант-помощник").classes("text-xl font-bold")
                 ui.label("Приложите документ и спрашивайте: действует ли акт, какие у него редакции, на какие "
                          "акты он ссылается, есть ли судебная практика. Помощник ищет в Гаранте и в интернете, "
                          "отвечает со ссылками и по просьбе делает файл — справку, таблицу.").classes(
@@ -87,8 +87,6 @@ def register(layout: Callable[[Who], None], who_of: Callable[[Request], Who]) ->
                         ui.link(chat["title"], f"/garant/{chat['chat_id']}").classes("text-primary")
                         when = (chat["created_at"] or "")[:16].replace("T", " ")
                         meta = f"{when} · сообщений {chat['messages']} · документов {chat['documents']}"
-                        if chat["cost_usd"]:
-                            meta += f" · ${chat['cost_usd']:.2f}"
                         ui.label(meta).classes("text-xs text-gray-500 whitespace-nowrap")
 
     @ui.page("/garant/{chat_id}")
@@ -118,7 +116,7 @@ class _ChatView:
         with ui.column().classes("w-full items-center p-6"):
             with ui.card().classes("w-full max-w-4xl p-6 gap-3"):
                 with ui.row().classes("w-full items-baseline justify-between"):
-                    self._title = ui.label("").classes("text-xl font-medium")
+                    self._title = ui.label("").classes("text-xl font-bold")
                     ui.link("Все беседы", "/garant").classes("text-sm text-primary")
                 self._docs = ui.label("").classes("text-sm text-gray-700")
                 with ui.row().classes("w-full items-center gap-3"):
@@ -135,7 +133,7 @@ class _ChatView:
                     self._limits = ui.label("").classes("text-xs text-gray-500")
                 with ui.scroll_area().classes("w-full h-[55vh] border rounded") as self._scroll:
                     self._chat = ui.column().classes("w-full gap-2 p-2")
-                self._status = ui.label("").classes("text-sm text-primary")
+                self._status = ui.label("").classes("text-sm text-ink")   # 27.10: «идёт» тёмно-серым
                 with ui.row().classes("w-full items-end flex-nowrap gap-2"):
                     self._input = ui.textarea(placeholder="Сообщение помощнику (Ctrl+Enter — отправить)").props(
                         "autogrow outlined").classes("flex-grow")
@@ -189,8 +187,6 @@ class _ChatView:
                         ui.label(message["text"]).classes("text-sm text-gray-800 whitespace-pre-line")
                     continue
                 stamp = message.get("at", "")[11:16]
-                if message.get("cost_usd"):
-                    stamp += f" · ${message['cost_usd']:.2f}"
                 if message["role"] == "пользователь":
                     ui.chat_message(text=message["text"], name="Вы", sent=True, stamp=stamp).classes("w-full")
                     continue

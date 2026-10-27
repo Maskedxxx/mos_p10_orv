@@ -381,7 +381,6 @@ def test_history_row_carries_act_name_duration_status_and_cost(tmp_runs_dir):
     assert item.status == "готов"
     assert item.cost_usd == 16.38
     assert web.format_elapsed(item.duration_s) == "7 мин 04 сек"
-    assert web.format_cost(item.cost_usd) == "$16.38"
 
 
 def test_history_shows_unfinished_run_without_duration(tmp_runs_dir):
@@ -533,6 +532,13 @@ def test_login_page_is_open_without_session():
 @pytest.mark.parametrize("path", ["/", "/history", "/run/20260825_080000_abcdef", "/garant", "/garant/abc123", "/feedback"])
 def test_pages_are_closed_without_session(path: str):
     assert web.is_public_path(path) is False
+
+
+def test_brand_files_open_without_session():
+    """27.10: шрифт и эмблемы нужны самой форме входа."""
+    assert web.is_public_path("/brand/fonts/TTMoscowEconomy-Regular.woff2") is True
+    assert web.is_public_path("/brand/login_band.svg") is True
+    assert web.is_public_path("/brandbook") is False
 
 
 def test_ready_excel_is_closed_without_session():
@@ -853,20 +859,12 @@ def test_op_title_for_every_operation_kind():
     assert "строка карты 2" in title and "число жалоб" in title and "нигде не ведётся" in title
 
 
-def test_estimate_cost_from_raw_traces_of_the_run(tmp_runs_dir):
-    rid = "run_cost"
-    trace.save_bytes(rid, "03_verdicts/03.raw.json", json.dumps([{"type": "x"}, {"total_cost_usd": 2.2}]).encode())
-    trace.save_bytes(rid, "05_hypotheses/06.raw.json", json.dumps([{"total_cost_usd": 0.3}]).encode())
-    trace.save_bytes(rid, "05_hypotheses/09.raw.json", json.dumps([{"total_cost_usd": 0.5}]).encode())
+def test_agent_note_without_cost():
+    """27.10: у шага плана — только делает ли его агент; стоимость эксперту не показываем."""
     recheck = RecheckIndicator(kind="перепроверить индикатор", indicator=3, clarification="c", reason="r")
-    assert web.estimate_cost(rid, recheck) == pytest.approx(2.2)
-    assert web.estimate_cost(rid, BuildHypotheses(kind="построить гипотезы", indicator=7, reason="r")) == pytest.approx(0.4)
-    append = AppendRequest(kind="дополнить запрос", row_ids=[8], reason="r")
-    assert web.estimate_cost(rid, append) is None                     # сырого ответа нет — цена после выполнения
-    assert web.cost_note(append, None) == "агент · цена — после выполнения"
-    assert web.cost_note(recheck, 2.2) == "агент · ≈ $2.20"
-    free = DeleteMapRow(kind="удалить строку карты", row_id=1, reason="r")
-    assert web.estimate_cost(rid, free) is None and web.cost_note(free, None) == "без агента · бесплатно"
+    assert web.agent_note(recheck) == "агент"
+    assert web.agent_note(AppendRequest(kind="дополнить запрос", row_ids=[8], reason="r")) == "агент"
+    assert web.agent_note(DeleteMapRow(kind="удалить строку карты", row_id=1, reason="r")) == "без агента"
 
 
 def test_pending_plan_only_right_after_assistant():
@@ -1002,7 +1000,7 @@ def test_dialog_jobs_plan_waits_for_decision_on_server(tmp_runs_dir, monkeypatch
     assert [m.get("mark") for m in chat] == [None, "шаг", "шаг", "готово"]
     assert {m.get("session") for m in chat} == {"s-aaaaaa"}   # кто применял план — у каждой строки
     assert chat[-1]["text"].startswith("Готово: план применён (2 из 2 шагов)")
-    assert web.dialog_spent(chat) == pytest.approx(1.5)
+    assert sum(m.get("cost_usd") or 0.0 for m in chat) == pytest.approx(1.5)   # стоимость записана (на экран не идёт)
     assert dialog.read_status(rid) is None
 
 
@@ -1070,10 +1068,10 @@ def test_dialog_available_for_closed_session(tmp_runs_dir):
     from app import sessions
     rid = "20261013_100000_aaaaaa"
     ready = _ready_run(rid)
+    assert web.session_closed_text(rid) is None
     sessions.close_session(rid, by="таймер", now=datetime(2026, 10, 13, 12, 0))
     assert web.dialog_unavailable(rid, ready) is None
-    text = web.session_closed_text(rid)
-    assert text.startswith("Сессия закрыта 13.10.2026 12:00") and "простой" in text and "продолжится" in text
+    assert web.session_closed_text(rid) == "Чтобы продолжить, напишите в чат."   # 27.10: только как продолжить
 
 
 def test_dialog_jobs_reopen_closed_session(tmp_runs_dir):
@@ -1136,7 +1134,24 @@ def test_sources_html_links_and_escapes():
     assert "Вердикты, индикатор 3" in out and web.sources_html([]) == ""
 
 
-def test_limits_text():
-    assert web.limits_text({"Экспорт": 21, "Постановка ссылки": 929, "Информация о документе": 299}) == \
-        "Гарант в этом месяце: выгрузки 21 из 30, постановка ссылки 929 из 1000"
-    assert "не удалось" in web.limits_text(None)
+def test_start_hint_says_what_is_missing():
+    """27.10 (удобство): под бледной «Проанализировать» — чего не хватает."""
+    assert web.start_hint(False, False) == "Чтобы начать, загрузите файл акта и отметьте тип акта."
+    assert web.start_hint(True, False) == "Чтобы начать, отметьте тип акта."
+    assert web.start_hint(False, True) == "Чтобы начать, загрузите файл акта."
+    assert web.start_hint(True, True) == ""
+
+
+@pytest.mark.parametrize("path, section", [
+    ("/", "/"), ("/history", "/history"), ("/run/20261023_141113_f26759", "/history"), ("/garant", "/garant"),
+    ("/garant/abc123", "/garant"), ("/feedback", "/feedback"), ("/login", None),
+])
+def test_menu_section(path: str, section: str | None):
+    """27.10: текущий раздел в меню; прогон — в «Истории», беседа — в «Беседах»."""
+    assert web.menu_section(path) == section
+
+
+def test_version_zero_reads_as_original():
+    """27.10: «версия 0» эксперту непонятна — на панели «исходная версия»."""
+    assert web.panel_state([], None, True, 0, _now()).detail == "Файл — исходная версия. Можно спрашивать или давать правки"
+    assert web.version_label(2) == "версия 2"

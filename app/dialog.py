@@ -25,7 +25,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 
-from app import garant_limits, versions
+from app import versions
 from app.config import ALLOWED_TOOLS_WEB, DIALOG_MODEL, GARANT_ALL_TOOLS, GARANT_MCP_CONFIG, PROJECT_ROOT, PROMPT_DIALOG
 from app.contracts import DialogTurn, Operation, Remark
 from app.nodes.hypotheses import _add_cost_to_meta
@@ -53,8 +53,9 @@ MCP_CONFIG = "dialog/mcp.json"    # серверы MCP помощника: Га�
 # Инструменты чтения артефактов прогона (app/mcp_run.py, сервер p10run в dialog/mcp.json)
 RUN_TOOLS = ["mcp__p10run__list_artifacts", "mcp__p10run__read_artifact"]
 # Гарант в чате (решение владельца 14.10): все инструменты всегда, и лимитированные. Набор за сессию не меняется —
-# смена инструментов посреди сессии сбрасывает кэш. Выгрузки (30 в месяц на всех) помощник делает сам и предупреждает:
-# пишет в ответе, а в ходе с выгрузкой сервис дописывает в чат «потрачено N, осталось M» перед ответом (_report_exports)
+# смена инструментов посреди сессии сбрасывает кэш. Выгрузки (30 в месяц на всех) помощник делает сам и предупреждает
+# в ответе; сколько потрачено — в журнал прогона (_log_exports). 27.10: строку об этом в чат эксперту больше
+# не пишем — лимиты Гаранта эксперту не показываем; остаток виден на странице Гаранта-помощника
 GARANT_TOOLS = list(GARANT_ALL_TOOLS)
 # Задание первого хода новой сессии; роль и правила — в системном промпте (промпт 07)
 NEW_SESSION_INSTRUCTION = "Ответь на сообщение пользователя — оно последним блоком входа."
@@ -238,8 +239,7 @@ def turn(run_id: str, message: str, *, session: str | None = None, timeout_s: in
     ok = result.ok and result.value is not None
     log_event(run_id, "dialog_turn", ok=ok, version=current, cost_usd=round(cost, 4),
               session_id=cli["session_id"] if cli else None)
-    # Строка о выгрузках — перед ответом помощника: его план должен остаться последней репликой (web.pending_plan)
-    _report_exports(run_id, n, session)
+    _log_exports(run_id, n)   # выгрузки Гаранта за ход — в журнал прогона
     if not ok:
         reply = f"Не получилось ответить: {result.error or 'неизвестная ошибка'}. Попробуйте ещё раз."
         append_chat(run_id, "ассистент", reply, cost_usd=round(cost, 4), mark="сбой")
@@ -338,17 +338,14 @@ def _turn_exports(run_id: str, n: int) -> int:
                and str(u.get("id")) not in errors)
 
 
-def _report_exports(run_id: str, n: int, session: str | None) -> None:
-    """После хода, в котором помощник выгружал из Гаранта, — строка в чат: сколько потрачено и сколько осталось.
-    15.10 (код-ревью): «потрачено» — по вызовам выгрузки самого помощника в этом ходе: общий остаток тратят и
-    параллельные прогоны. Не выгружал — строки нет."""
+def _log_exports(run_id: str, n: int) -> None:
+    """После хода, в котором помощник выгружал из Гаранта, — запись в журнал прогона: сколько потрачено.
+    15.10 (код-ревью): «потрачено» — по вызовам выгрузки самого помощника в этом ходе (общий остаток тратят и
+    параллельные прогоны). Не выгружал — записи нет. 27.10: в чат эксперту строку больше не пишем, остаток в журнал
+    не запрашиваем — его никто не читал, а запрос к Гаранту шёл каждый такой ход."""
     spent = _turn_exports(run_id, n)
-    if not spent:
-        return
-    left = (garant_limits.limits(fresh=True) or {}).get(garant_limits.EXPORT)
-    tail = f", осталось {left} в этом месяце (на всех пользователей)" if left is not None else ""
-    append_chat(run_id, "сервис", f"Выгрузок Гаранта потрачено: {spent}{tail}.", mark="лимиты", session=session)
-    log_event(run_id, "garant_exports_spent", spent=spent, left=left)
+    if spent:
+        log_event(run_id, "garant_exports_spent", spent=spent)
 
 
 def _now() -> str:

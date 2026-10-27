@@ -46,6 +46,8 @@ NICEGUI_STORAGE_DIR = PROJECT_ROOT / "var" / "nicegui"
 LOGS_DIR = PROJECT_ROOT / "var" / "logs"
 # 23.10: замечания «Сообщить о проблеме» (app/problems.py) — одна таблица на весь сервис
 FEEDBACK_DIR = PROJECT_ROOT / "var" / "feedback"
+# 27.10: файлы фирменного стиля (шрифт, эмблемы) — app/brand.py; вне git: репозиторий публичный
+BRAND_DIR = PROJECT_ROOT / "var" / "brand"
 
 # Сколько прогонов идёт одновременно (веб-страница app/web.py): остальные ждут в
 # очереди и стартуют сами, как только освободится слот. Один прогон — семь минут

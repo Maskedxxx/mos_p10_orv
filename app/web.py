@@ -60,7 +60,6 @@ from __future__ import annotations
 import asyncio
 import hmac
 import html
-import json
 import math
 import os
 import re
@@ -82,7 +81,7 @@ from nicegui.storage import Storage
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.responses import Response
 
-from app import config, dialog, feedback, garant_limits, garant_page, operations, problems, sessions, trace, versions
+from app import brand, config, dialog, feedback, garant_page, operations, problems, sessions, trace, versions
 from app.actions import Who, log_action, session_label
 from app.config import ACCEPTED_EXTENSIONS, SEARCH_LIMITS, all_indicators
 from app.mandatory_indicators import ACT_TYPES, NO_TYPE
@@ -149,11 +148,6 @@ def format_elapsed(seconds: float) -> str:
     return f"{total // 60} мин {total % 60:02d} сек"
 
 
-def format_cost(usd: float) -> str:
-    """Накопленная стоимость прогона: «$6.40»."""
-    return f"${usd:.2f}"
-
-
 def format_moment(moment: datetime | None) -> str:
     """Дата и время прогона для экрана истории: «25.08.2026 08:13»."""
     return moment.strftime("%d.%m.%Y %H:%M") if moment is not None else "—"
@@ -211,6 +205,12 @@ def can_start(has_file: bool, act_types: set[str]) -> bool:
     """Кнопка «Проанализировать»: файл принят и выбран хотя бы один тип акта (14.10: поле регионов сравнения
     убрано — сравнение с регионами снято у индикаторов 7, 8, 11 до БЛ-3)."""
     return has_file and bool(act_types)
+
+
+def start_hint(has_file: bool, has_type: bool) -> str:
+    """Подсказка под бледной «Проанализировать» (27.10, удобство): чего не хватает для запуска; всё есть — пусто."""
+    missing = [text for ok, text in ((has_file, "загрузите файл акта"), (has_type, "отметьте тип акта")) if not ok]
+    return f"Чтобы начать, {' и '.join(missing)}." if missing else ""
 
 
 def validate_upload(filename: str, size: int) -> str | None:
@@ -473,17 +473,15 @@ DIALOG_READ_ONLY = "Этот прогон правят в другом окне 
 _OPERATION = TypeAdapter(Operation)
 
 
+SESSION_CLOSED_TEXT = "Чтобы продолжить, напишите в чат."
+
+
 def session_closed_text(run_id: str) -> str | None:
-    """Строка «Сессия закрыта …» для страницы; None — сессия открыта (2.7, конец сессии)."""
-    if not sessions.is_closed(run_id):
-        return None
-    try:
-        summary = json.loads((trace.run_dir(run_id) / sessions.SESSION_SUMMARY_FILE).read_text(encoding="utf-8"))
-        when = format_moment(parse_moment(summary.get("closed_at")))
-        by = "кнопкой «Завершить работу»" if summary.get("closed_by") == "пользователь" else "сама — простой больше часа"
-    except (OSError, ValueError):
-        when, by = "—", "причина не прочитана"
-    return f"Сессия закрыта {when} ({by}). Напишите сообщение в чат — работа продолжится."
+    """
+    Строка над чатом закрытой сессии (2.7, конец сессии); None — сессия открыта. 27.10 (удобство): эксперту —
+    только как продолжить; когда и почему закрыта — в sessions/ прогона и журнале действий.
+    """
+    return SESSION_CLOSED_TEXT if sessions.is_closed(run_id) else None
 
 
 def dialog_unavailable(run_id: str, progress: RunProgress | None) -> str | None:
@@ -560,37 +558,9 @@ def op_title(op: Operation) -> str:
     return f"Дополнить запрос под строки карты {', '.join(map(str, op.row_ids))} агентом запроса"
 
 
-def _raw_cost(run_id: str, relname: str) -> float | None:
-    """Стоимость вызова из его сырого ответа (последняя запись CLI — итог с total_cost_usd)."""
-    try:
-        data = json.loads((trace.run_dir(run_id) / relname).read_text(encoding="utf-8"))
-        return float((data[-1] if isinstance(data, list) else data)["total_cost_usd"])
-    except Exception:
-        return None
-
-
-def estimate_cost(run_id: str, op: Operation) -> float | None:
-    """
-    Цена платного шага до запуска — сколько тот же агент стоил в исходном прогоне
-    этого акта. None — шаг без агента или сырого ответа нет (цена будет после выполнения).
-    """
-    if op.kind == "перепроверить индикатор":
-        return _raw_cost(run_id, f"03_verdicts/{op.indicator:02d}.raw.json")
-    if op.kind == "построить гипотезы":
-        folder = trace.run_dir(run_id) / "05_hypotheses"
-        costs = [c for p in sorted(folder.glob("[0-9][0-9].raw.json"))
-                 if (c := _raw_cost(run_id, f"05_hypotheses/{p.name}")) is not None]
-        return sum(costs) / len(costs) if costs else None
-    if op.kind == "дополнить запрос":
-        return _raw_cost(run_id, "07_request.raw.json")
-    return None
-
-
-def cost_note(op: Operation, cost: float | None) -> str:
-    """Подпись цены у шага плана."""
-    if not operations.is_model_op(op):
-        return "без агента · бесплатно"
-    return "агент · цена — после выполнения" if cost is None else f"агент · ≈ {format_cost(cost)}"
+def agent_note(op: Operation) -> str:
+    """Подпись у шага плана: делает ли его агент (27.10: без цены — стоимость эксперту не показываем)."""
+    return "агент" if operations.is_model_op(op) else "без агента"
 
 
 def pending_plan(chat: list[dict]) -> list[Operation]:
@@ -634,11 +604,6 @@ def version_rows(run_id: str) -> list[tuple[int, str]]:
     return rows + [(0, "исходный разбор сервиса")]
 
 
-def dialog_spent(chat: list[dict]) -> float:
-    """Сколько потрачено в диалоге по прогону: ходы помощника и шаги с агентом."""
-    return sum(message.get("cost_usd") or 0.0 for message in chat)
-
-
 # Тон строки состояния: готово — можно работать; работа — идёт действие;
 # решение — ждёт человека; сбой — последнее действие не удалось; просмотр — правят в другом окне
 PanelTone = Literal["готово", "работа", "решение", "сбой", "просмотр"]
@@ -669,13 +634,9 @@ def sources_html(sources: list[str]) -> str:
             + "</div>")
 
 
-def limits_text(left: dict[str, int] | None) -> str:
-    """Строка остатка лимитов Гаранта на панели; None — узнать не удалось."""
-    if left is None:
-        return "Гарант: остаток лимитов узнать не удалось"
-    parts = [f"{title.lower() if title != garant_limits.EXPORT else 'выгрузки'} {left[title]} из {total}"
-             for title, total in garant_limits.MONTHLY.items() if title in left and title != "Информация о документе"]
-    return "Гарант в этом месяце: " + ", ".join(parts)
+def version_label(version: int) -> str:
+    """Версия файла на панели: «версия N»; нулевая — «исходная версия» (27.10: «версия 0» эксперту непонятна)."""
+    return f"версия {version}" if version else "исходная версия"
 
 
 def panel_state(chat: list[dict], status: dict | None, editable: bool, version: int, now: datetime) -> PanelState:
@@ -687,7 +648,7 @@ def panel_state(chat: list[dict], status: dict | None, editable: bool, version: 
         if status.get("server") != dialog.SERVER_ID:
             return PanelState("сбой", "Действие прервано",
                               f"сервис перезапускался во время «{status.get('title', '')}». "
-                              f"Файл — версия {version}; повторите запрос")
+                              f"Файл — {version_label(version)}; повторите запрос")
         if status["state"] == "решение":
             return PanelState("решение", status["title"], status["detail"])
         started = parse_moment(status.get("since"))
@@ -699,8 +660,8 @@ def panel_state(chat: list[dict], status: dict | None, editable: bool, version: 
         return PanelState("решение", "Ждёт вашего решения",
                           "примените или отмените план ниже; новое сообщение отменит план")
     if chat and chat[-1].get("mark") in ("сбой", "частично"):
-        return PanelState("сбой", shorten(chat[-1]["text"].splitlines()[0], 160), f"файл — версия {version}")
-    return PanelState("готово", "Готово", f"Файл — версия {version}. Можно спрашивать или давать правки")
+        return PanelState("сбой", shorten(chat[-1]["text"].splitlines()[0], 160), f"файл — {version_label(version)}")
+    return PanelState("готово", "Готово", f"Файл — {version_label(version)}. Можно спрашивать или давать правки")
 
 
 def plan_summary(total: int, applied: int, rejected: int, failed: int | None, why: str | None,
@@ -952,11 +913,12 @@ def is_public_path(path: str) -> bool:
     """
     Открыт ли адрес без входа.
 
-    Открыты ровно два вида адресов: страница входа и служебные файлы NiceGUI, без
-    которых форма входа не отрисовалась бы. Готовые файлы прогона лежат тоже под
-    /_nicegui/, но закрыты: Excel с разбором акта не должен уезжать по прямой ссылке.
+    Открыты ровно три вида адресов: страница входа, служебные файлы NiceGUI и файлы
+    бренда (шрифт и эмблемы, 27.10) — без них форма входа не отрисовалась бы. Готовые
+    файлы прогона лежат тоже под /_nicegui/, но закрыты: Excel с разбором акта не должен
+    уезжать по прямой ссылке.
     """
-    if path == LOGIN_PATH:
+    if path == LOGIN_PATH or path.startswith(brand.URL + "/"):
         return True
     if path.startswith(NICEGUI_FILES_PREFIX):
         return False
@@ -1072,11 +1034,11 @@ nicegui_app.add_middleware(AuthMiddleware)
 # Отрисовка
 # ======================================================================
 
-# Цвет статуса прогона на экране истории
+# Цвет статуса прогона на экране истории (27.10: «идёт» — тёмно-серым, красный только у сбоя)
 _STATUS_CLASS: dict[str, str] = {
     "готов": "text-green-700",
     "сбой": "text-red-700",
-    "идёт": "text-blue-700",
+    "идёт": "text-ink",
     "в очереди": "text-gray-500",
 }
 
@@ -1111,32 +1073,54 @@ def _logout(who: Who) -> None:
     ui.navigate.to(LOGIN_PATH)
 
 
+def menu_section(path: str) -> str | None:
+    """Какой пункт меню выделить (27.10): адрес пункта; прогон — в «Истории», беседа — в «Беседах»."""
+    if path == "/":
+        return "/"
+    for prefix, target in (("/history", "/history"), ("/run/", "/history"), ("/garant", "/garant"),
+                           ("/feedback", "/feedback")):
+        if path.startswith(prefix):
+            return target
+    return None
+
+
 def _layout(who: Who) -> None:
     """
     Общая шапка и меню слева (23.10, платформа): раздел «Анализ ОРВ» — прогоны по 12 индикаторам,
     раздел «Гарант-помощник» — беседы с агентом по Гаранту (app/garant_page.py); выход — в шапке.
     """
     ui.page_title("Платформа ОРВ · П-10")
+    # Адрес страницы — для замечания о проблеме (23.10) и для выделения текущего раздела в меню (27.10)
+    path = ui.context.client.request.url.path if ui.context.client.request is not None else ""
+    # Шапка по «типовой странице» брендбука (27.10): слева эмблемы Комплекса и ДЭПиР, справа название
     with ui.header().classes("items-center justify-between px-6 py-3"):
-        with ui.row().classes("items-center gap-2"):
-            ui.button(icon="menu", on_click=lambda: drawer.toggle()).props("flat dense round color=white")
-            ui.label("Платформа ОРВ · модуль П-10").classes("text-lg font-medium")
-        with ui.row().classes("items-center gap-2"):
+        with ui.row().classes("items-center gap-8 flex-nowrap"):
+            ui.button(icon="menu", on_click=lambda: drawer.toggle()).props("flat dense round")
+            emblems = brand.url("header.svg")
+            if emblems is not None:
+                ui.element("img").props(f'src="{emblems}" alt="{brand.EMBLEMS_ALT}"').classes("h-11")
+        with ui.row().classes("items-center gap-2 flex-nowrap"):
+            ui.label("Платформа ОРВ · модуль П-10").classes("text-lg font-bold mr-4")
             # 23.10: замечание о проблеме — с любой страницы, адрес страницы запоминается сам
-            path = ui.context.client.request.url.path if ui.context.client.request is not None else ""
             ui.button("Сообщить о проблеме", icon="report_problem",
-                      on_click=lambda: _report_problem(who, path)).props("flat dense color=white")
-            ui.button("Выйти", on_click=lambda: _logout(who)).props("flat dense color=white")
+                      on_click=lambda: _report_problem(who, path)).props("flat dense")
+            ui.button("Выйти", on_click=lambda: _logout(who)).props("flat dense")
     with ui.left_drawer(value=True).classes("bg-gray-50 px-4 py-6 gap-1") as drawer:
-        # Разделы платформы: у каждого свои страницы
+        # Разделы платформы: у каждого свои страницы; текущий раздел — красным (27.10)
+        current = menu_section(path)
+
+        def menu_link(text: str, target: str) -> None:
+            color = "text-primary font-medium" if target == current else "text-gray-900"
+            ui.link(text, target).classes(f"text-sm no-underline py-1 {color}")
+
         ui.label("Анализ ОРВ").classes("text-xs uppercase tracking-wide text-gray-500 font-medium")
-        ui.link("Новый прогон", "/").classes("text-sm no-underline text-gray-900 py-1")
-        ui.link("История", "/history").classes("text-sm no-underline text-gray-900 py-1")
+        menu_link("Новый прогон", "/")
+        menu_link("История", "/history")
         ui.separator().classes("my-3")
         ui.label("Гарант-помощник").classes("text-xs uppercase tracking-wide text-gray-500 font-medium")
-        ui.link("Беседы", "/garant").classes("text-sm no-underline text-gray-900 py-1")
+        menu_link("Беседы", "/garant")
         ui.separator().classes("my-3")
-        ui.link("Обратная связь", "/feedback").classes("text-sm no-underline text-gray-900 py-1")
+        menu_link("Обратная связь", "/feedback")
 
 
 def _report_problem(who: Who, path: str) -> None:
@@ -1179,7 +1163,7 @@ garant_page.register(_layout, _who)
 def _status_icon(status: NodeStatus) -> None:
     """Значок состояния: точка ожидания, крутящийся индикатор, галочка, крест."""
     if status == "идёт":
-        ui.spinner(size="sm", color="primary")
+        ui.spinner(size="sm", color="ink")   # 27.10: «идёт» тёмно-серым — красный только у сбоя
     elif status == "готов":
         ui.icon("check_circle", color="positive").classes("text-xl")
     elif status == "сбой":
@@ -1220,9 +1204,9 @@ class _RunView:
         self._counter: ui.label | None = None
 
         with ui.column().classes("w-full items-center p-8 gap-4"):
-            with ui.card().classes("w-full max-w-3xl p-0"):
+            with ui.card().classes("w-full max-w-3xl p-0") as self._head_card:
                 with ui.column().classes("w-full p-5 gap-1"):
-                    self._act = ui.label(read_act_filename(run_id)).classes("text-lg font-medium")
+                    self._act = ui.label(read_act_filename(run_id)).classes("text-lg font-bold")
                     self._subtitle = ui.label("ожидает запуска").classes("text-sm text-gray-600")
                 ui.separator()
                 self._graph = ui.column().classes("w-full p-5 gap-0")
@@ -1310,13 +1294,13 @@ class _RunView:
     # ---- обновление изменившегося ----
 
     def _update_header(self, progress: RunProgress, state: QueueState) -> None:
-        """Шапка: статус, время с начала прогона, стоимость, занятый слот."""
+        """Шапка: статус, время с начала прогона, занятый слот (27.10: без стоимости — эксперту она не нужна)."""
         started = parse_moment(progress.started_at)
         finished = parse_moment(progress.finished_at)
         # max(0) — на случай подвода часов назад посреди семиминутного прогона
         elapsed = max(0.0, ((finished or datetime.now()) - started).total_seconds()) if started else 0.0
 
-        parts = [f"{progress.status} {format_elapsed(elapsed)}", format_cost(progress.total_cost_usd)]
+        parts = [f"{progress.status} {format_elapsed(elapsed)}"]
         slot = queue_text(state, progress.status)
         if slot:
             parts.append(slot)
@@ -1368,6 +1352,12 @@ class _RunView:
         Экран результата: карточка сводки и скачивания, под ней — диалог с результатом
         (итерация 3). Карточка перерисовывается после каждой новой версии файла.
         """
+        # 27.10 (удобство): прогон готов — шаги сворачиваются в «Как шёл прогон», итог и «Скачать Excel» видны без
+        # прокрутки; при сбое шаги остаются открытыми — по ним видно, где прогон встал (код-ревью 27.10)
+        if progress.status == "готов":
+            with self._head_card:
+                steps = ui.expansion("Как шёл прогон", icon="timeline").classes("w-full")
+            self._graph.move(steps)
         with self._result:
             self._card_box = ui.column().classes("w-full")
         self._draw_result(progress)
@@ -1402,17 +1392,15 @@ class _RunView:
                 else:
                     ui.icon("cancel", color="negative").classes("text-2xl")
                     headline = f"Прогон завершился сбоем через {format_elapsed(elapsed)}"
-                ui.label(f"{headline} · {format_cost(progress.total_cost_usd)}").classes(
-                    "text-lg font-medium"
-                )
+                ui.label(headline).classes("text-lg font-medium")
             ui.separator()
 
             with ui.column().classes("w-full p-5 gap-5"):
                 if not is_ok:
                     node = failed_node(progress)
                     reason = node.error or "причина не записана" if node is not None else "причина не записана"
-                    step = f"шаг «{node.title}»" if node is not None else "шаг не определён"
-                    ui.label(f"Встал на {step}: {reason}").classes("text-sm text-red-700")
+                    step = f"на шаге «{node.title}»" if node is not None else "на неизвестном шаге"
+                    ui.label(f"Встал {step}: {reason}").classes("text-sm text-red-700")
 
                 summary = progress.summary
                 if summary is not None:
@@ -1442,11 +1430,9 @@ class _RunView:
                         "text-sm text-gray-600"
                     )
 
-                # Конец сессии (2.7): закрыта — строка; открыта — кнопка с подтверждением
-                closed = session_closed_text(self._run_id)
-                if closed is not None:
-                    ui.label(closed).classes("text-sm text-gray-700")
-                else:
+                # Конец сессии (2.7): открыта — кнопка с подтверждением; закрыта — как продолжить, сказано
+                # над чатом (27.10: одна строка вместо двух одинаковых)
+                if not sessions.is_closed(self._run_id):
                     ui.button("Завершить работу", icon="task_alt", on_click=self._confirm_close).props("outline")
 
     def _confirm_close(self) -> None:
@@ -1467,7 +1453,7 @@ class _RunView:
         if error is not None:
             ui.notify(error, type="warning")
             return
-        ui.navigate.reload()   # страница заново: со строкой «Сессия закрыта … напишите — продолжится»
+        ui.navigate.reload()   # страница заново: над чатом — «Чтобы продолжить, напишите в чат.»
 
 
 class _DialogView:
@@ -1485,7 +1471,7 @@ class _DialogView:
     # тон строки состояния → значок (None — крутящийся индикатор), цвет значка, фон строки
     _TONES = {
         "готово": ("check_circle", "positive", "bg-green-50"),
-        "работа": (None, "primary", "bg-blue-50"),
+        "работа": (None, "ink", "bg-gray-100"),   # 27.10: «идёт» тёмно-серым — красный только у сбоя
         "решение": ("pending_actions", "warning", "bg-amber-50"),
         "сбой": ("error", "negative", "bg-red-50"),
         "просмотр": ("visibility", "grey-7", "bg-gray-100"),
@@ -1519,10 +1505,7 @@ class _DialogView:
             with ui.row().classes("w-full items-center flex-nowrap gap-3 px-5 py-4"):
                 ui.icon("forum", color="primary").classes("text-2xl")
                 ui.label("Работа с результатом").classes("text-lg font-medium")
-                ui.space()
-                with ui.column().classes("gap-0 items-end"):
-                    self._spent = ui.label("").classes("text-sm text-gray-600 text-right")
-                    self._limits = ui.label("").classes("text-xs text-gray-500 text-right")
+                # 27.10: стоимость диалога и лимиты Гаранта эксперту не показываем
             ui.separator()
             with ui.column().classes("w-full p-5 gap-3"):
                 ui.label(
@@ -1538,7 +1521,7 @@ class _DialogView:
                         self._state_detail = ui.label("").classes("text-sm text-gray-700")
                 # Окно без права правки: почему нет кнопок
                 self._lock_note = ui.label(DIALOG_READ_ONLY).classes("text-sm text-gray-600")
-                self._scroll = ui.scroll_area().classes("w-full h-96 border rounded")
+                self._scroll = ui.scroll_area().classes("w-full h-16 border rounded")
                 with self._scroll:
                     self._chat = ui.column().classes("w-full gap-1 p-2")
                 # Шаги помощника, пока идёт его ход (из файла хода, по таймеру)
@@ -1573,14 +1556,7 @@ class _DialogView:
         self._client.on_connect(lambda: setattr(self, "_disconnected", False))
         self._client.on_disconnect(self._on_disconnect)
         ui.timer(DIALOG_POLL_S, self._tick)
-        ui.timer(garant_limits.CACHE_S, self._refresh_limits)
         self._tick()
-        ui.timer(0.1, self._refresh_limits, once=True)
-
-    async def _refresh_limits(self) -> None:
-        """Остаток лимитов Гаранта — в фоне, не чаще раза в минуту (кэш garant_limits)."""
-        left = await nicegui_run.io_bound(garant_limits.limits)
-        _RunView._set_text(self._limits, limits_text(left))
 
     def _on_disconnect(self) -> None:
         self._disconnected = True
@@ -1597,7 +1573,7 @@ class _DialogView:
             # нужна сразу — иначе первая секунда кнопок молча не работает
             return
         rid = self._run_id
-        # Сессия закрыта (кнопкой или по простою) — панель работает, над чатом строка «напишите — продолжится»
+        # Сессия закрыта (кнопкой или по простою) — панель работает, над чатом «Чтобы продолжить, напишите в чат.»
         closed = session_closed_text(rid)
         self._editable = DIALOG_LOCK.acquire(rid, self._client_id, time.monotonic())
         _RunView._set_text(self._lock_note, closed if closed is not None and self._editable else DIALOG_READ_ONLY)
@@ -1659,9 +1635,10 @@ class _DialogView:
         self._next.set_visibility(left)
         if left:
             _RunView._set_text(self._next, f"Следующее замечание эксперта ({progress[0] + 1} из {progress[1]})")
-        _RunView._set_text(self._spent, f"потрачено в диалоге {format_cost(dialog_spent(chat))}")
 
     def _render_chat(self, chat: list[dict]) -> None:
+        # 27.10 (удобство): пустой чат — низкое поле, с перепиской — прежняя высота
+        self._scroll.classes(remove="h-16 h-96", add="h-96" if chat else "h-16")
         self._chat.clear()
         with self._chat:
             if not chat:
@@ -1680,8 +1657,6 @@ class _DialogView:
                 stamp = message.get("at", "")[11:16]
                 if message.get("session"):
                     stamp += f" · {message['session']}"
-                if message.get("cost_usd"):
-                    stamp += f" · {format_cost(message['cost_usd'])}"
                 ui.chat_message(
                     text=html.escape(message["text"]).replace("\n", "<br>") + sources_html(message.get("sources") or []),
                     text_html=True, name="Вы" if mine else "Помощник", sent=mine, stamp=stamp,
@@ -1701,18 +1676,14 @@ class _DialogView:
         plan = [] if busy else pending_plan(chat)
         if not plan:
             return
-        costs = [estimate_cost(self._run_id, op) for op in plan]
         with self._pending, ui.card().classes("w-full p-4 gap-2 border-l-4 border-amber-400"):
             ui.label(f"План: {len(plan)} {plural(len(plan), 'шаг', 'шага', 'шагов')}").classes("font-medium")
-            for number, (op, cost) in enumerate(zip(plan, costs), 1):
+            for number, op in enumerate(plan, 1):
                 with ui.row().classes("w-full flex-nowrap items-start gap-3"):
                     ui.label(f"{number}. {op_title(op)}").classes("text-sm flex-grow whitespace-pre-line")
-                    ui.label(cost_note(op, cost)).classes("text-xs text-gray-600 whitespace-nowrap")
-            paid = [c for op, c in zip(plan, costs) if operations.is_model_op(op) and c is not None]
-            if paid:
-                ui.label(f"Платные шаги — около {format_cost(sum(paid))}; «было — стало» покажу до записи.").classes(
-                    "text-xs text-gray-600"
-                )
+                    ui.label(agent_note(op)).classes("text-xs text-gray-600 whitespace-nowrap")
+            if any(operations.is_model_op(op) for op in plan):
+                ui.label("По шагам агента «было — стало» покажу до записи.").classes("text-xs text-gray-600")
             if self._editable:
                 with ui.row().classes("gap-2"):
                     ui.button("Применить", icon="check", on_click=lambda: self._apply(plan)).props("unelevated")
@@ -1722,7 +1693,7 @@ class _DialogView:
         with self._pending, ui.card().classes("w-full p-4 gap-2 border-l-4 border-amber-400"):
             ui.label(title).classes("font-medium")
             ui.label(
-                f"Агент отработал, стоимость {format_cost(candidate.cost_usd)}. В файл запишется только после «Принять»."
+                "Агент отработал. В файл запишется только после «Принять»."
             ).classes("text-xs text-gray-600")
             with ui.row().classes("w-full flex-nowrap gap-4 items-start"):
                 for caption, text in (("Было", candidate.before), ("Стало", candidate.after)):
@@ -1745,7 +1716,8 @@ class _DialogView:
             for n, what in rows:
                 path = trace.run_dir(self._run_id) / versions.VERSIONS / f"v{n}" / EXCEL_FILE
                 with ui.row().classes("w-full items-start flex-nowrap gap-3"):
-                    ui.label(f"v{n}" + (" · текущая" if n == current else "")).classes(
+                    # нулевая версия — «исходная», как на панели (version_label; код-ревью 27.10)
+                    ui.label(("исходная" if n == 0 else f"v{n}") + (" · текущая" if n == current else "")).classes(
                         "text-sm font-medium w-28 shrink-0"
                     )
                     ui.label(what).classes("text-sm text-gray-700 flex-grow")
@@ -1786,7 +1758,10 @@ class _DialogView:
 
     def _on_send(self) -> None:
         text = (self._input.value or "").strip()
-        if not text or not self._editable or DIALOG_JOBS.busy(self._run_id):
+        if not text:
+            ui.notify("Напишите сообщение", type="warning")   # 27.10: как в Гаранте — нажатие не уходит молча
+            return
+        if not self._editable or DIALOG_JOBS.busy(self._run_id):
             return
         self._input.set_value("")
         log_action(self._who, "сообщение помощнику", self._run_id, text=shorten(text, 500))
@@ -1875,19 +1850,23 @@ def page_login(request: Request) -> Response | None:
         nicegui_app.storage.user[SESSION_AUTHENTICATED] = True
         ui.navigate.to(safe_referrer(nicegui_app.storage.user.pop(SESSION_REFERRER, None)))
 
-    with ui.header().classes("items-center px-6 py-3"):
-        ui.label("Платформа ОРВ · модуль П-10").classes("text-lg font-medium")
-
+    # Вход по обложке ДЭПиР из брендбука (стр. 70, 27.10): сверху полоса узора с эмблемами, ниже название и форма
+    band = brand.url("login_band.svg")
     with ui.column().classes("w-full items-center p-8"):
-        with ui.card().classes("w-full max-w-sm p-6 gap-4"):
-            ui.label("Вход").classes("text-xl font-medium")
-            ui.label("Страница закрыта паролем. Доступ выдаёт владелец сервиса.").classes(
-                "text-sm text-gray-700"
-            )
-            login = ui.input("Логин").props("outlined autofocus").classes("w-full")
-            password = ui.input("Пароль", password=True).props("outlined").classes("w-full")
-            message = ui.label("").classes("text-sm text-red-700")
-            ui.button("Войти", on_click=try_login).props("unelevated").classes("w-full")
+        with ui.card().classes("w-full max-w-3xl p-0 gap-0 overflow-hidden"):
+            if band is not None:
+                ui.element("img").props(f'src="{band}" alt="{brand.EMBLEMS_ALT}"').classes("w-full block")
+            with ui.column().classes("w-full p-8 gap-6"):
+                ui.label("Платформа ОРВ · модуль П-10").classes("text-3xl font-bold")
+                with ui.column().classes("w-full max-w-sm gap-4"):
+                    ui.label("Вход").classes("text-xl font-medium")
+                    ui.label("Страница закрыта паролем. Доступ выдаёт владелец сервиса.").classes(
+                        "text-sm text-gray-700"
+                    )
+                    login = ui.input("Логин").props("outlined autofocus").classes("w-full")
+                    password = ui.input("Пароль", password=True).props("outlined").classes("w-full")
+                    message = ui.label("").classes("text-sm text-red-700")
+                    ui.button("Войти", on_click=try_login).props("unelevated").classes("w-full")
 
     # Enter в любом из полей — то же самое, что нажать «Войти»
     login.on("keydown.enter", try_login)
@@ -1905,11 +1884,12 @@ def page_index(request: Request) -> None:
     type_boxes: dict[str, ui.checkbox] = {}
 
     def refresh_start() -> None:
-        """Кнопка активна, только когда есть файл и тип акта (2.7)."""
+        """Кнопка активна, только когда есть файл и тип акта (2.7); пока нет — подсказка, чего не хватает (27.10)."""
         if can_start("data" in pending, act_types):
             start.enable()
         else:
             start.disable()
+        hint.set_text(start_hint("data" in pending, bool(act_types)))
 
     def on_type(changed: str, checked: bool) -> None:
         """Отметка типа акта: «нет подходящего типа» снимает остальные и наоборот."""
@@ -1933,6 +1913,12 @@ def page_index(request: Request) -> None:
         pending["name"] = event.file.name
         pending["data"] = await event.file.read()
         chosen.set_text(f"Выбран файл: {event.file.name}")
+        refresh_start()
+
+    def forget_file() -> None:
+        """Файл убран крестиком (27.10): забыть его — иначе «Проанализировать» запустила бы уже убранный файл."""
+        pending.clear()
+        chosen.set_text("")
         refresh_start()
 
     def handle_rejected(_: UiEventArguments) -> None:
@@ -1965,7 +1951,7 @@ def page_index(request: Request) -> None:
 
     with ui.column().classes("w-full items-center p-8"):
         with ui.card().classes("w-full max-w-2xl p-6 gap-4"):
-            ui.label("Карта гипотез по нормативному акту").classes("text-xl font-medium")
+            ui.label("Карта гипотез по нормативному акту").classes("text-xl font-bold")
             ui.label(
                 "Загрузите нормативный акт Москвы в формате .docx, .pdf или .doc. Сервис прогонит его "
                 "через двенадцать индикаторов эффективного регулирования и соберёт Excel "
@@ -1982,10 +1968,12 @@ def page_index(request: Request) -> None:
                     max_file_size=MAX_UPLOAD_BYTES,
                     label="Перетащите файл акта или выберите его",
                 )
-                .props(f'accept="{",".join(ACCEPTED_EXTENSIONS)}" flat bordered')
-                .classes("w-full")
+                # 27.10: шапка поля — светло-серая (была главным цветом — красная плашка читалась как ошибка)
+                .props(f'accept="{",".join(ACCEPTED_EXTENSIONS)}" flat bordered color=grey-2 text-color=ink')
+                .classes("w-full p10-upload")   # p10-upload — без строки «0.0B / 0.00%» (app/brand.py)
             )
-            chosen = ui.label("").classes("text-sm text-primary")
+            upload.on("removed", lambda _: forget_file())
+            chosen = ui.label("").classes("text-sm text-ink")
 
             # 2.7 (АМ): тип акта — от него зависят обязательные показатели бланка
             ui.label("Тип акта (можно несколько)").classes("text-sm font-medium")
@@ -1996,6 +1984,8 @@ def page_index(request: Request) -> None:
 
             start = ui.button("Проанализировать", on_click=start_run).props("unelevated")
             start.disable()
+            # 27.10 (удобство): пока кнопка бледная — подсказка, чего не хватает
+            hint = ui.label(start_hint(False, False)).classes("text-sm text-gray-600")
 
 
 @ui.page("/run/{run_id}")
@@ -2023,7 +2013,7 @@ def page_feedback(request: Request) -> None:
     rows = list(reversed(problems.read_problems()))
     with ui.column().classes("w-full items-center p-8"):
         with ui.card().classes("w-full max-w-5xl p-6 gap-4"):
-            ui.label("Обратная связь").classes("text-xl font-medium")
+            ui.label("Обратная связь").classes("text-xl font-bold")
             ui.label("Замечания, отправленные кнопкой «Сообщить о проблеме» в шапке. Для разбора скачайте их "
                      "одной таблицей.").classes("text-sm text-gray-700")
             ui.button("Скачать Excel", icon="download",
@@ -2051,7 +2041,7 @@ def page_history(request: Request) -> None:
 
     with ui.column().classes("w-full items-center p-8"), ui.card().classes("w-full max-w-4xl p-0"):
         with ui.column().classes("w-full p-5 gap-1"):
-            ui.label("История прогонов").classes("text-lg font-medium")
+            ui.label("История прогонов").classes("text-lg font-bold")
             ui.label("Клик по строке открывает результат прогона.").classes(
                 "text-sm text-gray-600"
             )
@@ -2068,7 +2058,6 @@ def page_history(request: Request) -> None:
             ui.label("Дата").classes("w-36")
             ui.label("Длительность").classes("w-28")
             ui.label("Статус").classes("w-24")
-            ui.label("Стоимость").classes("w-20 text-right")
 
         for item in items:
             row = ui.row().classes(
@@ -2084,7 +2073,6 @@ def page_history(request: Request) -> None:
                 ui.label(item.status).classes(
                     f"w-24 text-sm {_STATUS_CLASS.get(item.status, 'text-gray-700')}"
                 )
-                ui.label(format_cost(item.cost_usd)).classes("w-20 text-sm text-right")
             row.on("click", lambda _, target=item.run_id: ui.navigate.to(f"/run/{target}"))
 
 
@@ -2102,11 +2090,12 @@ def main() -> None:
     app_logger.info("сервис запущен: порт %s", WEB_PORT)
     trace.log_service_event("service_started", port=WEB_PORT, pid=os.getpid(),
                             max_concurrent_runs=config.MAX_CONCURRENT_RUNS, model=config.MODEL)
+    brand.register()   # 27.10: файлы бренда (var/brand/), фирменные цвета, шрифт и стили — на всех страницах
     ui.run(
         host="0.0.0.0",
         port=WEB_PORT,
         title="Платформа ОРВ · П-10",
-        favicon="📊",
+        favicon=brand.favicon(),
         reload=False,
         show=False,
         storage_secret=config.storage_secret(),
