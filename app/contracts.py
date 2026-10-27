@@ -1861,10 +1861,16 @@ class Buckets(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    violated: list[Verdict] = Field(default_factory=list)
-    no_data: list[Verdict] = Field(default_factory=list)
-    checked: list[Verdict] = Field(default_factory=list)
-    failed: list[Verdict] = Field(default_factory=list)
+    violated: list[Verdict] = Field(
+        default_factory=list, description="Вердикты «нарушен» — по каждому строятся гипотезы из нарушений.")
+    no_data: list[Verdict] = Field(
+        default_factory=list, description="Вердикты «нет данных» — по индикаторам 7–12 строятся гипотезы из пробелов "
+                                          "в данных; у 1–6 гипотез нет, это незавершённая проверка по тексту акта.")
+    checked: list[Verdict] = Field(
+        default_factory=list, description="Вердикты «соблюдён» и «не применимо» — нарушений не найдено.")
+    failed: list[Verdict] = Field(
+        default_factory=list, description="Индикаторы, проверка которых не удалась (вердикт «ошибка», ставит код) — "
+                                          "лист «Ошибки прогона».")
 
 
 
@@ -3898,11 +3904,13 @@ class VersionState(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    current: int = 0                                          # текущая версия; 0 — исходный разбор
-    next_row_id: int                                          # следующий свободный номер строки карты
-    next_item_num: int                                        # следующий свободный номер позиции запроса
-    unverified_ids: dict[int, int] = Field(default_factory=dict)  # индикатор → строка «проверка не завершена»
-    marks: Marks = Field(default_factory=Marks)
+    current: int = Field(default=0, description="Текущая версия файла; 0 — исходный разбор сервиса.")
+    next_row_id: int = Field(description="Номер, который получит следующая новая строка карты гипотез.")
+    next_item_num: int = Field(description="Номер, который получит следующая новая позиция запроса показателей.")
+    unverified_ids: dict[int, int] = Field(
+        default_factory=dict, description="Индикатор → номер строки карты «проверка не завершена» (вердикт «нет данных», "
+                                          "по которому гипотез нет); номера закреплены, чтобы не сдвигались в версиях.")
+    marks: Marks = Field(default_factory=Marks, description="Пометки строк Excel: что правил человек и что устарело.")
 
 
 # ---- Файлы чатов (27.10, модульность): реплики, сессия CLI, «что идёт сейчас», сведения о беседе Гаранта ----
@@ -3998,18 +4006,26 @@ class RunMeta(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    run_id: str
-    act_filename: str
-    started_at: str
-    finished_at: str | None = None
-    cost_usd: float = 0.0
-    status: str
-    current_node: str | None = None
+    run_id: str = Field(description="Номер прогона — папка runs/<run_id>: дата, время и короткий код.")
+    act_filename: str = Field(description="Имя файла акта, как его загрузил пользователь.")
+    started_at: str = Field(description="Когда прогон начат, время в ISO-формате.")
+    finished_at: str | None = Field(default=None, description="Когда разбор закончен; пусто — ещё идёт.")
+    cost_usd: float = Field(default=0.0, description="Стоимость всех вызовов модели по прогону, в долларах: разбор, "
+                                                     "а после него — ходы помощника и шаги плана.")
+    status: str = Field(description="Чем кончился разбор: «started» — идёт, «finished» — готов, «failed» — сбой.")
+    current_node: str | None = Field(default=None, description="Не заполняется, всегда пусто; ход разбора по шагам — "
+                                                               "в progress.json.")
     # 2.7 (итерация 4): выбор пользователя при загрузке; у прогонов до 2.7 полей нет — значения по умолчанию
-    act_types: list[str] = Field(default_factory=list)          # тип акта (АМ): обязательные показатели бланка
-    comparison_regions: list[str] | None = None                 # регионы сравнения (К); None — из конфига
-    search_limits: dict[int, int] | None = None                 # потолки поиска по индикаторам (Л); None — из конфига
-    developers: list[str] = Field(default_factory=list)         # орган-разработчик (А), выбор пользователя; пусто — модель
+    act_types: list[str] = Field(   # АМ
+        default_factory=list, description="Типы акта, выбранные при загрузке; по ним в бланк запроса входят "
+                                          "обязательные показатели. Пусто — тип не выбран.")
+    comparison_regions: list[str] | None = Field(   # К
+        default=None, description="Регионы сравнения для практических индикаторов; пусто — регионы по умолчанию.")
+    search_limits: dict[int, int] | None = Field(   # Л
+        default=None, description="Потолок заходов поиска в интернете: номер индикатора → число; пусто — по умолчанию.")
+    developers: list[str] = Field(   # А
+        default_factory=list, description="Орган-разработчик, выбранный пользователем при загрузке; пусто — "
+                                          "разработчика определил паспорт акта.")
 
     @model_validator(mode="after")
     def _check_not_blank(self) -> "RunMeta":
