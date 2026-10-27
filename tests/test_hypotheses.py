@@ -18,6 +18,7 @@ from unittest.mock import Mock
 import pytest
 
 import app.nodes.hypotheses as hyp_module
+import app.trace as trace_module
 from app.contracts import Buckets, DataItem, Effect, Hypothesis, HypothesisSet, RunMeta, Verdict
 from app.nodes.hypotheses import run_hypotheses_no_data, run_hypotheses_violated
 from app.runner import CallResult
@@ -131,7 +132,7 @@ def _make_run(rid: str, *, cost_usd: float = 0.0) -> None:
 
 @pytest.fixture
 def run_id(tmp_runs_dir) -> str:
-    """run_id с уже созданным meta.json (cost_usd=0.0) — _add_cost_to_meta его требует."""
+    """run_id с уже созданным meta.json (cost_usd=0.0) — add_cost его требует."""
     rid = "run_hypotheses_test"
     _make_run(rid)
     return rid
@@ -297,19 +298,19 @@ def test_both_branches_concurrent_dont_lose_cost(tmp_runs_dir, tmp_prompts, monk
     стоимость друг друга при записи в meta.json.
 
     Между чтением текущей стоимости и записью новой искусственно вставлена
-    задержка — без блокировки в _add_cost_to_meta этот тест воспроизводимо
+    задержка — без блокировки в add_cost этот тест воспроизводимо
     ловил бы потерянное обновление (классический read-modify-write race)."""
     rid = "run_race_test"
     _make_run(rid, cost_usd=1.0)  # имитация суммы, уже записанной узлом [2]
 
-    real_load_json = hyp_module.load_json
+    real_load_json = trace_module.load_json   # 27.10: прибавление стоимости — trace.add_cost
 
     def _slow_load_json(*args, **kwargs):
         result = real_load_json(*args, **kwargs)
         time_module.sleep(0.05)  # расширяет окно гонки между чтением и записью
         return result
 
-    monkeypatch.setattr(hyp_module, "load_json", _slow_load_json)
+    monkeypatch.setattr(trace_module, "load_json", _slow_load_json)
 
     def _effect(instruction, document, model_cls, **kwargs):
         n = _n_from_trace_name(kwargs["trace_name"])

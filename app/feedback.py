@@ -22,27 +22,27 @@ from openpyxl import load_workbook
 
 from app.contracts import Remark
 from app.nodes.excel import (
-    _EXPERT_SCORE_COLUMNS,
-    _EXPERT_VERDICT_COLUMNS,
-    _SHEET_MAP,
-    _SHEET_QUESTIONS,
-    _SHEET_REQUEST,
-    _SHEET_VERDICTS,
+    EXPERT_SCORE_COLUMNS,
+    EXPERT_VERDICT_COLUMNS,
+    SHEET_MAP,
+    SHEET_QUESTIONS,
+    SHEET_REQUEST,
+    SHEET_VERDICTS,
 )
 
-_AGREE, _CORRECT, _TEXT, _WHERE = _EXPERT_VERDICT_COLUMNS[0]
-_SCORE = _EXPERT_SCORE_COLUMNS[0][0]
+_AGREE, _CORRECT, _TEXT, _WHERE = EXPERT_VERDICT_COLUMNS[0]
+_SCORE = EXPERT_SCORE_COLUMNS[0][0]
 _TITLE_LEN = 150
 
 # лист → (заголовок, по которому ищется шапка; колонка ключа; колонка «о чём строка»)
 _SHEETS = {
-    _SHEET_VERDICTS: ("Индикатор", "Индикатор", "Индикатор"),
-    _SHEET_MAP: ("Индикаторы", "№", "Гипотеза"),
-    _SHEET_REQUEST: ("Показатель", "№", "Показатель"),
-    _SHEET_QUESTIONS: ("Вопрос", "№", "Вопрос"),
+    SHEET_VERDICTS: ("Индикатор", "Индикатор", "Индикатор"),
+    SHEET_MAP: ("Индикаторы", "№", "Гипотеза"),
+    SHEET_REQUEST: ("Показатель", "№", "Показатель"),
+    SHEET_QUESTIONS: ("Вопрос", "№", "Вопрос"),
 }
 # Листы, которых может не быть в книге прогона до 2.7 — их отсутствие не ошибка
-_OPTIONAL_SHEETS = {_SHEET_QUESTIONS}
+_OPTIONAL_SHEETS = {SHEET_QUESTIONS}
 
 
 def _find_header_row(ws, anchor: str = "Индикаторы") -> int:
@@ -87,7 +87,7 @@ def read_remarks(path: Path) -> list[Remark]:
             if not (agree or correct or score or text or where):
                 continue
             key, title = get(key_col), get(title_col)
-            if sheet == _SHEET_VERDICTS:   # «1. межведомственное взаимодействие»
+            if sheet == SHEET_VERDICTS:   # «1. межведомственное взаимодействие»
                 m = re.match(r"(\d+)\.\s*(.*)", key, re.S)
                 key, title = (m.group(1), m.group(2)) if m else (key, key)
             if len(title) > _TITLE_LEN:
@@ -107,11 +107,11 @@ def summary(remarks: list[Remark]) -> str:
     """Сводка того, что не идёт в очередь: согласия с вердиктами и оценки без текста."""
     quiet = [r for r in remarks if not is_queued(r)]
     parts = []
-    agreed = sum(1 for r in quiet if r.sheet == _SHEET_VERDICTS and r.agree == "да")
+    agreed = sum(1 for r in quiet if r.sheet == SHEET_VERDICTS and r.agree == "да")
     if agreed:
         parts.append(f"вердикты — согласен с {agreed}")
-    for sheet, noun in ((_SHEET_MAP, "строк карты"), (_SHEET_REQUEST, "позиций запроса"),
-                        (_SHEET_QUESTIONS, "вопросов органу")):
+    for sheet, noun in ((SHEET_MAP, "строк карты"), (SHEET_REQUEST, "позиций запроса"),
+                        (SHEET_QUESTIONS, "вопросов органу")):
         # строки без номера (заголовок группы в запросе) — не позиции, в счёт не идут
         scores = [r.score for r in quiet if r.sheet == sheet and r.key and r.score is not None]
         if scores:
@@ -122,10 +122,10 @@ def summary(remarks: list[Remark]) -> str:
 def remark_message(r: Remark) -> str:
     """Замечание — сообщением пользователя в диалог."""
     where = {
-        _SHEET_VERDICTS: f"лист Вердикты, индикатор {r.key} «{r.title}»",
-        _SHEET_MAP: f"Карта гипотез, строка {r.key} («{r.title}»)",
-        _SHEET_REQUEST: f"Запрос показателей, позиция {r.key} («{r.title}»)",
-        _SHEET_QUESTIONS: f"Вопросы органу, вопрос {r.key} («{r.title}»)",
+        SHEET_VERDICTS: f"лист Вердикты, индикатор {r.key} «{r.title}»",
+        SHEET_MAP: f"Карта гипотез, строка {r.key} («{r.title}»)",
+        SHEET_REQUEST: f"Запрос показателей, позиция {r.key} («{r.title}»)",
+        SHEET_QUESTIONS: f"Вопросы органу, вопрос {r.key} («{r.title}»)",
     }[r.sheet]
     if not r.key:   # строка без номера: замечание под таблицей или у заголовка группы
         where = f"общее замечание к листу {r.sheet}" + (f" (у строки «{r.title}»)" if r.title else "")

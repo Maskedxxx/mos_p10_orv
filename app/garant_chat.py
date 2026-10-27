@@ -24,7 +24,7 @@
 Агент отдаёт содержимое (markdown или таблицу), код собирает docx (python-docx), xlsx (openpyxl), md, pdf
 (docx → LibreOffice).
 
-Одновременно идут не больше MAX_PARALLEL_TURNS ходов на весь сервис — подписка одна на прогоны и беседы,
+Одновременно идут не больше config.GARANT_MAX_PARALLEL_TURNS ходов на весь сервис — подписка одна на прогоны и беседы,
 остальные ходы ждут очереди.
 """
 
@@ -39,116 +39,32 @@ import tempfile
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
-
-from pydantic import Field, model_validator
 
 from app import garant_limits, trace
-from app.config import ALLOWED_TOOLS_WEB, DIALOG_MODEL, GARANT_ALL_TOOLS, PROMPTS_DIR
-from app.contracts import _Base
-from app.dialog import _step_text
+from app.chat_common import (
+    CHAT_WHO, GARANT_OFF_NOTE, GARANT_TOOLS, NEW_SESSION_INSTRUCTION, SESSION_GONE, append_chat_file, read_chat_file,
+    tool_step_text, turn_tools,
+)
+from app.config import ALLOWED_TOOLS_WEB, DIALOG_MODEL, GARANT_MAX_PARALLEL_TURNS, HISTORY_MESSAGES, PROMPT_GARANT_CHAT
+from app.contracts import (
+    ChatEntry, CliSession, GarantChatInfo, GarantDocument, GarantFile, GarantTable, GarantTurn,
+)
 from app.nodes.convert import convert_to_markdown
 from app.runner import call, garant_available
-from app.trace import log_event, run_dir
+from app.trace import DOCUMENT_FILE, log_event, run_dir
 
-PROMPT_GARANT_CHAT = PROMPTS_DIR / "08_garant_chat.md"
 CHATS = "garant"                 # папка бесед внутри runs/
 CHAT_INFO = "chat.json"
 CHAT = "chat.jsonl"
 SESSION = "session.json"
 FILES = "files"
 DOCS = "docs"
-HISTORY_MESSAGES = 16            # сколько последних реплик уходит агенту в начале новой сессии (как у помощника)
-MAX_PARALLEL_TURNS = 2           # ходов одновременно на весь сервис
-SESSION_GONE = "No conversation found"   # что пишет CLI, когда сессии для --resume у него нет
-NEW_SESSION_INSTRUCTION = "Ответь на сообщение пользователя — оно последним блоком входа."
-GARANT_OFF_NOTE = ("Гарант сейчас недоступен (нет файла токена): инструментов Гаранта в этом ходе нет. "
-                   "Если пользователь просит найти или проверить в Гаранте — скажи ему об этом.")
-GARANT_TOOLS = list(GARANT_ALL_TOOLS)
 FILE_FORMATS = ("docx", "xlsx", "md", "pdf")
 _CHAT_ID_RE = re.compile(r"^\d{8}_\d{6}_[0-9a-f]{6}$")
-_ROLES = ("пользователь", "ассистент", "сервис")
-_CHAT_WHO = {"пользователь": "пользователь", "ассистент": "помощник", "сервис": "система"}
 
-_SLOTS = threading.BoundedSemaphore(MAX_PARALLEL_TURNS)
+_SLOTS = threading.BoundedSemaphore(GARANT_MAX_PARALLEL_TURNS)
 _BUSY: dict[str, str] = {}       # chat_id → «в очереди» / «ищет»: что идёт по беседе прямо сейчас (в этом процессе)
 _BUSY_LOCK = threading.Lock()
-
-
-# ---- Контракт ответа агента ----
-
-class GarantTable(_Base):
-    """Таблица для файла Excel."""
-
-    headers: list[str] = Field(
-        min_length=1,
-        description="Заголовки столбцов по порядку, коротко и по-русски.",
-    )
-    rows: list[list[str]] = Field(
-        description="Строки таблицы: в каждой столько ячеек, сколько заголовков, по порядку столбцов. "
-                    "Значения — текстом, как их должен увидеть читатель.",
-    )
-
-
-class GarantFile(_Base):
-    """Файл на скачивание: содержимое даёт агент, собирает его сервис."""
-
-    purpose: str = Field(
-        min_length=1,
-        description="Что это за файл и почему выбран этот формат — одна фраза. Например: «справка по найденным "
-                    "редакциям — Word, пользователь просил документ».",
-    )
-    name: str = Field(
-        min_length=1,
-        description="Имя файла по-русски, без расширения и без пути: «Справка по редакциям акта».",
-    )
-    format: Literal["docx", "xlsx", "md", "pdf"] = Field(
-        description="Формат файла. «docx» — документ Word (по умолчанию для справок и записок). «xlsx» — таблица "
-                    "Excel, когда пользователь просит таблицу или данных много и они по столбцам. «pdf» — когда "
-                    "пользователь просит PDF. «md» — когда просит markdown или простой текст.",
-    )
-    text: str | None = Field(
-        default=None,
-        description="Содержимое для docx, pdf и md — markdown: заголовки «#», «##», «###», списки «- » и «1. », "
-                    "абзацы, таблицы в виде «| a | b |». Для xlsx — null.",
-    )
-    table: GarantTable | None = Field(
-        default=None,
-        description="Содержимое для xlsx — таблица. Для docx, pdf и md — null.",
-    )
-
-    @model_validator(mode="after")
-    def _content_matches_format(self) -> "GarantFile":
-        # Для каждого формата — своё содержимое: иначе файл собрать не из чего
-        if self.format == "xlsx" and self.table is None:
-            raise ValueError("для xlsx нужна таблица table")
-        if self.format != "xlsx" and not (self.text or "").strip():
-            raise ValueError(f"для {self.format} нужен текст text")
-        return self
-
-
-class GarantTurn(_Base):
-    """Ответ агента на одно сообщение пользователя."""
-
-    reply: str = Field(
-        min_length=1,
-        description="Ответ пользователю по-русски, в markdown: по существу, со ссылками на найденные документы "
-                    "(реквизиты, пункт). Только факты, которые ты прочитал инструментами в этом разговоре или нашёл "
-                    "в тексте приложенного документа; чего не нашёл — так и скажи. Если сделан файл — одной "
-                    "фразой, что в нём.",
-    )
-    sources: list[str] = Field(
-        default_factory=list,
-        description="Откуда взяты факты ответа, по одному источнику на элемент: документ Гаранта — реквизиты и "
-                    "что в нём (редакция, пункт); страница интернета — адрес и что на ней; приложенный документ — "
-                    "«документ пользователя, п. 2.8». Только то, что ты действительно прочитал. Пусто — в ответе "
-                    "нет фактов (уточняющий вопрос).",
-    )
-    files: list[GarantFile] = Field(
-        default_factory=list,
-        description="Файлы на скачивание — только когда пользователь просит файл, документ, таблицу или "
-                    "выгрузку. Иначе пусто.",
-    )
 
 
 @dataclass
@@ -186,17 +102,18 @@ def new_chat(session: str | None = None) -> str:
     """Создать беседу: папка и chat.json. Выход: номер беседы (дата, время и код, как у прогона)."""
     chat_id = f"{datetime.datetime.now():%Y%m%d_%H%M%S}_{secrets.token_hex(3)}"
     _write_json(run_dir(chat_run_id(chat_id)) / CHAT_INFO,
-                {"title": "", "created_at": _now(), "created_by": session, "documents": []})
+                GarantChatInfo(title="", created_at=_now(), created_by=session).model_dump(mode="json"))
     log_event(chat_run_id(chat_id), "garant_chat_created", who="пользователь", session=session)
     return chat_id
 
 
-def chat_info(chat_id: str) -> dict:
-    return json.loads((run_dir(chat_run_id(chat_id)) / CHAT_INFO).read_text(encoding="utf-8"))
+def chat_info(chat_id: str) -> GarantChatInfo:
+    return GarantChatInfo.model_validate_json((run_dir(chat_run_id(chat_id)) / CHAT_INFO).read_text(encoding="utf-8"))
 
 
 def _update_info(chat_id: str, **fields) -> None:
-    _write_json(run_dir(chat_run_id(chat_id)) / CHAT_INFO, {**chat_info(chat_id), **fields})
+    info = GarantChatInfo.model_validate({**chat_info(chat_id).model_dump(), **fields})
+    _write_json(run_dir(chat_run_id(chat_id)) / CHAT_INFO, info.model_dump(mode="json"))
 
 
 def list_chats() -> list[dict]:
@@ -213,32 +130,24 @@ def list_chats() -> list[dict]:
         except (OSError, ValueError):
             continue
         chat = read_chat(path.name)
-        out.append({"chat_id": path.name, "title": info.get("title") or "Без названия",
-                    "created_at": info.get("created_at"), "created_by": info.get("created_by"),
-                    "messages": sum(1 for m in chat if m["role"] != "сервис"),
-                    "documents": len(info.get("documents") or []),
-                    "cost_usd": round(sum(m.get("cost_usd") or 0.0 for m in chat), 4)})
+        out.append({"chat_id": path.name, "title": info.title or "Без названия",
+                    "created_at": info.created_at, "created_by": info.created_by,
+                    "messages": sum(1 for m in chat if m.role != "сервис"),
+                    "documents": len(info.documents),
+                    "cost_usd": round(sum(m.cost_usd or 0.0 for m in chat), 4)})
     out.sort(key=lambda c: c["chat_id"], reverse=True)
     return out
 
 
-def read_chat(chat_id: str) -> list[dict]:
-    path = run_dir(chat_run_id(chat_id)) / CHAT
-    if not path.is_file():
-        return []
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+def read_chat(chat_id: str) -> list[ChatEntry]:
+    return read_chat_file(run_dir(chat_run_id(chat_id)) / CHAT)
 
 
-def append_chat(chat_id: str, role: str, text: str, **extra) -> dict:
+def append_chat(chat_id: str, role: str, text: str, **extra) -> ChatEntry:
     """Дописать реплику беседы; пустые поля не пишутся. В журнал беседы — роль и начало текста."""
-    assert role in _ROLES, role
+    entry = append_chat_file(run_dir(chat_run_id(chat_id)) / CHAT, role, text, **extra)
     extra = {k: v for k, v in extra.items() if v is not None}
-    entry = {"at": _now(), "role": role, "text": text, **extra}
-    path = run_dir(chat_run_id(chat_id)) / CHAT
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    log_event(chat_run_id(chat_id), "chat", who=_CHAT_WHO[role], role=role, text=text[:300],
+    log_event(chat_run_id(chat_id), "chat", who=CHAT_WHO[role], role=role, text=text[:300],
               **{k: v for k, v in extra.items() if k in ("cost_usd", "session", "mark")})
     return entry
 
@@ -267,7 +176,7 @@ def add_document(chat_id: str, filename: str, data: bytes, session: str | None =
     """
     rid = chat_run_id(chat_id)
     root = run_dir(rid)
-    docs = list(chat_info(chat_id).get("documents") or [])
+    docs = list(chat_info(chat_id).documents)
     n = len(docs) + 1
     suffix = Path(filename).suffix.lower()
     src = root / DOCS / f"{n:02d}{suffix}"
@@ -281,10 +190,10 @@ def add_document(chat_id: str, filename: str, data: bytes, session: str | None =
         raise ValueError(f"Не удалось прочитать файл «{filename}»: возможно, он повреждён, защищён паролем "
                          "или это скан без текста. Пересохраните его в Word как .docx и загрузите снова.") from None
     (root / DOCS / f"{n:02d}.md").write_text(text, encoding="utf-8")
-    (root / "01_document.md").unlink(missing_ok=True)   # шаг чтения пишет его по привычке прогона — здесь не нужен
-    docs.append({"n": n, "name": filename, "chars": len(text), "at": _now()})
+    (root / DOCUMENT_FILE).unlink(missing_ok=True)   # шаг чтения пишет его по привычке прогона — здесь не нужен
+    docs.append(GarantDocument(n=n, name=filename, chars=len(text), at=_now()))
     info = chat_info(chat_id)
-    _update_info(chat_id, documents=docs, title=info.get("title") or Path(filename).stem)
+    _update_info(chat_id, documents=docs, title=info.title or Path(filename).stem)
     # Новый документ — в системном промпте новой сессии: старую больше не продолжаем
     (root / SESSION).unlink(missing_ok=True)
     append_chat(chat_id, "сервис", f"Документ «{filename}» приложен: {len(text):,} знаков текста.".replace(",", " "),
@@ -297,25 +206,25 @@ def shared_context(chat_id: str) -> str:
     """Системный промпт сессии: промпт 08 и тексты приложенных документов."""
     root = run_dir(chat_run_id(chat_id))
     parts = [PROMPT_GARANT_CHAT.read_text(encoding="utf-8").rstrip() + "\n"]
-    docs = chat_info(chat_id).get("documents") or []
+    docs = chat_info(chat_id).documents
     if not docs:
         parts.append("## ДОКУМЕНТЫ ПОЛЬЗОВАТЕЛЯ\n\nПользователь пока не приложил документов.\n")
     for d in docs:
-        text = (root / DOCS / f"{d['n']:02d}.md").read_text(encoding="utf-8")
-        parts.append(f"## ДОКУМЕНТ ПОЛЬЗОВАТЕЛЯ {d['n']}: «{d['name']}»\n\n{text}\n")
+        text = (root / DOCS / f"{d.n:02d}.md").read_text(encoding="utf-8")
+        parts.append(f"## ДОКУМЕНТ ПОЛЬЗОВАТЕЛЯ {d.n}: «{d.name}»\n\n{text}\n")
     return "\n".join(parts)
 
 
 # ---- Ход агента ----
 
-def _load_session(chat_id: str) -> dict | None:
+def _load_session(chat_id: str) -> CliSession | None:
     path = run_dir(chat_run_id(chat_id)) / SESSION
-    return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
+    return CliSession.model_validate_json(path.read_text(encoding="utf-8")) if path.is_file() else None
 
 
-def build_document(message: str, history: list[dict], note: str = "") -> str:
+def build_document(message: str, history: list[ChatEntry], note: str = "") -> str:
     """Вход первого хода новой сессии: пометка (Гарант недоступен), история беседы, сообщение — последним."""
-    lines = [f"{m['role']}: {m['text']}" for m in history] or ["(начало беседы)"]
+    lines = [f"{m.role}: {m.text}" for m in history] or ["(начало беседы)"]
     head = f"## СЛУЖЕБНО\n\n{note}\n\n" if note else ""
     return (head + "## ИСТОРИЯ БЕСЕДЫ\n\n" + "\n\n".join(lines) + "\n\n"
             + f"## СООБЩЕНИЕ ПОЛЬЗОВАТЕЛЯ\n\n{message}\n")
@@ -328,27 +237,8 @@ def resume_message(message: str, note: str = "") -> str:
 
 
 def _turn_tools(chat_id: str, n: int) -> tuple[list[dict], set[str]]:
-    """Вызовы инструментов хода n (без дублей) и id вызовов с ошибкой — из turns/NNNN*.stream.jsonl."""
-    uses: list[dict] = []
-    seen: set[str] = set()
-    errors: set[str] = set()
-    for path in sorted((run_dir(chat_run_id(chat_id)) / "turns").glob(f"{n:04d}*.stream.jsonl")):
-        for line in path.read_text(encoding="utf-8").splitlines():
-            try:
-                event = json.loads(line).get("event") or {}
-            except (ValueError, AttributeError):
-                continue
-            if not isinstance(event, dict) or event.get("type") not in ("assistant", "user"):
-                continue
-            for block in (event.get("message") or {}).get("content") or []:
-                if not isinstance(block, dict):
-                    continue
-                if block.get("type") == "tool_result" and block.get("is_error"):
-                    errors.add(str(block.get("tool_use_id")))
-                elif block.get("type") == "tool_use" and block.get("id") not in seen:
-                    seen.add(block.get("id"))
-                    uses.append(block)
-    return uses, errors
+    """Вызовы инструментов хода n (без дублей) и id вызовов с ошибкой — из turns/NNNN*.stream.jsonl (chat_common)."""
+    return turn_tools(run_dir(chat_run_id(chat_id)) / "turns", n)
 
 
 def _report_exports(chat_id: str, n: int, session: str | None) -> None:
@@ -367,13 +257,13 @@ def turn(chat_id: str, message: str, *, session: str | None = None, timeout_s: i
     """
     Ответить на сообщение пользователя. Реплики, файлы и стоимость — в беседу. Есть сессия CLI — продолжаем её;
     не продолжилась (её нет у CLI или сбой) — новая сессия с историей беседы в этом же ходе.
-    Ходов на весь сервис не больше MAX_PARALLEL_TURNS — остальные ждут, беседа помечена «в очереди».
+    Ходов на весь сервис не больше GARANT_MAX_PARALLEL_TURNS — остальные ждут, беседа помечена «в очереди».
     """
     rid = chat_run_id(chat_id)
     history = read_chat(chat_id)[-HISTORY_MESSAGES:]
-    n = sum(1 for m in read_chat(chat_id) if m["role"] == "пользователь") + 1
+    n = sum(1 for m in read_chat(chat_id) if m.role == "пользователь") + 1
     append_chat(chat_id, "пользователь", message, session=session)
-    if not (chat_info(chat_id).get("title") or "").strip():
+    if not chat_info(chat_id).title.strip():
         _update_info(chat_id, title=message.strip().splitlines()[0][:80])
     _set_busy(chat_id, "в очереди")
     try:
@@ -398,13 +288,13 @@ def _turn(chat_id: str, rid: str, message: str, history: list[dict], n: int, ses
     result = None
     if cli is not None:
         result = call(resume_message(message, note), None, GarantTurn, trace_name=f"turns/{n:04d}.raw.json",
-                      resume_session_id=cli["session_id"], resume_cost_base=float(cli.get("cost_reported", 0.0)),
+                      resume_session_id=cli.session_id, resume_cost_base=float(cli.cost_reported or 0.0),
                       **common)
         cost += result.cost_usd
         if not (result.ok and result.value is not None):
             # Упрощённо (в отличие от помощника прогона): любая неудача продолжения — новая сессия с историей
             kind = "garant_session_lost" if SESSION_GONE in (result.error or "") else "garant_resume_failed"
-            log_event(rid, kind, session_id=cli["session_id"], error=(result.error or "")[:300])
+            log_event(rid, kind, session_id=cli.session_id, error=(result.error or "")[:300])
             (run_dir(rid) / SESSION).unlink(missing_ok=True)
             cli = None
     if cli is None:
@@ -412,12 +302,12 @@ def _turn(chat_id: str, rid: str, message: str, history: list[dict], n: int, ses
                       trace_name=f"turns/{n:04d}{'.new' if result is not None else ''}.raw.json", **common)
         cost += result.cost_usd
         if result.ok and result.value is not None and result.session_id:
-            cli = {"session_id": result.session_id, "started": _now()}
+            cli = CliSession(session_id=result.session_id, started=_now())
             log_event(rid, "garant_session_started", session_id=result.session_id)
     ok = result.ok and result.value is not None
-    log_event(rid, "garant_turn", ok=ok, cost_usd=round(cost, 4), session_id=cli["session_id"] if cli else None)
+    log_event(rid, "garant_turn", ok=ok, cost_usd=round(cost, 4), session_id=cli.session_id if cli else None)
     _report_exports(chat_id, n, session)
-    steps = [s for s in (_step_text(u.get("name", ""), u.get("input") or {}) for u in _turn_tools(chat_id, n)[0]) if s]
+    steps = [s for s in (tool_step_text(u.get("name", ""), u.get("input") or {}) for u in _turn_tools(chat_id, n)[0]) if s]
     if not ok:
         # Техническая причина — в журнал беседы; человеку — понятная фраза без английского
         log_event(rid, "garant_turn_failed", error=(result.error or "")[:500])
@@ -426,7 +316,8 @@ def _turn(chat_id: str, rid: str, message: str, history: list[dict], n: int, ses
         append_chat(chat_id, "ассистент", reply, cost_usd=round(cost, 4), mark="сбой", steps=steps or None)
         return TurnResult(reply=reply, ok=False, cost_usd=cost)
     if cli is not None:
-        _write_json(run_dir(rid) / SESSION, {**cli, "last_turn": _now(), "cost_reported": result.session_cost_usd})
+        _write_json(run_dir(rid) / SESSION, cli.model_copy(update={"last_turn": _now(), "cost_reported": result.session_cost_usd})
+                    .model_dump(mode="json", exclude_none=True))
     value = result.value
     files, failed = [], []
     for spec in value.files:

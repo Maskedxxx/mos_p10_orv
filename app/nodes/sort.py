@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from app.contracts import Buckets, Verdict
 from app.logger import get_run_logger
-from app.trace import save_json
+from app.trace import BUCKETS_FILE, save_json
 
 
 def sort_verdicts(verdicts: list[Verdict], run_id: str) -> Buckets:
@@ -50,7 +50,7 @@ def sort_verdicts(verdicts: list[Verdict], run_id: str) -> Buckets:
         f"разбор корзины потерял вердикты: вход={len(verdicts)}, распределено={total_out}"
     )
 
-    save_json(run_id, "04_buckets.json", buckets)
+    save_json(run_id, BUCKETS_FILE, buckets)
 
     logger = get_run_logger(run_id).getChild("04_buckets")
     logger.info(

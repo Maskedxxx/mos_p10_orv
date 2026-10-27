@@ -31,7 +31,7 @@ from docling.document_converter import DocumentConverter  # noqa: E402
 
 from app.config import ACCEPTED_EXTENSIONS, NEEDS_LIBREOFFICE
 from app.logger import get_run_logger
-from app.trace import save_text
+from app.trace import DOCUMENT_FILE, save_text
 
 # Сколько ждём LibreOffice на конвертации .doc в .docx
 _LIBREOFFICE_TIMEOUT_S = 180
@@ -95,7 +95,7 @@ def convert_to_markdown(act_path: str | Path, run_id: str) -> str:
     if not markdown.strip():
         raise ValueError(f"docling вернул пустой документ для файла {path.name}")
 
-    save_text(run_id, "01_document.md", markdown)
+    save_text(run_id, DOCUMENT_FILE, markdown)
 
     duration_s = time.monotonic() - started
     logger.info(

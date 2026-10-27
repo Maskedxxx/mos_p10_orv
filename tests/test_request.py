@@ -14,7 +14,7 @@ from unittest.mock import Mock
 import pytest
 
 import app.nodes.request as request_module
-from app.contracts import DataItem, DataRequest, Effect, HypothesisMap, MapRow, RequestItem, RequestOutput, RunMeta, SourceRef
+from app.contracts import ActPassport, DataItem, DataRequest, Effect, HypothesisMap, MapRow, RequestItem, RequestOutput, RunMeta, SourceRef
 from app.nodes.request import _request_years, build_request
 from app.runner import CallResult
 from app.trace import load_json, run_dir, save_json
@@ -283,7 +283,7 @@ def test_request_years_future_act_gives_effective_year_only():
     assert _request_years(effective_year=2027, end_year=2025) == [2027]
 
 
-def test_document_carries_act_passport_and_years(run_id, tmp_prompt, monkeypatch):
+def test_document_carries_act_passport_and_years(run_id, tmp_prompt, monkeypatch, valid_passport):
     """Г6. В stdin узла 6 уходят текст акта, паспорт и годы бланка — раньше только карта."""
     seen = {}
 
@@ -294,7 +294,7 @@ def test_document_carries_act_passport_and_years(run_id, tmp_prompt, monkeypatch
     monkeypatch.setattr(request_module, "call", Mock(side_effect=_effect))
     hyp_map = _map([_row2(1, [("число заявок", "запрос органу")])])
     build_request(hyp_map, run_id, document_md="ТЕКСТ АКТА ЗДЕСЬ",
-                  passport={"requisites": {"authority": "Департамент"}, "status": {"status": "принят", "effective_date": "21.08.2025"}},
+                  passport=ActPassport(**valid_passport),
                   effective_year=2025)
     doc = seen["doc"]
     assert "## ПОЛНЫЙ ТЕКСТ АКТА" in doc and "ТЕКСТ АКТА ЗДЕСЬ" in doc

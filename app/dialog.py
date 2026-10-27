@@ -26,42 +26,31 @@ import time
 from dataclasses import dataclass, field
 
 from app import versions
-from app.config import ALLOWED_TOOLS_WEB, DIALOG_MODEL, GARANT_ALL_TOOLS, GARANT_MCP_CONFIG, PROJECT_ROOT, PROMPT_DIALOG
-from app.contracts import DialogTurn, Operation, Remark
-from app.nodes.hypotheses import _add_cost_to_meta
+from app.chat_common import (
+    CHAT_WHO, GARANT_OFF_NOTE, GARANT_TOOLS, NEW_SESSION_INSTRUCTION, SESSION_GONE, append_chat_file, read_chat_file,
+    tool_step_text, turn_tools,
+)
+from app.config import (
+    ALLOWED_TOOLS_WEB, DIALOG_MODEL, GARANT_MCP_CONFIG, HISTORY_MESSAGES, PROJECT_ROOT, PROMPT_DIALOG, RESUME_FAILS_TO_RESET,
+)
+from app.contracts import ChatEntry, CliSession, DialogStatus, DialogTurn, Operation, Remark
 from app.run_map import build_run_map
 from app.runner import call, garant_available
-from app.trace import log_event, run_dir, save_bytes
+from app.trace import DIALOG_STATUS_FILE, DOCUMENT_FILE, PASSPORT_FILE, add_cost, log_event, run_dir, save_bytes
 
 CHAT = "dialog/chat.jsonl"
 REMARKS = "dialog/remarks.json"   # очередь замечаний из файла эксперта
-STATUS = "dialog/status.json"     # что идёт по прогону прямо сейчас; нет файла — ничего
 # Процесс сервиса, записавший состояние: состояние от прежнего процесса — действие прервано перезапуском
 SERVER_ID = f"{os.getpid()}-{int(time.time())}"
-HISTORY_MESSAGES = 16       # сколько последних реплик чата уходит модели в начале новой сессии
-# Сессия CLI помощника: session_id, started, last_turn, version_seen, cost_reported (стоимость сессии, как её
-# сообщил CLI в прошлом ходе: при --resume он сообщает сумму с начала сессии — runner вычитает её)
+# Сессия CLI помощника (контракт CliSession): номер, когда начата, последний ход, какую версию видела модель,
+# стоимость сессии, как её сообщил CLI в прошлом ходе (при --resume он сообщает сумму с начала сессии — runner вычитает её)
 SESSION = "dialog/session.json"
-# Что CLI пишет, когда сессии для --resume у него нет (проба 15.10: код 1, «No conversation found with session ID»)
-SESSION_GONE = "No conversation found"
-# Сколько ходов подряд сессия может не продолжиться, прежде чем помощник начнёт новую (15.10, повторное ревью)
-RESUME_FAILS_TO_RESET = 2
-# Пометка служебной строки хода, когда файла токена Гаранта нет (15.10)
-GARANT_OFF_NOTE = ("Гарант сейчас недоступен (нет файла токена): инструментов Гаранта в этом ходе нет. "
-                   "Если пользователь просит найти или проверить в Гаранте — скажи ему об этом.")
 MCP_CONFIG = "dialog/mcp.json"    # серверы MCP помощника: Гарант + чтение артефактов прогона
 # Инструменты чтения артефактов прогона (app/mcp_run.py, сервер p10run в dialog/mcp.json)
 RUN_TOOLS = ["mcp__p10run__list_artifacts", "mcp__p10run__read_artifact"]
-# Гарант в чате (решение владельца 14.10): все инструменты всегда, и лимитированные. Набор за сессию не меняется —
-# смена инструментов посреди сессии сбрасывает кэш. Выгрузки (30 в месяц на всех) помощник делает сам и предупреждает
-# в ответе; сколько потрачено — в журнал прогона (_log_exports). 27.10: строку об этом в чат эксперту больше
-# не пишем — лимиты Гаранта эксперту не показываем; остаток виден на странице Гаранта-помощника
-GARANT_TOOLS = list(GARANT_ALL_TOOLS)
-# Задание первого хода новой сессии; роль и правила — в системном промпте (промпт 07)
-NEW_SESSION_INSTRUCTION = "Ответь на сообщение пользователя — оно последним блоком входа."
-_ROLES = ("пользователь", "ассистент", "сервис")
-# Кто в журнале сессии (events.jsonl) для каждой роли чата
-_CHAT_WHO = {"пользователь": "пользователь", "ассистент": "помощник", "сервис": "система"}
+# Гарант в чате — все инструменты всегда (chat_common.GARANT_TOOLS). Сколько выгрузок потрачено — в журнал прогона
+# (_log_exports). 27.10: строку об этом в чат эксперту больше не пишем — лимиты Гаранта эксперту не показываем;
+# остаток виден на странице Гаранта-помощника
 
 
 @dataclass
@@ -72,24 +61,16 @@ class TurnResult:
     sources: list[str] = field(default_factory=list)
 
 
-def read_chat(run_id: str) -> list[dict]:
-    path = run_dir(run_id) / CHAT
-    if not path.is_file():
-        return []
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+def read_chat(run_id: str) -> list[ChatEntry]:
+    return read_chat_file(run_dir(run_id) / CHAT)
 
 
-def append_chat(run_id: str, role: str, text: str, **extra) -> dict:
+def append_chat(run_id: str, role: str, text: str, **extra) -> ChatEntry:
     """Дописать реплику в чат прогона: пользователь, ассистент или сервис (что применено, что отклонено)."""
-    assert role in _ROLES, role
-    extra = {k: v for k, v in extra.items() if v is not None}   # пустые поля (нет сессии, нет цены) не пишутся
-    entry = {"at": datetime.datetime.now().isoformat(timespec="seconds"), "role": role, "text": text, **extra}
-    path = run_dir(run_id) / CHAT
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    entry = append_chat_file(run_dir(run_id) / CHAT, role, text, **extra)
+    extra = {k: v for k, v in extra.items() if v is not None}
     # Журнал сессии: роль и начало текста (полный текст — в chat.jsonl)
-    log_event(run_id, "chat", who=_CHAT_WHO[role], role=role, text=text[:300],
+    log_event(run_id, "chat", who=CHAT_WHO[role], role=role, text=text[:300],
               plan_steps=len(extra["plan"]) if "plan" in extra else None,
               **{k: v for k, v in extra.items() if k in ("cost_usd", "session", "mark", "version")})
     return entry
@@ -107,9 +88,9 @@ def shared_context(run_id: str) -> str:
     """
     root = run_dir(run_id)
     parts = [PROMPT_DIALOG.read_text(encoding="utf-8").rstrip() + "\n", build_run_map(),
-             f"## ПОЛНЫЙ ТЕКСТ АКТА\n\n{(root / '01_document.md').read_text(encoding='utf-8')}\n"]
-    if (root / "02_passport.json").is_file():
-        parts.append(_json_block("ПАСПОРТ АКТА (JSON)", (root / "02_passport.json").read_text(encoding="utf-8")))
+             f"## ПОЛНЫЙ ТЕКСТ АКТА\n\n{(root / DOCUMENT_FILE).read_text(encoding='utf-8')}\n"]
+    if (root / PASSPORT_FILE).is_file():
+        parts.append(_json_block("ПАСПОРТ АКТА (JSON)", (root / PASSPORT_FILE).read_text(encoding="utf-8")))
     return "\n".join(parts)
 
 
@@ -127,13 +108,14 @@ def mcp_config(run_id: str, with_garant: bool = True) -> str:
     return str(save_bytes(run_id, MCP_CONFIG, data))
 
 
-def load_session(run_id: str) -> dict | None:
+def load_session(run_id: str) -> CliSession | None:
     """Сессия CLI помощника по прогону; None — ещё не начиналась."""
     path = run_dir(run_id) / SESSION
-    return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
+    return CliSession.model_validate_json(path.read_text(encoding="utf-8")) if path.is_file() else None
 
 
-def _save_session(run_id: str, data: dict) -> None:
+def _save_session(run_id: str, session: CliSession) -> None:
+    data = session.model_dump(mode="json", exclude_none=True)
     save_bytes(run_id, SESSION, json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"))
 
 
@@ -156,10 +138,10 @@ def _service(run_id: str, version_seen: int | None, note: str) -> str:
     return f"## СЛУЖЕБНО\n\n{version_line(run_id, version_seen)}\n" + (f"\n{note}\n" if note else "")
 
 
-def build_document(run_id: str, message: str, history: list[dict], note: str = "") -> str:
+def build_document(run_id: str, message: str, history: list[ChatEntry], note: str = "") -> str:
     """Вход первого хода новой сессии (stdin): служебная строка, история чата, сообщение пользователя — последним.
     Акт, паспорт, карта прогона — в системном промпте; вердикты, карту, бланк помощник читает инструментом."""
-    lines = [f"{m['role']}: {m['text']}" for m in history] or ["(начало диалога)"]
+    lines = [f"{m.role}: {m.text}" for m in history] or ["(начало диалога)"]
     return "\n".join([
         _service(run_id, None, note),
         "## ИСТОРИЯ ДИАЛОГА\n\n" + "\n\n".join(lines) + "\n",
@@ -199,46 +181,46 @@ def turn(run_id: str, message: str, *, session: str | None = None, timeout_s: in
     result = None
     if cli is not None:
         # Продолжение разговора: модель помнит прошлые ходы, служебная строка — что изменилось
-        result = call(resume_message(run_id, message, cli["version_seen"], note), None, DialogTurn,
-                      trace_name=f"dialog/turns/{n:04d}.raw.json", resume_session_id=cli["session_id"],
-                      resume_cost_base=float(cli.get("cost_reported", 0.0)), **common)
+        result = call(resume_message(run_id, message, cli.version_seen, note), None, DialogTurn,
+                      trace_name=f"dialog/turns/{n:04d}.raw.json", resume_session_id=cli.session_id,
+                      resume_cost_base=float(cli.cost_reported or 0.0), **common)
         cost += result.cost_usd
         if result.ok and result.value is not None:
-            log_event(run_id, "dialog_session_resumed", session_id=cli["session_id"])
+            log_event(run_id, "dialog_session_resumed", session_id=cli.session_id)
         elif SESSION_GONE in (result.error or ""):
-            log_event(run_id, "dialog_session_lost", session_id=cli["session_id"], error=(result.error or "")[:300])
+            log_event(run_id, "dialog_session_lost", session_id=cli.session_id, error=(result.error or "")[:300])
             (run_dir(run_id) / SESSION).unlink(missing_ok=True)   # мёртвую сессию больше не продолжаем
             cli = None
         else:
             # 15.10 (код-ревью): сбой продолжения (таймаут, ошибка API) — память помощника не стираем: ход
             # «не получилось», следующий продолжит ту же сессию. Не продолжилась второй ход подряд — сессия сломана
             # (длинная или испорченная история): новая с историей чата (повторное ревью)
-            fails = int(cli.get("resume_failures", 0)) + 1
-            if result.session_id == cli["session_id"] and result.session_cost_usd:
-                cli = {**cli, "cost_reported": result.session_cost_usd}   # CLI считает сессию нарастающим итогом
+            fails = int(cli.resume_failures or 0) + 1
+            if result.session_id == cli.session_id and result.session_cost_usd:
+                cli = cli.model_copy(update={"cost_reported": result.session_cost_usd})   # CLI считает сессию нарастающим итогом
             if fails >= RESUME_FAILS_TO_RESET:
-                log_event(run_id, "dialog_session_lost", session_id=cli["session_id"],
+                log_event(run_id, "dialog_session_lost", session_id=cli.session_id,
                           error=(result.error or "")[:300])
                 (run_dir(run_id) / SESSION).unlink(missing_ok=True)
                 cli = None
             else:
-                log_event(run_id, "dialog_resume_failed", session_id=cli["session_id"],
+                log_event(run_id, "dialog_resume_failed", session_id=cli.session_id,
                           error=(result.error or "")[:300])
-                _save_session(run_id, {**cli, "resume_failures": fails})
+                _save_session(run_id, cli.model_copy(update={"resume_failures": fails}))
     if cli is None:
         # Новая сессия: история чата — во входе, всё остальное — в системном промпте и инструментах
         result = call(NEW_SESSION_INSTRUCTION, build_document(run_id, message, history, note), DialogTurn,
                       trace_name=f"dialog/turns/{n:04d}{'.new' if result is not None else ''}.raw.json", **common)
         cost += result.cost_usd
         if result.ok and result.value is not None and result.session_id:
-            cli = {"session_id": result.session_id, "started": _now()}
+            cli = CliSession(session_id=result.session_id, started=_now())
             log_event(run_id, "dialog_session_started", session_id=result.session_id)
-    _add_cost_to_meta(run_id, cost)
+    add_cost(run_id, cost)
     state = versions.load_state(run_id)
     current = state.current if state is not None else 0
     ok = result.ok and result.value is not None
     log_event(run_id, "dialog_turn", ok=ok, version=current, cost_usd=round(cost, 4),
-              session_id=cli["session_id"] if cli else None)
+              session_id=cli.session_id if cli else None)
     _log_exports(run_id, n)   # выгрузки Гаранта за ход — в журнал прогона
     if not ok:
         reply = f"Не получилось ответить: {result.error or 'неизвестная ошибка'}. Попробуйте ещё раз."
@@ -246,8 +228,8 @@ def turn(run_id: str, message: str, *, session: str | None = None, timeout_s: in
         out = TurnResult(reply=reply, cost_usd=cost)
     else:
         if cli is not None:
-            _save_session(run_id, {**cli, "last_turn": _now(), "version_seen": current,
-                                   "cost_reported": result.session_cost_usd, "resume_failures": 0})
+            _save_session(run_id, cli.model_copy(update={"last_turn": _now(), "version_seen": current,
+                                                         "cost_reported": result.session_cost_usd, "resume_failures": 0}))
         value = result.value
         append_chat(run_id, "ассистент", value.reply, plan=[op.model_dump(mode="json") for op in value.plan],
                     sources=value.sources or None, steps=turn_steps(run_id, n) or None, cost_usd=round(cost, 4))
@@ -255,70 +237,9 @@ def turn(run_id: str, message: str, *, session: str | None = None, timeout_s: in
     return out
 
 
-# Шаги помощника для пользователя (шаг 7): вызов инструмента → строка «что делаю»
-_STEP_TITLES = {
-    "mcp__p10run__list_artifacts": "смотрю список файлов результата",
-    "mcp__garant__garant_document_redactions": "смотрю редакции акта в Гаранте",
-    "mcp__garant__garant_snippets": "ищу место в документе Гаранта",
-    "mcp__garant__garant_sutyazhnik": "ищу судебную практику в Гаранте («Сутяжник»)",
-    "mcp__garant__garant_limits": "смотрю остаток лимитов Гаранта",
-    "mcp__garant__garant_export_block_html": "выгружаю текст пункта из Гаранта (платно)",
-    "mcp__garant__garant_export_html": "выгружаю текст документа из Гаранта (платно)",
-    "mcp__garant__garant_export_rtf": "выгружаю документ из Гаранта в RTF (платно)",
-    "mcp__garant__garant_export_odt": "выгружаю документ из Гаранта в ODT (платно)",
-    "mcp__garant__garant_export_pdf": "выгружаю документ из Гаранта в PDF (платно)",
-    "mcp__garant__garant_export_image": "выгружаю картинку из Гаранта (платно)",
-    "mcp__garant__garant_export_formula": "выгружаю формулу из Гаранта (платно)",
-    "mcp__garant__garant_document_info": "смотрю карточку документа в Гаранте",
-    "mcp__garant__garant_find_hyperlinks": "распознаю ссылки на акты в тексте (Гарант)",
-    "mcp__garant__garant_find_modified": "проверяю в Гаранте, менялись ли документы",
-    "mcp__garant__garant_block_changed": "проверяю в Гаранте, менялись ли пункты",
-    "mcp__garant__garant_prime_categories": "смотрю разделы новостей Гаранта",
-    "mcp__garant__garant_prime_news": "ищу новости в Гаранте",
-}
-
-
-def _step_text(name: str, args: dict) -> str | None:
-    """Строка шага по вызову инструмента; None — служебный вызов (ответ по схеме), не показывается."""
-    if name == "StructuredOutput":
-        return None
-    if name == "mcp__p10run__read_artifact":
-        query = args.get("query")
-        return f"читаю {args.get('path', '')}" + (f" — ищу «{query}»" if query else "")
-    if name == "mcp__garant__garant_search":
-        return f"ищу в Гаранте: {args.get('query') or args.get('text') or ''}".rstrip(": ")
-    if name == "WebSearch":
-        return f"ищу в интернете: {args.get('query', '')}"
-    if name == "WebFetch":
-        return f"открываю {args.get('url', '')}"
-    return _STEP_TITLES.get(name, f"вызываю {name.removeprefix('mcp__')}")
-
-
 def _turn_tools(run_id: str, n: int) -> tuple[list[dict], set[str]]:
-    """
-    Вызовы инструментов хода n по порядку (без дублей событий) и id вызовов, на которые инструмент ответил
-    ошибкой, — из файлов хода dialog/turns/NNNN*.stream.jsonl (их пишет runner по ходу работы).
-    """
-    uses: list[dict] = []
-    seen: set[str] = set()
-    errors: set[str] = set()
-    for path in sorted((run_dir(run_id) / "dialog" / "turns").glob(f"{n:04d}*.stream.jsonl")):
-        for line in path.read_text(encoding="utf-8").splitlines():
-            try:
-                event = json.loads(line).get("event") or {}
-            except (ValueError, AttributeError):
-                continue
-            if not isinstance(event, dict) or event.get("type") not in ("assistant", "user"):
-                continue
-            for block in (event.get("message") or {}).get("content") or []:
-                if not isinstance(block, dict):
-                    continue
-                if block.get("type") == "tool_result" and block.get("is_error"):
-                    errors.add(str(block.get("tool_use_id")))
-                elif block.get("type") == "tool_use" and block.get("id") not in seen:
-                    seen.add(block.get("id"))
-                    uses.append(block)
-    return uses, errors
+    """Вызовы инструментов хода n и id вызовов с ошибкой — из dialog/turns/NNNN*.stream.jsonl (chat_common.turn_tools)."""
+    return turn_tools(run_dir(run_id) / "dialog" / "turns", n)
 
 
 def turn_steps(run_id: str, n: int) -> list[str]:
@@ -327,7 +248,7 @@ def turn_steps(run_id: str, n: int) -> list[str]:
     Вход: прогон, номер хода (номер реплики пользователя в чате). Выход: строки «что делает помощник».
     """
     uses, _ = _turn_tools(run_id, n)
-    steps = [_step_text(u.get("name", ""), u.get("input") or {}) for u in uses]
+    steps = [tool_step_text(u.get("name", ""), u.get("input") or {}) for u in uses]
     return [s for s in steps if s]
 
 
@@ -382,18 +303,18 @@ def next_remark(run_id: str) -> Remark | None:
 
 def set_status(run_id: str, state: str, title: str, detail: str) -> None:
     """Что идёт по прогону: «думает» (ход помощника), «шаг» (шаг плана, возврат версии), «решение» (ждёт человека)."""
-    data = {"state": state, "title": title, "detail": detail,
-            "since": datetime.datetime.now().isoformat(timespec="seconds"), "server": SERVER_ID}
-    save_bytes(run_id, STATUS, json.dumps(data, ensure_ascii=False).encode("utf-8"))
+    status = DialogStatus(state=state, title=title, detail=detail,
+                          since=datetime.datetime.now().isoformat(timespec="seconds"), server=SERVER_ID)
+    save_bytes(run_id, DIALOG_STATUS_FILE, json.dumps(status.model_dump(mode="json"), ensure_ascii=False).encode("utf-8"))
 
 
-def read_status(run_id: str) -> dict | None:
-    path = run_dir(run_id) / STATUS
+def read_status(run_id: str) -> DialogStatus | None:
+    path = run_dir(run_id) / DIALOG_STATUS_FILE
     try:
-        return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
-    except (OSError, ValueError):   # файл пишется атомарно, но страница не должна падать из-за него
+        return DialogStatus.model_validate_json(path.read_text(encoding="utf-8")) if path.is_file() else None
+    except (OSError, ValueError):   # файл пишется атомарно, но страница не должна падать из-за него (и неверный — тоже)
         return None
 
 
 def clear_status(run_id: str) -> None:
-    (run_dir(run_id) / STATUS).unlink(missing_ok=True)
+    (run_dir(run_id) / DIALOG_STATUS_FILE).unlink(missing_ok=True)

@@ -28,8 +28,8 @@
 основной поток), поэтому у _Progress свой лок.
 
 СТОИМОСТЬ. Оркестратор НЕ считает стоимость сам — узлы уже прибавляют её в
-meta.json под локом (_add_cost_to_meta в app/nodes/hypotheses.py). Здесь только
-читается уже посчитанная сумма — под ТЕМ ЖЕ локом (_meta_lock), второй механизм
+meta.json под локом (add_cost в app/trace.py). Здесь только
+читается уже посчитанная сумма — под ТЕМ ЖЕ локом (META_LOCK), второй механизм
 учёта не заводится. Стоимость узла = разница "после минус до", общая сумма =
 значение из meta.json на момент окончания.
 
@@ -82,7 +82,6 @@ from app.config import PASSPORT_TIMEOUT_S
 from app.nodes.convert import convert_to_markdown
 from app.nodes.excel import build_excel
 from app.nodes.hypotheses import (
-    _meta_lock,
     run_hypotheses_no_data,
     run_hypotheses_violated,
 )
@@ -91,10 +90,10 @@ from app.nodes.request import build_request
 from app.nodes.sort import sort_verdicts
 from app.nodes.passport import apply_user_developers, make_passport, passport_effective_year
 from app.nodes.verdicts import run_verdicts
-from app.trace import load_json, log_event, new_run, save_json, update_meta
-
-# Имя файла состояния выполнения в папке прогона
-PROGRESS_FILE = "progress.json"
+from app.trace import (
+    BUCKETS_FILE, DOCUMENT_FILE, EXCEL_FILE, HYPOTHESES_DIR, INPUT_STEM, MAP_FILE, META_FILE, META_LOCK, PASSPORT_FILE,
+    PROGRESS_FILE, REQUEST_FILE, VERDICTS_DIR, load_json, log_event, new_run, save_json, update_meta,
+)
 
 # Узлы графа выполнения: ключ (для страницы и для кода) -> человеческое имя.
 # Обе ветки гипотез [4а]/[4б] — один узел "hypotheses": их отдельные статусы
@@ -115,15 +114,15 @@ _NODES: list[tuple[str, str]] = [
 # run_pipeline ниже. «00_input» — загруженный акт, meta.json — настройки прогона; папка со слешем
 # в конце — все файлы в ней. Вход каждого узла — выход более раннего (проверяет тест журнала).
 NODE_GRAPH: dict[str, tuple[list[str], list[str]]] = {
-    "convert": (["00_input"], ["01_document.md"]),
-    "passport": (["01_document.md", "meta.json"], ["02_passport.json"]),
-    "verdicts": (["01_document.md", "02_passport.json", "meta.json"], ["03_verdicts/"]),
-    "sort": (["03_verdicts/"], ["04_buckets.json"]),
-    "hypotheses": (["04_buckets.json", "01_document.md", "02_passport.json"], ["05_hypotheses/"]),
-    "merge": (["05_hypotheses/", "01_document.md"], ["06_map.json"]),
-    "request": (["06_map.json", "01_document.md", "02_passport.json", "meta.json"], ["07_request.json"]),
-    "excel": (["06_map.json", "07_request.json", "04_buckets.json", "02_passport.json", "meta.json"],
-              ["08_result.xlsx"]),
+    "convert": ([INPUT_STEM], [DOCUMENT_FILE]),
+    "passport": ([DOCUMENT_FILE, META_FILE], [PASSPORT_FILE]),
+    "verdicts": ([DOCUMENT_FILE, PASSPORT_FILE, META_FILE], [f"{VERDICTS_DIR}/"]),
+    "sort": ([f"{VERDICTS_DIR}/"], [BUCKETS_FILE]),
+    "hypotheses": ([BUCKETS_FILE, DOCUMENT_FILE, PASSPORT_FILE], [f"{HYPOTHESES_DIR}/"]),
+    "merge": ([f"{HYPOTHESES_DIR}/", DOCUMENT_FILE], [MAP_FILE]),
+    "request": ([MAP_FILE, DOCUMENT_FILE, PASSPORT_FILE, META_FILE], [REQUEST_FILE]),
+    "excel": ([MAP_FILE, REQUEST_FILE, BUCKETS_FILE, PASSPORT_FILE, META_FILE],
+              [EXCEL_FILE]),
 }
 
 
@@ -137,12 +136,12 @@ def _cost_now(run_id: str) -> float:
     Прочитать текущую суммарную стоимость прогона из meta.json.
 
     Чтение идёт под тем же локом, которым узлы прибавляют туда свою стоимость
-    (_add_cost_to_meta в app/nodes/hypotheses.py) — иначе можно прочитать
+    (add_cost в app/trace.py) — иначе можно прочитать
     meta.json в момент чужой записи. Второй механизм учёта не заводится:
     оркестратор только читает.
     """
-    with _meta_lock:
-        return load_json(run_id, "meta.json", RunMeta).cost_usd
+    with META_LOCK:
+        return load_json(run_id, META_FILE, RunMeta).cost_usd
 
 
 class _Progress:
@@ -371,7 +370,7 @@ def _run_hypotheses_branches(
     return violated_sets + no_data_sets, errors
 
 
-def _build_summary(
+def build_summary(
     verdicts: list[Verdict],
     hypothesis_map: HypothesisMap,
     request: DataRequest,
@@ -402,12 +401,12 @@ def _finish(
     """
     Завершить прогон: финальная запись в progress.json и в meta.json.
 
-    meta.json обновляется под _meta_lock — тем же, под которым узлы прибавляют
+    meta.json обновляется под META_LOCK — тем же, под которым узлы прибавляют
     туда стоимость (update_meta читает и пишет файл целиком). Статусы meta.json
     остаются в стиле уже записанного туда trace.new_run() "started".
     """
     progress.finish(status, summary)
-    with _meta_lock:
+    with META_LOCK:
         update_meta(
             run_id,
             status="finished" if status == "готов" else "failed",
@@ -429,7 +428,7 @@ def _run_settings(run_id: str) -> RunMeta:
     Нет meta.json или полей (прогон до 2.7) — значения по умолчанию.
     """
     try:
-        return load_json(run_id, "meta.json", RunMeta)
+        return load_json(run_id, META_FILE, RunMeta)
     except Exception:
         return RunMeta(run_id=run_id, act_filename="—", started_at="—", status="—")
 
@@ -464,7 +463,7 @@ def run_pipeline(
             document_md = convert_to_markdown(path, run_id)
     except Exception as exc:
         logger.error("прогон остановлен: конвертация не дала текста акта")
-        empty = _build_summary([], HypothesisMap(), DataRequest(), None)
+        empty = build_summary([], HypothesisMap(), DataRequest(), None)
         return _finish(progress, run_id, "сбой", empty, f"{type(exc).__name__}: {exc}")
 
     # [1.1] паспорт акта — без него идти нельзя: ворота «не применимо» всех
@@ -482,9 +481,9 @@ def run_pipeline(
             user_developers = _run_settings(run_id).developers
             if user_developers:
                 passport = apply_user_developers(passport, user_developers)
-                save_json(run_id, "02_passport.json", passport)
+                save_json(run_id, PASSPORT_FILE, passport)
     except Exception as exc:
-        empty = _build_summary([], HypothesisMap(), DataRequest(), None)
+        empty = build_summary([], HypothesisMap(), DataRequest(), None)
         return _finish(progress, run_id, "сбой", empty, f"паспорт акта: {type(exc).__name__}: {exc}")
 
     # [2] двенадцать вердиктов параллельно, барьер внутри узла; готовность
@@ -546,7 +545,7 @@ def run_pipeline(
             request = build_request(
                 hypothesis_map, run_id,
                 document_md=document_md,
-                passport=passport.model_dump(mode="json"),
+                passport=passport,
                 effective_year=passport_effective_year(passport),
                 timeout_s=timeout_s, max_budget_usd=max_budget_usd,
                 act_types=settings.act_types,
@@ -561,10 +560,10 @@ def run_pipeline(
             excel_path = build_excel(hypothesis_map, request, buckets, passport, run_id,
                                      act_types=settings.act_types)
     except Exception as exc:
-        summary = _build_summary(verdicts, hypothesis_map, request, None)
+        summary = build_summary(verdicts, hypothesis_map, request, None)
         return _finish(progress, run_id, "сбой", summary, f"{type(exc).__name__}: {exc}")
 
-    summary = _build_summary(verdicts, hypothesis_map, request, excel_path)
+    summary = build_summary(verdicts, hypothesis_map, request, excel_path)
     logger.info(
         "прогон завершён: нарушено=%d соблюдено=%d не_применимо=%d нет_данных=%d "
         "ошибок=%d строк=%d слияний=%d показателей=%d стоимость=$%.4f",

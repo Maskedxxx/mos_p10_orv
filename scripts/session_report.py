@@ -26,6 +26,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app import trace  # noqa: E402
+from app.chat_common import read_chat_file  # noqa: E402
 from app.sessions import split_costs  # noqa: E402
 from scripts._monitor import SCHEMA_RETRY, STRUCTURED_OUTPUT, load_raw, tool_calls  # noqa: E402
 
@@ -125,7 +126,7 @@ def report(run: str, compare: str | None = None) -> str:
     # --- сессия
     add(f"== Сессия {run_path.name}")
     add(f"акт: {meta.get('act_filename')} · тип: {', '.join(meta.get('act_types') or []) or '—'}")
-    chat = [json.loads(ln) for ln in _lines(run_path / "dialog" / "chat.jsonl")]
+    chat = read_chat_file(run_path / "dialog" / "chat.jsonl")
     # 15.10: та же разбивка, что в итоге сессии (progress после правок — уже итог вместе с диалогом)
     costs = split_costs(journal, meta.get("cost_usd"), progress.get("total_cost_usd"), chat)
     add(f"начат: {meta.get('started_at')} · разбор: {progress.get('status')} · "

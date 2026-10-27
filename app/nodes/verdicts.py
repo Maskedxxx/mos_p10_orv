@@ -44,8 +44,9 @@ from app.config import (
 from app.contracts import ActPassport, Indicator01Output, Indicator02Output, Indicator03Output, Indicator04Output, Indicator05Output, Indicator06Output, Indicator07Output, Indicator08Output, Indicator09Output, Indicator10Output, Indicator11Output, Indicator12Output, Verdict, VerdictOutput
 from app.logger import get_run_logger
 from app.runner import call
-from app.nodes.hypotheses import _add_cost_to_meta, _after, append_task_clarification
-from app.trace import save_json
+from app.nodes.common import append_task_clarification, run_after
+from app.nodes.passport import passport_block
+from app.trace import VERDICTS_DIR, add_cost, save_json
 
 # Длина, до которой обрезается текст ошибки в rationale вердикта "ошибка"
 _ERROR_RATIONALE_LIMIT = 2000
@@ -151,7 +152,7 @@ def _run_one_indicator(
             None,
             INDICATOR_OUTPUT.get(n, VerdictOutput),   # 2.5: выжимка обязательна; 13.10: свой контракт индикатора
             run_id=run_id,
-            trace_name=f"{trace_prefix}03_verdicts/{n:02d}.raw.json",
+            trace_name=f"{trace_prefix}{VERDICTS_DIR}/{n:02d}.raw.json",
             allowed_tools=allowed_tools,
             timeout_s=max(timeout_s, INDICATOR_TIMEOUT_S.get(n, 0)),   # 2.7: индикатору 3 — больше
             max_budget_usd=max_budget_usd,
@@ -173,7 +174,7 @@ def _run_one_indicator(
             # модель может подставить своё число, перезаписываем настоящим
             value, artifacts = _split_artifacts(result.value)
             if artifacts:
-                save_json(run_id, f"{trace_prefix}03_verdicts/{n:02d}.checks.json", artifacts)
+                save_json(run_id, f"{trace_prefix}{VERDICTS_DIR}/{n:02d}.checks.json", artifacts)
             verdict = value.model_copy(update={"attempts": result.attempts})
 
         return n, verdict, result.cost_usd
@@ -246,7 +247,7 @@ def run_verdicts(
     search_limits — потолки поиска прогона по индикаторам (None — SEARCH_LIMITS).
 
     Требует, чтобы meta.json прогона уже существовал (создаётся trace.new_run()
-    выше по пайплайну) — суммарная стоимость ПРИБАВЛЯЕТСЯ к записанной (_add_cost_to_meta).
+    выше по пайплайну) — суммарная стоимость ПРИБАВЛЯЕТСЯ к записанной (add_cost).
     """
     nums = indicators if indicators is not None else [ind.number for ind in all_indicators()]
     logger = get_run_logger(run_id).getChild("03_verdicts")
@@ -255,16 +256,13 @@ def run_verdicts(
     verdicts_by_n: dict[int, Verdict] = {}
     cost_total = 0.0
 
-    # Блок паспорта собирается один раз на все 12 агентов. Импорт внутри функции:
-    # passport.py импортирует _add_cost_to_meta из hypotheses — кольцо на уровне модулей
-    from app.nodes.passport import passport_block
-
+    # Блок паспорта собирается один раз на все 12 агентов
     block = passport_block(passport)
     delays = _start_delays(nums)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [
             executor.submit(
-                _after, delays[n], _run_one_indicator, n, document_md, block, run_id, timeout_s,
+                run_after, delays[n], _run_one_indicator, n, document_md, block, run_id, timeout_s,
                 max_budget_usd, extra_instruction, trace_prefix, regions, search_limits,
             )
             for n in nums
@@ -274,7 +272,7 @@ def run_verdicts(
             verdicts_by_n[n] = verdict
             cost_total += cost
             if save:
-                save_json(run_id, f"03_verdicts/{n:02d}.json", verdict)
+                save_json(run_id, f"{VERDICTS_DIR}/{n:02d}.json", verdict)
             # Событие готовности индикатора — по ходу, ДО барьера. Сбой колбэка
             # (например, ошибка записи файла прогресса на стороне оркестратора)
             # не должен ронять пятиминутный узел: ловим и идём дальше.
@@ -296,6 +294,6 @@ def run_verdicts(
     )
     # Прибавляем, а не перезаписываем: в meta уже лежит стоимость паспорта, а в диалоге —
     # всего прогона (раньше здесь было update_meta(cost_usd=...), паспорт терялся).
-    _add_cost_to_meta(run_id, cost_total)
+    add_cost(run_id, cost_total)
 
     return ordered

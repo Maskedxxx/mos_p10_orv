@@ -22,12 +22,12 @@ import json
 from datetime import datetime
 
 from app import config, dialog, trace, versions
-from app.contracts import RunMeta, RunProgress
+from app.contracts import ChatEntry, RunMeta
 from app.trace import (
-    EVENTS_FILE, SESSION_SUMMARY_FILE, SESSIONS_DIR, load_json, log_event, log_service_event, read_events, run_dir, save_json,
+    EVENTS_FILE, META_FILE, SESSION_SUMMARY_FILE, SESSIONS_DIR, load_json, log_event, log_service_event, read_events,
+    read_progress, run_dir, save_json,
 )
 
-PROGRESS_FILE = "progress.json"   # то же имя, что в pipeline.PROGRESS_FILE (pipeline здесь не нужен целиком)
 _FINISHED = ("готов", "сбой")     # разбор закончен — сессию можно закрыть
 
 
@@ -54,13 +54,6 @@ def last_activity(run_id: str) -> datetime | None:
     return None
 
 
-def _progress(run_id: str) -> RunProgress | None:
-    try:
-        return load_json(run_id, PROGRESS_FILE, RunProgress)
-    except Exception:
-        return None
-
-
 def idle_sessions(now: datetime, idle_s: int = config.SESSION_IDLE_S) -> list[str]:
     """Открытые сессии с законченным разбором, в журнале которых нет событий дольше idle_s секунд."""
     found = []
@@ -71,7 +64,7 @@ def idle_sessions(now: datetime, idle_s: int = config.SESSION_IDLE_S) -> list[st
         if not path.is_dir() or is_closed(rid):
             continue
         last = last_activity(rid)
-        progress = _progress(rid)
+        progress = read_progress(rid)
         if last is None or progress is None or progress.status not in _FINISHED:
             continue
         if (now - last).total_seconds() > idle_s:
@@ -80,7 +73,7 @@ def idle_sessions(now: datetime, idle_s: int = config.SESSION_IDLE_S) -> list[st
 
 
 def split_costs(events: list[dict], meta_cost: float | None, progress_cost: float | None,
-                chat: list[dict]) -> dict[str, float]:
+                chat: list[ChatEntry]) -> dict[str, float]:
     """
     Стоимость сессии {"разбор", "диалог", "всего"} по журналу, meta.json, progress.json и чату — одна разбивка для
     итога сессии и отчёта scripts/session_report.py.
@@ -94,16 +87,16 @@ def split_costs(events: list[dict], meta_cost: float | None, progress_cost: floa
         total = round(meta_cost, 4) if meta_cost is not None else run_cost
         return {"разбор": run_cost, "диалог": round(max(total - run_cost, 0.0), 4), "всего": total}
     run_cost = round(progress_cost or 0.0, 4)
-    dialog_cost = round(sum(float(e.get("cost_usd") or 0) for e in chat), 4)
+    dialog_cost = round(sum(float(e.cost_usd or 0) for e in chat), 4)
     return {"разбор": run_cost, "диалог": dialog_cost, "всего": round(run_cost + dialog_cost, 4)}
 
 
 def _summary(run_id: str, by: str, now: datetime) -> dict:
     """Итог сессии — из meta.json, progress.json, чата, версий и журнала."""
     events = read_events(run_id)
-    progress = _progress(run_id)
+    progress = read_progress(run_id)
     try:
-        meta = load_json(run_id, "meta.json", RunMeta)
+        meta = load_json(run_id, META_FILE, RunMeta)
     except Exception:
         meta = None
     chat = dialog.read_chat(run_id)
@@ -113,8 +106,8 @@ def _summary(run_id: str, by: str, now: datetime) -> dict:
                         progress.total_cost_usd if progress is not None else None, chat)
     roles: dict[str, int] = {}
     for e in chat:
-        if e.get("role") in ("пользователь", "ассистент"):
-            roles[e["role"]] = roles.get(e["role"], 0) + 1
+        if e.role in ("пользователь", "ассистент"):
+            roles[e.role] = roles.get(e.role, 0) + 1
     agents_done = [e for e in events if e["event"] == "agent_finished"]
     # Сессия, открытая заново (23.10): начало — момент открытия, номер — следующий за прошлыми итогами;
     # стоимость остаётся нарастающим итогом прогона

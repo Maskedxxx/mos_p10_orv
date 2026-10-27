@@ -31,6 +31,19 @@ class MandatoryIndicator:
     kind: str               # «показатель по годам» или «перечень или реестр»
 
 
+@dataclass
+class MandatoryMetric:
+    """
+    Обязательный показатель бланка после объединения выбранных типов акта (mandatory_for): одинаковый текст у разных
+    типов — одна запись со всеми кодами. 27.10 (модульность): раньше — словарь с теми же ключами в том же порядке.
+    """
+    codes: list[str]        # коды формы всех типов с этим текстом — «КНД-1», «Р-1»
+    metric: str             # формулировка без номера и единицы
+    unit: str | None        # единица из перечня бланка; у перечня — None
+    breakdown: str          # указание на разбивку из формы
+    kind: str               # «показатель по годам» или «перечень или реестр»
+
+
 # Типы акта — как на странице загрузки; «нет подходящего типа» — обязательной части нет
 NO_TYPE = "нет подходящего типа"
 ACT_TYPES: list[str] = ['контрольно-надзорная деятельность', 'господдержка', 'предоставление госуслуги', 'руководство по соблюдению обязательных требований', 'обязательные требования', NO_TYPE]
@@ -301,18 +314,18 @@ MANDATORY: dict[str, list[MandatoryIndicator]] = {
 }
 
 
-def mandatory_for(act_types: list[str]) -> list[dict]:
+def mandatory_for(act_types: list[str]) -> list[MandatoryMetric]:
     """
     Объединение наборов выбранных типов без дублей, в порядке типов и номеров формы.
     Одинаковый текст показателя у разных типов — одна запись со всеми кодами.
     """
-    merged: dict[str, dict] = {}
+    merged: dict[str, MandatoryMetric] = {}
     for act_type in act_types:
         for ind in MANDATORY.get(act_type, []):
             entry = merged.get(ind.metric)
             if entry is None:
-                merged[ind.metric] = {"codes": [ind.code], "metric": ind.metric, "unit": ind.unit,
-                                      "breakdown": ind.breakdown, "kind": ind.kind}
-            elif ind.code not in entry["codes"]:
-                entry["codes"].append(ind.code)
+                merged[ind.metric] = MandatoryMetric(codes=[ind.code], metric=ind.metric, unit=ind.unit,
+                                                     breakdown=ind.breakdown, kind=ind.kind)
+            elif ind.code not in entry.codes:
+                entry.codes.append(ind.code)
     return list(merged.values())

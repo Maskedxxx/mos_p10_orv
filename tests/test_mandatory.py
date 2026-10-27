@@ -45,5 +45,5 @@ def test_union_without_duplicates():
     """КНД и руководство совпадают по тексту — одна запись с обоими кодами."""
     merged = mandatory_for(["контрольно-надзорная деятельность", "руководство по соблюдению обязательных требований"])
     assert len(merged) == 17
-    assert merged[0]["codes"] == ["КНД-1", "Р-1"]
+    assert merged[0].codes == ["КНД-1", "Р-1"]
     assert mandatory_for([NO_TYPE]) == [] and mandatory_for([]) == []

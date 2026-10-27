@@ -268,7 +268,7 @@ def test_candidate_pairs_by_shared_clause():
     """В4. Пары гипотез с общим номером пункта акта — кандидаты на слияние.
     Случай 1112: инд. 10 «8» и инд. 11 «7, 8» — общий пункт 8, узел его
     пропустил «на глаз»; теперь пара обязана попасть в кандидаты."""
-    flat = merge_module._flatten_hypotheses([
+    flat = merge_module.flatten_hypotheses([
         _hset_c(10, [("сроки могут не соблюдаться", "8"), ("отказы как барьер", "10")]),
         _hset_c(11, [("сроки не соблюдаются на практике", "7, 8")]),
     ])
@@ -280,7 +280,7 @@ def test_candidate_pairs_by_shared_clause():
 def test_candidate_pairs_ignore_annex_numbers_and_missing_clause():
     """В4. «приложение 1» — не пункт: две гипотезы про разные пункты одного приложения
     кандидатами не становятся; гипотеза без пункта — тоже."""
-    flat = merge_module._flatten_hypotheses([
+    flat = merge_module.flatten_hypotheses([
         _hset_c(4, [("а", "1.3 (п. 2.6 приложения 1 к постановлению)"),
                     ("б", "1.11 (п. 7.1.6.3 приложения 1 к постановлению)"),
                     ("в", None)]),
@@ -290,7 +290,7 @@ def test_candidate_pairs_ignore_annex_numbers_and_missing_clause():
 
 def test_candidate_pairs_within_one_indicator_too():
     """В3. Дубли внутри одного индикатора — тоже кандидаты (ГРАНТЫ инд. 6, обе п. 1.4)."""
-    flat = merge_module._flatten_hypotheses([_hset_c(6, [("а", "1.4"), ("б", "1.4")])])
+    flat = merge_module.flatten_hypotheses([_hset_c(6, [("а", "1.4"), ("б", "1.4")])])
     assert [(a, b) for a, b, _ in _candidate_pairs(flat)] == [(1, 2)]
 
 
@@ -339,11 +339,11 @@ def test_decision_for_every_candidate_no_error(run_id, tmp_prompt, monkeypatch):
 def test_fallback_map_keeps_expert_briefs(valid_hypothesis):
     """2.5: при сбое модели слияния строки собираются из гипотез как есть — вместе с выжимками."""
     from app.contracts import Hypothesis
-    from app.nodes.merge import _fallback_map
+    from app.nodes.merge import fallback_map
     briefs = {"hypothesis_brief": ["что не так (п. 2.1)"], "grounds_brief": ["вывод вердикта (п. 2.1)"]}
     effect = {**valid_hypothesis["effects"][0], "how_to_calculate_brief": ["сумма за год"],
               "expected_trend_brief": ["рост подтвердит"]}
     hyp = Hypothesis(**{**valid_hypothesis, **briefs, "effects": [effect]})
-    row = _fallback_map([(1, 7, hyp)]).rows[0]
+    row = fallback_map([(1, 7, hyp)]).rows[0]
     assert row.hypothesis_brief == briefs["hypothesis_brief"] and row.grounds_brief == briefs["grounds_brief"]
     assert row.effects[0].how_to_calculate_brief == ["сумма за год"]

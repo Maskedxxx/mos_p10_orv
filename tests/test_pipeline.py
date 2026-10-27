@@ -4,7 +4,7 @@
 Все девять узлов подменены заглушками: оркестратор не должен звать модель.
 Заглушки пишут события в общий журнал (с монотонными отметками времени),
 кладут на диск настоящие артефакты своих узлов и прибавляют свою стоимость
-в meta.json тем же механизмом, что и настоящие узлы (_add_cost_to_meta) —
+в meta.json тем же механизмом, что и настоящие узлы (add_cost) —
 иначе не проверить ни порядок вызовов, ни сохранность артефактов, ни учёт
 стоимости.
 
@@ -38,7 +38,7 @@ from app.contracts import (
     Verdict,
     SourceRef,
 )
-from app.nodes.hypotheses import _add_cost_to_meta
+from app.trace import add_cost
 from app.pipeline import run_pipeline
 from app.trace import load_json, new_run, read_events, run_dir, save_json, save_text
 
@@ -159,7 +159,7 @@ class Fakes:
         """Прибавить стоимость узла тем же механизмом, что и настоящие узлы."""
         cost = _COSTS.get(name, 0.0)
         if cost:
-            _add_cost_to_meta(run_id, cost)
+            add_cost(run_id, cost)
 
     def _sleep(self, name: str) -> None:
         delay = self.delays.get(name, 0.0)
@@ -372,8 +372,8 @@ def test_nodes_called_in_declared_order(fakes, act_file):
 
 
 def test_passport_routed_to_expected_nodes(fakes, act_file):
-    """1.1. Паспорт уходит в вердикты, обе ветки гипотез, запрос (как JSON плюс
-    год вступления в силу и текст акта) и Excel — и НЕ уходит в слияние."""
+    """1.1. Паспорт уходит в вердикты, обе ветки гипотез, запрос (контрактом, как и остальным, плюс
+    год вступления в силу и текст акта; 27.10 — раньше словарём) и Excel — и НЕ уходит в слияние."""
     run_pipeline(act_file, fakes.run_id)
 
     seen = fakes.passport_seen
@@ -381,7 +381,7 @@ def test_passport_routed_to_expected_nodes(fakes, act_file):
     assert isinstance(seen["violated"], ActPassport)
     assert isinstance(seen["no_data"], ActPassport)
     assert isinstance(seen["excel"], ActPassport)
-    assert isinstance(seen["request"], dict) and seen["request"]["requisites"]["authority"] == "Департамент"
+    assert isinstance(seen["request"], ActPassport) and seen["request"].requisites.authority == "Департамент"
     assert seen["request_effective_year"] == 2025
     assert seen["request_document"] == "текст акта"
     assert "merge" not in seen

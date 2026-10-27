@@ -32,15 +32,15 @@ JSON-блоком (см. _verdict_card) — вердикт не подмешив
 по образцу app/logger.py), а не "узлы возвращают стоимость, оркестратор пишет
 meta" — второе потребовало бы менять сигнатуру функций (сшитую с ТЗ) на
 кортеж (list[HypothesisSet], float) и знания об этом у оркестратора, а лока
-внутри узла достаточно, пока оба узла живут в одном процессе (см. docstring
-_add_cost_to_meta про границы применимости).
+в app/trace.py достаточно, пока оба узла живут в одном процессе (см. docstring
+trace.add_cost про границы применимости; 27.10 лок и прибавление перенесены
+из этого модуля в app/trace.py — ими пользуются все узлы и диалог).
 """
 
 from __future__ import annotations
 
 import json
 import re
-import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -52,51 +52,15 @@ from app.config import (
     PROMPT_HYPOTHESES_NO_DATA,
     PROMPT_HYPOTHESES_VIOLATED,
 )
-from app.contracts import ActPassport, Buckets, DataItem, HypothesisSet, HypothesisSetOutput, RunMeta, Verdict
+from app.contracts import ActPassport, Buckets, DataItem, HypothesisSet, HypothesisSetOutput, Verdict
 from app.logger import get_run_logger
+from app.nodes.common import append_task_clarification, run_after
+from app.nodes.passport import passport_block
 from app.runner import call
-from app.trace import load_json, run_dir, save_json, update_meta
+from app.trace import HYPOTHESES_DIR, VERDICTS_DIR, add_cost, run_dir, save_json
 
 # Длина, до которой обрезается текст ошибки в why_this_many при провале вызова
 _ERROR_TEXT_LIMIT = 2000
-
-# Лок для потокобезопасного прибавления стоимости к meta.json — см. docstring
-# модуля и _add_cost_to_meta про причину и границы применимости.
-_meta_lock = threading.Lock()
-
-
-def append_task_clarification(instruction: str, extra_instruction: str | None) -> str:
-    """
-    Дописать к промпту узла уточнение задачи от пользователя (диалоговый режим,
-    план итерации 3, шаг 1.2). Без уточнения промпт возвращается побайтно прежним.
-
-    Уточнение говорит, ЧТО ещё проверить и ГДЕ искать, но не какой вывод нужен:
-    это правило промпта оркестратора, а текст уточнения пользователь видит
-    в плане до подтверждения.
-    """
-    if not extra_instruction:
-        return instruction
-    return (
-        f"{instruction}\n\n<уточнение_задачи>\n"
-        "Пользователь уточнил объём проверки. Выполни инструкцию выше полностью "
-        "и дополнительно учти уточнение. Оно говорит, что проверить и где искать, "
-        "а не к какому выводу прийти.\n\n"
-        f"{extra_instruction.strip()}\n</уточнение_задачи>\n"
-    )
-
-
-def _add_cost_to_meta(run_id: str, cost_delta: float) -> None:
-    """
-    Прибавить стоимость вызовов узла к уже записанной в meta.json, не затирая её.
-
-    Лок сериализует чтение+запись между узлами [4а] и [4б], если оба вызваны
-    оркестратором параллельно в потоках одного процесса. Если оркестратор
-    когда-нибудь станет запускать узлы отдельными процессами — thread-lock не
-    защитит, потребуется файловая блокировка (например fcntl.flock).
-    """
-    with _meta_lock:
-        current = load_json(run_id, "meta.json", RunMeta)
-        update_meta(run_id, cost_usd=current.cost_usd + cost_delta)
 
 
 def _shared_context(document_md: str, passport_block_text: str) -> str:
@@ -134,7 +98,7 @@ def _to_request(run_id: str, verdict: Verdict) -> list[dict]:
     """
     if verdict.verdict != "нет данных":
         return []
-    path = run_dir(run_id) / f"03_verdicts/{verdict.indicator:02d}.checks.json"
+    path = run_dir(run_id) / f"{VERDICTS_DIR}/{verdict.indicator:02d}.checks.json"
     if not path.is_file():
         return []
     try:
@@ -190,17 +154,6 @@ def _ensure_requests(hset: HypothesisSet, to_request: list[dict]) -> tuple[Hypot
     return hset.model_copy(update={"hypotheses": hypotheses}), [d.metric for d in added]
 
 
-def _after(delay_s: float, fn, *args):
-    """
-    Запустить fn через delay_s секунд (2.6): ведомый агент ждёт, пока первый в группе
-    запишет общий текст в кэш — одновременно стартовавшие агенты пишут его каждый сам.
-    Общий помощник узлов гипотез и вердиктов.
-    """
-    if delay_s > 0:
-        time.sleep(delay_s)
-    return fn(*args)
-
-
 def _empty_set(verdict: Verdict, error_text: str) -> HypothesisSet:
     """Пустой набор гипотез при провале вызова — провал не выдумывает гипотезу."""
     return HypothesisSet(
@@ -240,7 +193,7 @@ def _run_one_hypothesis(
             _verdict_card(verdict, to_request),
             HypothesisSetOutput,   # 2.5: выжимки для эксперта в ответе обязательны
             run_id=run_id,
-            trace_name=f"{trace_prefix}05_hypotheses/{n:02d}.raw.json",
+            trace_name=f"{trace_prefix}{HYPOTHESES_DIR}/{n:02d}.raw.json",
             allowed_tools=ALLOWED_TOOLS_TEXT,
             timeout_s=timeout_s,
             max_budget_usd=max_budget_usd,
@@ -298,7 +251,7 @@ def _run_hypotheses(
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [
             executor.submit(
-                _after, CACHE_WARMUP_S if i else 0.0,   # первый пишет акт в кэш, остальные читают
+                run_after, CACHE_WARMUP_S if i else 0.0,   # первый пишет акт в кэш, остальные читают
                 _run_one_hypothesis, verdict, document_md, passport_block_text, run_id, instruction,
                 timeout_s, max_budget_usd, trace_prefix,
             )
@@ -311,7 +264,7 @@ def _run_hypotheses(
             if not ok:
                 failed_count += 1
             if save:
-                save_json(run_id, f"05_hypotheses/{n:02d}.json", hset)
+                save_json(run_id, f"{HYPOTHESES_DIR}/{n:02d}.json", hset)
 
     ordered = [sets_by_n[n] for n in sorted(sets_by_n)]
     duration_total = time.monotonic() - started
@@ -322,7 +275,7 @@ def _run_hypotheses(
         branch_label, len(ordered), total_hypotheses, failed_count, cost_total, duration_total,
     )
 
-    _add_cost_to_meta(run_id, cost_total)
+    add_cost(run_id, cost_total)
 
     return ordered
 
@@ -352,10 +305,8 @@ def run_hypotheses_violated(
     Стоимость вызовов складывается и ПРИБАВЛЯЕТСЯ к уже записанной в meta.json.
     Может быть вызвана оркестратором одновременно с run_hypotheses_no_data —
     гонка при записи в meta.json устранена локом, см. docstring модуля и
-    _add_cost_to_meta.
+    trace.add_cost.
     """
-    from app.nodes.passport import passport_block  # кольцевой импорт: passport.py берёт отсюда _add_cost_to_meta
-
     return _run_hypotheses(
         buckets.violated, document_md, passport_block(passport), run_id, PROMPT_HYPOTHESES_VIOLATED, "violated",
         max_workers, timeout_s, max_budget_usd, extra_instruction, trace_prefix, save,
@@ -388,9 +339,7 @@ def run_hypotheses_no_data(
     не завершена» (ОС экспертов, Б1: МАДИ инд. 3 и «зелёные» инд. 4 дали ложные
     гипотезы с оценками 1).
     """
-    from app.nodes.passport import passport_block  # кольцевой импорт, см. run_hypotheses_violated
-
-    practice = [v for v in buckets.no_data if v.indicator not in NO_DATA_TEXT_FAMILY]
+    practice =[v for v in buckets.no_data if v.indicator not in NO_DATA_TEXT_FAMILY]
     skipped = [v.indicator for v in buckets.no_data if v.indicator in NO_DATA_TEXT_FAMILY]
     if skipped:
         get_run_logger(run_id).getChild("05_hypotheses_no_data").info(

@@ -33,21 +33,21 @@
    уровень WARNING — предупреждение, не ошибка, по требованию владельца).
 
 Стоимость вызова ПРИБАВЛЯЕТСЯ к уже записанной в meta.json — переиспользуется
-_add_cost_to_meta из app.nodes.hypotheses, вторая копия не пишется.
+add_cost из app.trace, вторая копия не пишется.
 """
 
 from __future__ import annotations
 
 import json
+from dataclasses import asdict
 
 from app.config import ALLOWED_TOOLS_TEXT, PROMPT_REQUEST, REQUEST_YEARS_DEPTH
-from app.contracts import DataRequest, HypothesisMap, RequestItem, RequestOutput
-from app.mandatory_indicators import mandatory_for
+from app.contracts import ActPassport, DataRequest, HypothesisMap, RequestItem, RequestOutput
+from app.mandatory_indicators import MandatoryMetric, mandatory_for
 from app.logger import get_run_logger
-from app.nodes.excel import compute_years
-from app.nodes.hypotheses import _add_cost_to_meta
+from app.nodes.common import compute_years
 from app.runner import call
-from app.trace import save_json
+from app.trace import REQUEST_FILE, add_cost, save_json
 
 # Заголовок блока текущего бланка в режиме дополнения (план итерации 3, шаг 1.4).
 # Этот же текст описан в промпте 06_request.md — сверяет tests/test_prompts.py.
@@ -76,9 +76,9 @@ def _build_document(
     hypothesis_map: HypothesisMap,
     years: list[int],
     document_md: str | None = None,
-    passport: dict | None = None,
+    passport: ActPassport | None = None,
     existing: DataRequest | None = None,
-    mandatory: list[dict] | None = None,
+    mandatory: list[MandatoryMetric] | None = None,
 ) -> str:
     """
     Собрать документ для stdin: текст акта, паспорт, карта гипотез, годы бланка —
@@ -100,7 +100,7 @@ def _build_document(
     if passport is not None:
         parts.append(
             "## ПАСПОРТ АКТА\n\n"
-            f"```json\n{json.dumps(passport, ensure_ascii=False, indent=2)}\n```\n"
+            f"```json\n{json.dumps(passport.model_dump(mode='json'), ensure_ascii=False, indent=2)}\n```\n"
         )
     if existing is not None:
         # Режим дополнения: модель видит уже составленный бланк, чтобы не повторять
@@ -113,7 +113,7 @@ def _build_document(
     parts.append("## КАРТА ГИПОТЕЗ (JSON)\n\n" f"```json\n{rows_json}\n```\n")
     if mandatory:
         # 2.7 (АМ): обязательные показатели выбранных типов акта — дословно из формы Владимира
-        parts.append(f"{MANDATORY_HEADER}\n\n```json\n{json.dumps(mandatory, ensure_ascii=False, indent=2)}\n```\n")
+        parts.append(f"{MANDATORY_HEADER}\n\n```json\n{json.dumps([asdict(m) for m in mandatory], ensure_ascii=False, indent=2)}\n```\n")
     parts.append("## ГОДЫ БЛАНКА (JSON)\n\n" f"```json\n{json.dumps(years)}\n```\n")
     return "\n".join(parts)
 
@@ -122,21 +122,21 @@ MANDATORY_HEADER = "## ОБЯЗАТЕЛЬНЫЕ ПОКАЗАТЕЛИ (JSON)"
 _KIND_RANK = {"показатель по годам": 0, "перечень или реестр": 1, "открытый вопрос": 2}
 
 
-def _mandatory_item(entry: dict) -> RequestItem:
+def _mandatory_item(entry: MandatoryMetric) -> RequestItem:
     """Обязательный показатель, который модель не включила, — позицией дословно из формы (Р4)."""
-    note = f"Разбивка из формы: {entry['breakdown']}" if entry["breakdown"] else None
-    return RequestItem(num="0", kind=entry["kind"], metric=entry["metric"], unit=entry["unit"],
-                       note=note, mandatory=list(entry["codes"]))
+    note = f"Разбивка из формы: {entry.breakdown}" if entry.breakdown else None
+    return RequestItem(num="0", kind=entry.kind, metric=entry.metric, unit=entry.unit,
+                       note=note, mandatory=list(entry.codes))
 
 
-def _ensure_mandatory(request: DataRequest, mandatory: list[dict], logger) -> DataRequest:
+def _ensure_mandatory(request: DataRequest, mandatory: list[MandatoryMetric], logger) -> DataRequest:
     """
     Каждый обязательный код — хотя бы в одной позиции. Пропущенный моделью показатель
     код дописывает дословно (решение владельца Р4, 12.10: «всегда добавляются» иначе
     не гарантировать) и пишет предупреждение.
     """
     covered = {c for it in request.items for c in it.mandatory}
-    added = [_mandatory_item(e) for e in mandatory if not set(e["codes"]) & covered]
+    added = [_mandatory_item(e) for e in mandatory if not set(e.codes) & covered]
     for it in added:
         logger.warning("request: обязательный показатель %s не вошёл в ответ модели — дописан кодом дословно",
                        ", ".join(it.mandatory))
@@ -257,7 +257,7 @@ def build_request(
     run_id: str,
     *,
     document_md: str | None = None,
-    passport: dict | None = None,
+    passport: ActPassport | None = None,
     effective_year: int | None = None,
     timeout_s: int = 900,
     max_budget_usd: float | None = None,
@@ -296,7 +296,7 @@ def build_request(
         logger.info("request: строк карты нет — бланк из %d обязательных показателей", len(mandatory))
         value = _order_and_number(_ensure_mandatory(DataRequest(items=[], years=years), mandatory, logger))
         if save:
-            save_json(run_id, "07_request.json", value)
+            save_json(run_id, REQUEST_FILE, value)
         return value
 
     if not hypothesis_map.rows:
@@ -305,7 +305,7 @@ def build_request(
         logger.info("request: строк карты нет, вызов модели пропущен")
         value = existing if existing is not None else DataRequest(items=[], years=years)
         if save:
-            save_json(run_id, "07_request.json", value)
+            save_json(run_id, REQUEST_FILE, value)
         return value
 
     instruction = PROMPT_REQUEST.read_text(encoding="utf-8")
@@ -342,8 +342,8 @@ def build_request(
             value = _order_and_number(_ensure_mandatory(value, mandatory, logger))
 
     if save:
-        save_json(run_id, "07_request.json", value)
-    _add_cost_to_meta(run_id, result.cost_usd)
+        save_json(run_id, REQUEST_FILE, value)
+    add_cost(run_id, result.cost_usd)
 
     logger.info(
         "request done: items=%d years=%s cost=$%.4f",

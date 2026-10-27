@@ -9,7 +9,7 @@
 [2] и [4а]/[4б]).
 
 Перед вызовом все входящие гипотезы получают сквозную нумерацию с единицы
-(_flatten_hypotheses) — модель ссылается на эти номера в поле merged_row_ids
+(flatten_hypotheses) — модель ссылается на эти номера в поле merged_row_ids
 ответа. Номера уходят в stdin вместе с гипотезами отдельным помеченным JSON-
 блоком, полный текст акта — отдельным блоком перед ним (см. _build_document,
 по образцу app/nodes/hypotheses.py). Инструменты не нужны: слияние делается
@@ -23,7 +23,7 @@
 
 Провал вызова (CallResult.ok=False) НИКОГДА не превращается в выдуманную
 карту — узел собирает HypothesisMap из входящих гипотез как есть, каждая
-отдельной строкой, merges пустой (_fallback_map), и пишет предупреждение
+отдельной строкой, merges пустой (fallback_map), и пишет предупреждение
 в лог. Слияние — улучшение читаемости карты, без него карта просто длиннее,
 но гипотезы не теряются.
 
@@ -34,7 +34,7 @@
 способ такое поймать, и по требованию владельца делается всегда.
 
 Стоимость вызова ПРИБАВЛЯЕТСЯ к уже записанной в meta.json (узлы [2] и
-[4а]/[4б] уже писали туда свои суммы) — переиспользуется _add_cost_to_meta
+[4а]/[4б] уже писали туда свои суммы) — переиспользуется add_cost
 из app.nodes.hypotheses, вторая копия функции не пишется (требование
 владельца).
 """
@@ -47,12 +47,11 @@ import re
 from app.config import ALLOWED_TOOLS_TEXT, PROMPT_MERGE
 from app.contracts import Hypothesis, HypothesisMap, HypothesisSet, MapRow, MergeOutput
 from app.logger import get_run_logger
-from app.nodes.hypotheses import _add_cost_to_meta
 from app.runner import call
-from app.trace import save_json
+from app.trace import MAP_FILE, add_cost, save_json
 
 
-def _flatten_hypotheses(hypothesis_sets: list[HypothesisSet]) -> list[tuple[int, int, Hypothesis]]:
+def flatten_hypotheses(hypothesis_sets: list[HypothesisSet]) -> list[tuple[int, int, Hypothesis]]:
     """
     Разложить все входящие гипотезы в плоский список со сквозным номером с 1.
 
@@ -80,7 +79,7 @@ _CLAUSE_NOISE_RE = re.compile(
 )
 
 
-def _clause_tokens(clause: str | None) -> set[str]:
+def clause_tokens(clause: str | None) -> set[str]:
     """Номера пунктов акта из строки clause гипотезы; пусто, если пункта нет."""
     if not clause:
         return set()
@@ -98,7 +97,7 @@ def _candidate_pairs(flat: list[tuple[int, int, Hypothesis]]) -> list[tuple[int,
     «на глаз». За 8 прогонов так был пропущен дубль 1112 инд. 10↔11 (общий п. 8).
     Возвращает (row_id_a, row_id_b, общие пункты) в порядке номеров.
     """
-    tokens = [(row_id, _clause_tokens(hyp.clause)) for row_id, _indicator, hyp in flat]
+    tokens = [(row_id, clause_tokens(hyp.clause)) for row_id, _indicator, hyp in flat]
     pairs: list[tuple[int, int, list[str]]] = []
     for i in range(len(tokens)):
         for j in range(i + 1, len(tokens)):
@@ -155,7 +154,7 @@ def _check_decisions(
             )
 
 
-def _fallback_map(flat: list[tuple[int, int, Hypothesis]]) -> HypothesisMap:
+def fallback_map(flat: list[tuple[int, int, Hypothesis]]) -> HypothesisMap:
     """
     Провал модели — не выдумываем слияние: каждая входящая гипотеза становится
     отдельной строкой карты как есть, merges остаётся пустым (см. docstring
@@ -215,7 +214,7 @@ def merge_map(
 
     Слияние дублей видно только когда все гипотезы лежат рядом, поэтому вызов
     ровно один на весь набор, без параллельного прогона по кускам. Провал
-    вызова не выдумывает карту (см. _fallback_map), успешный ответ проверяется
+    вызова не выдумывает карту (см. fallback_map), успешный ответ проверяется
     на сохранность гипотез (см. _check_no_loss).
 
     Артефакты: сырой ответ модели сохраняет сам runner.call под именем
@@ -224,7 +223,7 @@ def merge_map(
     """
     logger = get_run_logger(run_id).getChild("06_merge")
 
-    flat = _flatten_hypotheses(hypothesis_sets)
+    flat = flatten_hypotheses(hypothesis_sets)
     n_input = len(flat)
 
     if n_input == 0:
@@ -232,7 +231,7 @@ def merge_map(
         # (все индикаторы соблюдены/не применимы), а не сбой.
         logger.info("merge: входных гипотез нет, вызов модели пропущен")
         empty = HypothesisMap(rows=[], merges=[])
-        save_json(run_id, "06_map.json", empty)
+        save_json(run_id, MAP_FILE, empty)
         return empty
 
     instruction = PROMPT_MERGE.read_text(encoding="utf-8")
@@ -256,14 +255,14 @@ def merge_map(
             "слияний, гипотезы не потеряны",
             result.error,
         )
-        hyp_map = _fallback_map(flat)
+        hyp_map = fallback_map(flat)
     else:
         hyp_map = result.value
         _check_no_loss(n_input, hyp_map, logger)
         _check_decisions(candidates, hyp_map, logger)
 
-    save_json(run_id, "06_map.json", hyp_map)
-    _add_cost_to_meta(run_id, result.cost_usd)
+    save_json(run_id, MAP_FILE, hyp_map)
+    add_cost(run_id, result.cost_usd)
 
     logger.info(
         "merge done: input=%d rows=%d merges=%d candidates=%d decisions=%d cost=$%.4f",

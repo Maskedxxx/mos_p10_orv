@@ -24,13 +24,15 @@ from __future__ import annotations
 from pathlib import Path
 
 from app.contracts import Buckets, DataRequest, HypothesisMap, JournalEntry, VersionState
-from app.trace import load_json, log_event, run_dir, save_bytes, save_json
+from app.trace import (
+    BUCKETS_FILE, EXCEL_FILE, HYPOTHESES_DIR, MAP_FILE, REQUEST_FILE, VERDICTS_DIR, VERSIONS_DIR, load_json, log_event,
+    run_dir, save_bytes, save_json,
+)
 
-VERSIONS = "versions"
-_STATE = f"{VERSIONS}/state.json"
-_JOURNAL = f"{VERSIONS}/journal.jsonl"
-_SINGLE = ("04_buckets.json", "06_map.json", "07_request.json", "08_result.xlsx")
-_NUMBERED = ("03_verdicts", "05_hypotheses")   # внутри — NN.json, сырые NN.raw*.json не берутся
+_STATE = f"{VERSIONS_DIR}/state.json"
+_JOURNAL = f"{VERSIONS_DIR}/journal.jsonl"
+_SINGLE = (BUCKETS_FILE, MAP_FILE, REQUEST_FILE, EXCEL_FILE)
+_NUMBERED = (VERDICTS_DIR, HYPOTHESES_DIR)   # внутри — NN.json, сырые NN.raw*.json не берутся
 
 
 def artifact_files(base: Path) -> list[str]:
@@ -40,14 +42,14 @@ def artifact_files(base: Path) -> list[str]:
     names = [name for name in _SINGLE if (base / name).is_file()]
     for folder in _NUMBERED:
         names += sorted(f"{folder}/{p.name}" for p in (base / folder).glob("[0-9][0-9].json"))
-    names += sorted(f"03_verdicts/{p.name}" for p in (base / "03_verdicts").glob("[0-9][0-9].checks.json"))
+    names += sorted(f"{VERDICTS_DIR}/{p.name}" for p in (base / VERDICTS_DIR).glob("[0-9][0-9].checks.json"))
     return names
 
 
 def _snapshot(run_id: str, n: int) -> None:
     root = run_dir(run_id)
     for rel in artifact_files(root):
-        save_bytes(run_id, f"{VERSIONS}/v{n}/{rel}", (root / rel).read_bytes())
+        save_bytes(run_id, f"{VERSIONS_DIR}/v{n}/{rel}", (root / rel).read_bytes())
 
 
 def load_state(run_id: str) -> VersionState | None:
@@ -67,12 +69,12 @@ def ensure_v0(run_id: str) -> VersionState:
     state = load_state(run_id)
     if state is not None:
         return state
-    from app.nodes.excel import _unverified_row_ids   # тот же расчёт, что у исходной книги
+    from app.nodes.excel import unverified_row_ids   # тот же расчёт, что у исходной книги
 
-    hyp_map = load_json(run_id, "06_map.json", HypothesisMap)
-    request = load_json(run_id, "07_request.json", DataRequest)
-    buckets = load_json(run_id, "04_buckets.json", Buckets)
-    unverified = _unverified_row_ids(hyp_map, buckets)
+    hyp_map = load_json(run_id, MAP_FILE, HypothesisMap)
+    request = load_json(run_id, REQUEST_FILE, DataRequest)
+    buckets = load_json(run_id, BUCKETS_FILE, Buckets)
+    unverified = unverified_row_ids(hyp_map, buckets)
     taken = [row.row_id for row in hyp_map.rows] + list(unverified.values())
     state = VersionState(
         next_row_id=max(taken, default=0) + 1,
@@ -81,7 +83,7 @@ def ensure_v0(run_id: str) -> VersionState:
     )
     _snapshot(run_id, 0)
     save_json(run_id, _STATE, state)
-    save_json(run_id, f"{VERSIONS}/v0/state.json", state)   # пометки версии — для отката
+    save_json(run_id, f"{VERSIONS_DIR}/v0/state.json", state)   # пометки версии — для отката
     log_event(run_id, "version_created", version=0)
     return state
 
@@ -100,14 +102,14 @@ def commit(run_id: str, state: VersionState, entries: list[JournalEntry]) -> Ver
             f.write(e.model_dump_json() + "\n")
     new_state = state.model_copy(update={"current": n})
     save_json(run_id, _STATE, new_state)
-    save_json(run_id, f"{VERSIONS}/v{n}/state.json", new_state)   # пометки версии — для отката
+    save_json(run_id, f"{VERSIONS_DIR}/v{n}/state.json", new_state)   # пометки версии — для отката
     log_event(run_id, "version_created", version=n, changes=[f"{e.kind}: {e.target}" for e in entries])
     return new_state
 
 
 def version_state(run_id: str, n: int) -> VersionState | None:
     """Состояние на момент версии n (пометки «правлено» и «устарело» той версии)."""
-    rel = f"{VERSIONS}/v{n}/state.json"
+    rel = f"{VERSIONS_DIR}/v{n}/state.json"
     return load_json(run_id, rel, VersionState) if (run_dir(run_id) / rel).is_file() else None
 
 
@@ -120,7 +122,7 @@ def read_journal(run_id: str) -> list[JournalEntry]:
 
 def restore(run_id: str, n: int) -> None:
     """Вернуть корень к версии n побайтно: чистые артефакты корня заменяются снимком."""
-    root, snap = run_dir(run_id), run_dir(run_id) / VERSIONS / f"v{n}"
+    root, snap = run_dir(run_id), run_dir(run_id) / VERSIONS_DIR / f"v{n}"
     for rel in artifact_files(root):
         (root / rel).unlink()
     for rel in artifact_files(snap):
@@ -133,7 +135,7 @@ def recover(run_id: str) -> bool:
     state = load_state(run_id)
     if state is None:
         return False
-    root, snap = run_dir(run_id), run_dir(run_id) / VERSIONS / f"v{state.current}"
+    root, snap = run_dir(run_id), run_dir(run_id) / VERSIONS_DIR / f"v{state.current}"
     same = artifact_files(root) == artifact_files(snap) and all(
         (root / rel).read_bytes() == (snap / rel).read_bytes() for rel in artifact_files(snap)
     )

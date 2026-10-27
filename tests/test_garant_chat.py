@@ -12,7 +12,8 @@ import pytest
 from pydantic import ValidationError
 
 from app import garant_chat
-from app.garant_chat import GarantFile, GarantTable, GarantTurn
+from app.config import GARANT_ALL_TOOLS
+from app.contracts import GarantFile, GarantTable, GarantTurn
 from app.runner import CallResult
 
 
@@ -64,12 +65,12 @@ def test_turn_new_session_saves_reply_and_session(chat, monkeypatch):
     assert call["trace_name"] == "turns/0001.raw.json" and "resume_session_id" not in call
     assert call["mcp_tools"] is None                                   # Гарант недоступен — без MCP
     assert "Гарант сейчас недоступен" in call["document"] and "Действует ли акт?" in call["document"]
-    roles = [m["role"] for m in garant_chat.read_chat(chat)]
+    roles = [m.role for m in garant_chat.read_chat(chat)]
     assert roles == ["пользователь", "ассистент"]
-    assert garant_chat.read_chat(chat)[1]["sources"] == ["Гарант: ПП № 1"]
+    assert garant_chat.read_chat(chat)[1].sources == ["Гарант: ПП № 1"]
     session = json.loads((garant_chat.run_dir(garant_chat.chat_run_id(chat)) / garant_chat.SESSION).read_text())
     assert session["session_id"] == "sess-A"
-    assert garant_chat.chat_info(chat)["title"] == "Действует ли акт?"
+    assert garant_chat.chat_info(chat).title == "Действует ли акт?"
     assert garant_chat.busy_state(chat) is None
 
 
@@ -77,7 +78,7 @@ def test_turn_with_garant_gives_all_garant_tools(chat, monkeypatch):
     monkeypatch.setattr(garant_chat, "garant_available", lambda: True)
     calls = _fake_calls(monkeypatch, _ok(GarantTurn(reply="ок")))
     garant_chat.turn(chat, "найди акт")
-    assert calls[0]["mcp_tools"] == list(garant_chat.GARANT_ALL_TOOLS)
+    assert calls[0]["mcp_tools"] == list(GARANT_ALL_TOOLS)
     assert "СЛУЖЕБНО" not in calls[0]["document"]
 
 
@@ -109,8 +110,8 @@ def test_failed_turn_is_understandable(chat, monkeypatch):
     result = garant_chat.turn(chat, "вопрос")
     assert not result.ok
     last = garant_chat.read_chat(chat)[-1]
-    assert last["mark"] == "сбой" and last["text"].startswith("Не получилось ответить")
-    assert "Timeout" not in last["text"] and "/home" not in last["text"]
+    assert last.mark == "сбой" and last.text.startswith("Не получилось ответить")
+    assert "Timeout" not in last.text and "/home" not in last.text
 
 
 def test_document_resets_session_and_goes_to_context(chat, monkeypatch):
@@ -129,8 +130,8 @@ def test_document_resets_session_and_goes_to_context(chat, monkeypatch):
     assert not (root / garant_chat.SESSION).exists()                  # следующий ход — новая сессия
     assert not (root / "01_document.md").exists()
     assert "ТЕКСТ ПОСТАНОВЛЕНИЯ п. 1" in garant_chat.shared_context(chat)
-    assert garant_chat.read_chat(chat)[-1]["mark"] == "документ"
-    assert garant_chat.chat_info(chat)["title"] == "привет"           # название уже было — не меняется
+    assert garant_chat.read_chat(chat)[-1].mark == "документ"
+    assert garant_chat.chat_info(chat).title == "привет"           # название уже было — не меняется
 
 
 def test_unreadable_document_explained(chat, monkeypatch):
@@ -141,7 +142,7 @@ def test_unreadable_document_explained(chat, monkeypatch):
     with pytest.raises(ValueError) as error:
         garant_chat.add_document(chat, "скан.pdf", b"%PDF")
     assert "Не удалось прочитать файл «скан.pdf»" in str(error.value) and "/home" not in str(error.value)
-    assert garant_chat.chat_info(chat)["documents"] == []
+    assert garant_chat.chat_info(chat).documents == []
 
 
 def test_file_contract_requires_matching_content():
@@ -200,7 +201,7 @@ def test_turn_files_made_and_listed(chat, monkeypatch):
     _fake_calls(monkeypatch, _ok(GarantTurn(reply="Сделал справку.", files=[spec])))
     result = garant_chat.turn(chat, "сделай справку")
     assert result.files == [{"name": "Справка.docx", "format": "docx"}]
-    assert garant_chat.read_chat(chat)[-1]["files"] == [{"name": "Справка.docx", "format": "docx"}]
+    assert [f.model_dump() for f in garant_chat.read_chat(chat)[-1].files] == [{"name": "Справка.docx", "format": "docx"}]
     assert garant_chat.file_path(chat, "Справка.docx") is not None
 
 
@@ -214,8 +215,8 @@ def test_turn_file_failure_reported(chat, monkeypatch):
     monkeypatch.setattr(garant_chat, "render_file", broken)
     garant_chat.turn(chat, "сделай справку")
     chat_log = garant_chat.read_chat(chat)
-    assert chat_log[-2]["role"] == "ассистент" and chat_log[-1]["mark"] == "сбой"
-    assert "Справка.docx" in chat_log[-1]["text"]
+    assert chat_log[-2].role == "ассистент" and chat_log[-1].mark == "сбой"
+    assert "Справка.docx" in chat_log[-1].text
 
 
 def test_upload_error_messages():

@@ -29,7 +29,8 @@ from app.contracts import (
     Verdict,
 )
 from app.feedback import _col, _find_header_row
-from app.nodes.excel import build_excel, compute_years
+from app.nodes.common import compute_years
+from app.nodes.excel import build_excel
 from app.contracts import ActPassport
 from app.trace import run_dir
 import pytest

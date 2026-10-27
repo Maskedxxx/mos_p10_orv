@@ -35,13 +35,16 @@ from app.contracts import (
     EditText, HypothesisMap, HypothesisSet, JournalEntry, MapRow, MergeMapRows, Operation, RecheckIndicator,
     RequestItem, RunMeta, RunProgress, SetVerdict, SplitRequestItem, Verdict, VersionState,
 )
-from app.nodes.excel import _points, _unverified_verdicts, build_excel, violated_without_rows
+from app.nodes.excel import points_text, unverified_verdicts, build_excel, violated_without_rows
 from app.nodes.hypotheses import run_hypotheses_no_data, run_hypotheses_violated
-from app.nodes.merge import _clause_tokens, _fallback_map, _flatten_hypotheses
+from app.nodes.merge import clause_tokens, fallback_map, flatten_hypotheses
 from app.nodes.request import build_request
 from app.nodes.sort import sort_verdicts
 from app.nodes.verdicts import run_verdicts
-from app.trace import load_json, run_dir, save_bytes, save_json
+from app.trace import (
+    BUCKETS_FILE, DOCUMENT_FILE, HYPOTHESES_DIR, MAP_FILE, META_FILE, PASSPORT_FILE, PROGRESS_FILE, REQUEST_FILE,
+    VERDICTS_DIR, VERSIONS_DIR, load_json, run_dir, save_bytes, save_json,
+)
 
 
 class OperationError(Exception):
@@ -96,12 +99,12 @@ class _Ctx:
 
 def _load(run_id: str, state: VersionState) -> _Ctx:
     root = run_dir(run_id)
-    verdicts = {int(p.stem): load_json(run_id, f"03_verdicts/{p.name}", Verdict)
-                for p in sorted((root / "03_verdicts").glob("[0-9][0-9].json"))}
-    passport = load_json(run_id, "02_passport.json", ActPassport) if (root / "02_passport.json").is_file() else None
-    document = (root / "01_document.md").read_text(encoding="utf-8") if (root / "01_document.md").is_file() else ""
-    return _Ctx(run_id, state.model_copy(deep=True), verdicts, load_json(run_id, "06_map.json", HypothesisMap),
-                load_json(run_id, "07_request.json", DataRequest), passport, document)
+    verdicts = {int(p.stem): load_json(run_id, f"{VERDICTS_DIR}/{p.name}", Verdict)
+                for p in sorted((root / VERDICTS_DIR).glob("[0-9][0-9].json"))}
+    passport = load_json(run_id, PASSPORT_FILE, ActPassport) if (root / PASSPORT_FILE).is_file() else None
+    document = (root / DOCUMENT_FILE).read_text(encoding="utf-8") if (root / DOCUMENT_FILE).is_file() else ""
+    return _Ctx(run_id, state.model_copy(deep=True), verdicts, load_json(run_id, MAP_FILE, HypothesisMap),
+                load_json(run_id, REQUEST_FILE, DataRequest), passport, document)
 
 
 def _valid(model_cls, obj, **update):
@@ -177,24 +180,24 @@ def _edit_text(ctx: _Ctx, op: EditText) -> Change:
         ctx.verdicts[n] = _valid(Verdict, old, rationale_brief=points)
         _add_once(marks.edited_verdicts, n)
         return Change(f"Вердикты, инд. {n}", "обоснование переформулировано",
-                      _points(old.rationale_brief, old.rationale), _points(points, ""))
+                      points_text(old.rationale_brief, old.rationale), points_text(points, ""))
     if op.sheet == "строка карты":
         row = _row(ctx, int(op.key))
         if op.field in _MAP_FIELDS:
             full = _MAP_FIELDS[op.field]
-            before = _points(getattr(row, _BRIEF_OF[full]), getattr(row, full))
+            before = points_text(getattr(row, _BRIEF_OF[full]), getattr(row, full))
             after = _split_points(op.new_text)
             new_row = _valid(MapRow, row, **{_BRIEF_OF[full]: after})
-            after = _points(after, "")
+            after = points_text(after, "")
         else:
             if op.effect_index > len(row.effects):
                 raise OperationError(f"у строки {row.row_id} нет эффекта № {op.effect_index}")
             effects = [e.model_dump() for e in row.effects]
             effect, full = effects[op.effect_index - 1], _EFFECT_FIELDS[op.field]
             if full in _BRIEF_OF:   # «как считать», «что подтвердит» — выжимка
-                before = _points(effect[_BRIEF_OF[full]], effect[full])
+                before = points_text(effect[_BRIEF_OF[full]], effect[full])
                 effect[_BRIEF_OF[full]] = _split_points(op.new_text)
-                after = _points(effect[_BRIEF_OF[full]], "")
+                after = points_text(effect[_BRIEF_OF[full]], "")
             else:                   # название показателя — одно, выжимки у него нет
                 before, after = effect[full], op.new_text
                 effect[full] = op.new_text
@@ -386,16 +389,12 @@ def _split_request_item(ctx: _Ctx, op: SplitRequestItem) -> Change:
 # ---- операции с моделью: кандидат → «Принять» ------------------------------
 
 def _meta_cost(run_id: str) -> float:
-    return load_json(run_id, "meta.json", RunMeta).cost_usd
-
-
-def _passport_dict(ctx: _Ctx) -> dict | None:
-    return ctx.passport.model_dump(mode="json") if ctx.passport else None
+    return load_json(run_id, META_FILE, RunMeta).cost_usd
 
 
 def _prepare_recheck(ctx: _Ctx, op: RecheckIndicator, prefix: str) -> Candidate:
     start = _meta_cost(ctx.run_id)
-    meta = load_json(ctx.run_id, "meta.json", RunMeta)   # настройки прогона — те же, что при разборе (2.7)
+    meta = load_json(ctx.run_id, META_FILE, RunMeta)   # настройки прогона — те же, что при разборе (2.7)
     new = run_verdicts(ctx.document_md, ctx.run_id, passport=ctx.passport, indicators=[op.indicator],
                        extra_instruction=op.clarification, trace_prefix=prefix, save=False,
                        regions=meta.comparison_regions, search_limits=meta.search_limits)[0]
@@ -403,9 +402,9 @@ def _prepare_recheck(ctx: _Ctx, op: RecheckIndicator, prefix: str) -> Candidate:
     if new.verdict == "ошибка":
         raise OperationError(f"перепроверка не удалась: {new.rationale[:300]}")
     old = ctx.verdicts[op.indicator]
-    checks_path = run_dir(ctx.run_id) / f"{prefix}03_verdicts/{op.indicator:02d}.checks.json"
-    return Candidate(op, new, f"{old.verdict}\n{_points(old.rationale_brief, old.rationale)}",
-                     f"{new.verdict}\n{_points(new.rationale_brief, new.rationale)}", cost,
+    checks_path = run_dir(ctx.run_id) / f"{prefix}{VERDICTS_DIR}/{op.indicator:02d}.checks.json"
+    return Candidate(op, new, f"{old.verdict}\n{points_text(old.rationale_brief, old.rationale)}",
+                     f"{new.verdict}\n{points_text(new.rationale_brief, new.rationale)}", cost,
                      checks=checks_path.read_bytes() if checks_path.is_file() else None)
 
 
@@ -413,7 +412,7 @@ def _accept_recheck(ctx: _Ctx, cand: Candidate) -> Change:
     new: Verdict = cand.payload
     before = _apply_verdict(ctx, new)
     if cand.checks is not None:   # таблица проверки — та, на которой стоит новый вердикт
-        save_bytes(ctx.run_id, f"03_verdicts/{new.indicator:02d}.checks.json", cand.checks)
+        save_bytes(ctx.run_id, f"{VERDICTS_DIR}/{new.indicator:02d}.checks.json", cand.checks)
     return Change(f"Вердикты, инд. {new.indicator}", "вердикт перепроверен агентом индикатора", before, new.verdict)
 
 
@@ -444,10 +443,10 @@ def _prepare_hypotheses(ctx: _Ctx, op: BuildHypotheses, prefix: str) -> Candidat
 
 def _accept_hypotheses(ctx: _Ctx, cand: Candidate) -> Change:
     hset: HypothesisSet = cand.payload
-    rows = [row.model_copy(update={"row_id": _new_row_id(ctx)}) for row in _fallback_map(_flatten_hypotheses([hset])).rows]
+    rows = [row.model_copy(update={"row_id": _new_row_id(ctx)}) for row in fallback_map(flatten_hypotheses([hset])).rows]
     near = []
     for row in rows:
-        same = [r.row_id for r in ctx.hyp_map.rows if _clause_tokens(r.clause) & _clause_tokens(row.clause)]
+        same = [r.row_id for r in ctx.hyp_map.rows if clause_tokens(r.clause) & clause_tokens(row.clause)]
         if same:
             near.append(f"стр. {row.row_id} — тот же пункт, что у стр. {', '.join(map(str, same))}: проверьте, не дубль ли")
         if _needs_request(row):
@@ -463,7 +462,7 @@ def _prepare_request(ctx: _Ctx, op: AppendRequest, prefix: str) -> Candidate:
     rows = [_row(ctx, r) for r in op.row_ids]
     start = _meta_cost(ctx.run_id)
     extended = build_request(HypothesisMap(rows=rows), ctx.run_id, document_md=ctx.document_md,
-                             passport=_passport_dict(ctx), existing=ctx.request, trace_prefix=prefix, save=False)
+                             passport=ctx.passport, existing=ctx.request, trace_prefix=prefix, save=False)
     cost = _meta_cost(ctx.run_id) - start
     new_items = extended.items[len(ctx.request.items):]
     after = "\n".join(f"— {it.metric}" for it in new_items) or "новых позиций нет — всё покрыто существующими"
@@ -563,18 +562,18 @@ def _commit(ctx: _Ctx, op: Operation, change: Change, cost: float) -> StepResult
                          reason=op.reason, cost_usd=round(cost, 4))
     try:
         for v in ctx.verdicts.values():
-            save_json(run_id, f"03_verdicts/{v.indicator:02d}.json", v)
+            save_json(run_id, f"{VERDICTS_DIR}/{v.indicator:02d}.json", v)
         buckets = sort_verdicts(list(ctx.verdicts.values()), run_id)
         for n_ind, hset in ctx.new_sets.items():
-            save_json(run_id, f"05_hypotheses/{n_ind:02d}.json", hset)
-        save_json(run_id, "06_map.json", ctx.hyp_map)
-        save_json(run_id, "07_request.json", ctx.request)
+            save_json(run_id, f"{HYPOTHESES_DIR}/{n_ind:02d}.json", hset)
+        save_json(run_id, MAP_FILE, ctx.hyp_map)
+        save_json(run_id, REQUEST_FILE, ctx.request)
         # Новая строка «проверка не завершена» получает номер из того же счётчика, что
         # и строки карты: номер удалённой строки не достаётся никому (шаг 1.5)
-        for v in _unverified_verdicts(ctx.hyp_map, buckets):
+        for v in unverified_verdicts(ctx.hyp_map, buckets):
             if v.indicator not in state.unverified_ids:
                 state.unverified_ids[v.indicator] = _new_row_id(ctx)
-        meta = load_json(run_id, "meta.json", RunMeta)
+        meta = load_json(run_id, META_FILE, RunMeta)
         analyzed = datetime.datetime.fromisoformat(meta.finished_at) if meta.finished_at else None
         journal = versions.read_journal(run_id) + [entry]
         excel = build_excel(ctx.hyp_map, ctx.request, buckets, ctx.passport, run_id, version=n,
@@ -596,10 +595,10 @@ def _run_gaps(run_id: str, journal: list[JournalEntry]) -> set[int] | None:
     по такому индикатору (журнал: «Карта гипотез, инд. N») — сбой закрыт, дальше строки — его решение
     (повторное ревью). Снимка нет — None.
     """
-    v0 = f"{versions.VERSIONS}/v0"
+    v0 = f"{VERSIONS_DIR}/v0"
     try:
-        gaps = violated_without_rows(load_json(run_id, f"{v0}/06_map.json", HypothesisMap),
-                                     load_json(run_id, f"{v0}/04_buckets.json", Buckets))
+        gaps = violated_without_rows(load_json(run_id, f"{v0}/{MAP_FILE}", HypothesisMap),
+                                     load_json(run_id, f"{v0}/{BUCKETS_FILE}", Buckets))
     except (OSError, ValueError):
         return None
     built = {int(m.group(1)) for e in journal if (m := _BUILT_TARGET.fullmatch(e.target))}
@@ -612,11 +611,11 @@ def _short(text: str | None, limit: int = 1500) -> str | None:
 
 def _refresh_progress(run_id: str, ctx: _Ctx, excel) -> None:
     """Сводка страницы прогона — по текущей версии; сам progress.json диалог не создаёт."""
-    from app.pipeline import PROGRESS_FILE, _build_summary   # тяжёлый модуль — только когда нужен
+    from app.pipeline import build_summary   # тяжёлый модуль — только когда нужен
 
     if not (run_dir(run_id) / PROGRESS_FILE).is_file():
         return
     progress = load_json(run_id, PROGRESS_FILE, RunProgress)
-    summary = _build_summary(list(ctx.verdicts.values()), ctx.hyp_map, ctx.request, excel)
+    summary = build_summary(list(ctx.verdicts.values()), ctx.hyp_map, ctx.request, excel)
     save_json(run_id, PROGRESS_FILE, progress.model_copy(update={
-        "summary": summary, "total_cost_usd": load_json(run_id, "meta.json", RunMeta).cost_usd}))
+        "summary": summary, "total_cost_usd": load_json(run_id, META_FILE, RunMeta).cost_usd}))

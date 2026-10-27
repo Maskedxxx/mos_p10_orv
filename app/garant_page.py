@@ -2,7 +2,7 @@
 Страницы Гарант-помощника (платформа, шаги 3–4; владелец 23.10): список бесед и беседа с агентом.
 
 Подключаются из app/web.py вызовом register(_layout, _who). Сам модуль app.web не импортирует: прод запускается
-как `python -m app.web`, и повторный импорт исполнил бы модуль заново. Вход проверяет AuthMiddleware web.py —
+как `python -m app.web`, и повторный импорт исполнил бы модуль заново. Вход проверяет AuthMiddleware (app/auth.py) —
 он накрывает все адреса сервиса, в том числе эти страницы и скачивание файлов (/_nicegui/auto/ закрыт без входа).
 
 Логика беседы — app/garant_chat.py. Страница только показывает беседу, принимает документ и сообщение
@@ -22,12 +22,9 @@ from nicegui.events import UploadEventArguments
 
 from app import garant_chat, garant_limits
 from app.actions import Who, log_action
-from app.config import ACCEPTED_EXTENSIONS
+from app.config import ACCEPTED_EXTENSIONS, GARANT_LIMITS_CACHE_S, GARANT_POLL_S, MAX_UPLOAD_BYTES, MAX_UPLOAD_MB
 from app.trace import log_event
 
-MAX_UPLOAD_MB = 20                          # как на странице загрузки прогона (app/web.py, MAX_UPLOAD_MB)
-MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
-POLL_S = 1.0                                # как часто страница смотрит, не появилось ли новое в беседе
 _URL_RE = re.compile(r"https?://[^\s<>\"']+")
 # Строки сервиса в беседе: метка → значок и цвет (27.10: «документ» тёмно-серым — красный только у сбоя)
 _MARKS = {"документ": ("description", "ink"), "лимиты": ("account_balance_wallet", "amber-8"),
@@ -104,7 +101,7 @@ def register(layout: Callable[[Who], None], who_of: Callable[[Request], Who]) ->
 
 
 class _ChatView:
-    """Экран беседы: опрашивает папку беседы раз в POLL_S и перерисовывает то, что изменилось."""
+    """Экран беседы: опрашивает папку беседы раз в GARANT_POLL_S и перерисовывает то, что изменилось."""
 
     def __init__(self, chat_id: str, who: Who) -> None:
         self._chat_id = chat_id
@@ -139,8 +136,8 @@ class _ChatView:
                         "autogrow outlined").classes("flex-grow")
                     self._send = ui.button(icon="send", on_click=self._on_send).props("unelevated")
         self._input.on("keydown.ctrl.enter", self._on_send)
-        ui.timer(POLL_S, self._tick)
-        ui.timer(garant_limits.CACHE_S, self._refresh_limits)
+        ui.timer(GARANT_POLL_S, self._tick)
+        ui.timer(GARANT_LIMITS_CACHE_S, self._refresh_limits)
         ui.timer(0.1, self._refresh_limits, once=True)
         self._tick()
 
@@ -148,9 +145,9 @@ class _ChatView:
 
     def _tick(self) -> None:
         info = garant_chat.chat_info(self._chat_id)
-        self._title.set_text(info.get("title") or "Новая беседа")
-        docs = info.get("documents") or []
-        self._docs.set_text("Документы: " + "; ".join(f"«{d['name']}»" for d in docs) if docs
+        self._title.set_text(info.title or "Новая беседа")
+        docs = info.documents
+        self._docs.set_text("Документы: " + "; ".join(f"«{d.name}»" for d in docs) if docs
                             else "Документ не приложен — можно спрашивать и без него.")
         chat = garant_chat.read_chat(self._chat_id)
         if len(chat) != self._shown:
@@ -180,27 +177,27 @@ class _ChatView:
             if not chat:
                 ui.label("Здесь будет переписка с помощником.").classes("text-sm text-gray-500 p-2")
             for message in chat:
-                if message["role"] == "сервис":
-                    icon, color = _MARKS.get(message.get("mark"), ("info", "grey-6"))
+                if message.role == "сервис":
+                    icon, color = _MARKS.get(message.mark, ("info", "grey-6"))
                     with ui.row().classes("w-full items-start flex-nowrap gap-2 px-3 py-2 bg-gray-100 rounded"):
                         ui.icon(icon, color=color).classes("text-lg")
-                        ui.label(message["text"]).classes("text-sm text-gray-800 whitespace-pre-line")
+                        ui.label(message.text).classes("text-sm text-gray-800 whitespace-pre-line")
                     continue
-                stamp = message.get("at", "")[11:16]
-                if message["role"] == "пользователь":
-                    ui.chat_message(text=message["text"], name="Вы", sent=True, stamp=stamp).classes("w-full")
+                stamp = message.at[11:16]
+                if message.role == "пользователь":
+                    ui.chat_message(text=message.text, name="Вы", sent=True, stamp=stamp).classes("w-full")
                     continue
                 with ui.chat_message(name="Помощник", sent=False, stamp=stamp).classes("w-full"):
-                    ui.markdown(message["text"])
-                    if message.get("sources"):
-                        ui.html(sources_html(message["sources"]), sanitize=False)
-                    for f in message.get("files") or []:
-                        ui.button(f"Скачать «{f['name']}»", icon="download",
-                                  on_click=lambda name=f["name"]: self._download(name)).props("outline dense")
-                if message.get("steps"):   # что помощник делал в этом ходе — свёрнуто под ответом
-                    with ui.expansion(f"Шаги помощника ({len(message['steps'])})").classes(
+                    ui.markdown(message.text)
+                    if message.sources:
+                        ui.html(sources_html(message.sources), sanitize=False)
+                    for f in message.files or []:
+                        ui.button(f"Скачать «{f.name}»", icon="download",
+                                  on_click=lambda name=f.name: self._download(name)).props("outline dense")
+                if message.steps:   # что помощник делал в этом ходе — свёрнуто под ответом
+                    with ui.expansion(f"Шаги помощника ({len(message.steps)})").classes(
                             "w-full text-xs text-gray-600"):
-                        for step in message["steps"]:
+                        for step in message.steps:
                             ui.label(f"→ {step}").classes("text-xs text-gray-600")
         self._scroll.scroll_to(percent=1.0)
 

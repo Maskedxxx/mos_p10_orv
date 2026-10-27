@@ -3,9 +3,9 @@
 
 Отвечает за папку runs/<run_id>/ и запись всех артефактов пайплайна:
 
-    00_input.docx
+    00_input.<расширение акта>
     01_document.md
-    02_summary.md
+    02_passport.json
     03_verdicts/01.json .. 12.json
     03_verdicts/01.raw.json .. 12.raw.json     сырой ответ claude -p целиком
     04_buckets.json
@@ -15,7 +15,13 @@
     08_result.xlsx
     run.log
     meta.json
+    progress.json                              ход прогона по узлам (оркестратор)
     events.jsonl                               журнал сессии (2.7): одно событие — одна строка
+
+ИМЕНА ФАЙЛОВ (27.10, модульность). Имя файла папки прогона, которое нужно двум и более модулям, записано
+строкой только здесь, в разделе «Файлы папки прогона»; остальные модули берут его отсюда. Имя, нужное одному
+модулю (файлы чата помощника, беседы Гаранта, лог прогона), живёт в своём модуле. Сторож —
+tests/test_structure.py.
 
 Требование владельца: сырой ответ (`save_raw`) сохраняется ВСЕГДА, включая упавшие
 попытки — иначе нечем отлаживать. Повторная попытка с тем же именем не затирает
@@ -49,9 +55,24 @@ from pydantic import BaseModel
 
 import app.config as config
 from app.config import RUNS_DIR
-from app.contracts import RunMeta
+from app.contracts import RunMeta, RunProgress
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
+
+# ---- Файлы папки прогона (27.10: единственное место, где их имена записаны строкой) ----
+INPUT_STEM = "00_input"              # загруженный акт: 00_input + расширение акта (страница загрузки)
+DOCUMENT_FILE = "01_document.md"     # текст акта в markdown (узел чтения, app/nodes/convert.py)
+PASSPORT_FILE = "02_passport.json"   # паспорт акта (узел паспорта)
+VERDICTS_DIR = "03_verdicts"         # вердикты индикаторов NN.json и таблицы проверок NN.checks.json (узел вердиктов)
+BUCKETS_FILE = "04_buckets.json"     # вердикты, разложенные по кучам (узел сортировки)
+HYPOTHESES_DIR = "05_hypotheses"     # наборы гипотез по индикаторам NN.json (узлы гипотез)
+MAP_FILE = "06_map.json"             # карта гипотез (узел слияния)
+REQUEST_FILE = "07_request.json"     # бланк запроса показателей органу (узел запроса)
+EXCEL_FILE = "08_result.xlsx"        # итоговый Excel для эксперта (узел Excel)
+META_FILE = "meta.json"              # сведения о прогоне: имя акта, настройки, стоимость (new_run, add_cost)
+PROGRESS_FILE = "progress.json"      # ход прогона по узлам (оркестратор app/pipeline.py; страница читает раз в секунду)
+VERSIONS_DIR = "versions"            # версии результата после прогона (app/versions.py): vN/, state.json, journal.jsonl
+DIALOG_STATUS_FILE = "dialog/status.json"   # что идёт по прогону прямо сейчас (действия чата, app/dialog.py)
 
 EVENTS_FILE = "events.jsonl"
 # Итог закрытой сессии (2.7, app/sessions.py): есть файл — сессия закрыта, журнал больше не пишется
@@ -59,8 +80,8 @@ SESSION_SUMMARY_FILE = "session_summary.json"
 SESSIONS_DIR = "sessions"   # 23.10: итоги прошлых сессий прогона, открытого заново — sessions/01.json, …
 # Служебные файлы, которые пишутся часто (каждое изменение прогресса, статус диалога), и снимки
 # версий (о них — событие version_created): как артефакты не журналируются, иначе шум
-_NOT_ARTIFACTS = {"meta.json", "progress.json", "dialog/status.json", EVENTS_FILE}
-_NOT_ARTIFACT_DIRS = ("versions/",)
+_NOT_ARTIFACTS = {META_FILE, PROGRESS_FILE, DIALOG_STATUS_FILE, EVENTS_FILE}
+_NOT_ARTIFACT_DIRS = (f"{VERSIONS_DIR}/",)
 _events_lock = threading.Lock()   # события приходят из потоков индикаторов, веток гипотез и страницы
 
 
@@ -212,7 +233,7 @@ def new_run(
         search_limits=search_limits,
         developers=list(developers or []),
     )
-    save_json(run_id, "meta.json", meta)
+    save_json(run_id, META_FILE, meta)
     log_event(run_id, "session_created", act_filename=act_filename, act_types=meta.act_types,
               comparison_regions=comparison_regions, search_limits=search_limits, developers=meta.developers)
     return run_id
@@ -285,6 +306,21 @@ def load_json(run_id: str, relname: str, model_cls: type[ModelT]) -> ModelT:
     return model_cls.model_validate(data)
 
 
+def read_progress(run_id: str) -> RunProgress | None:
+    """
+    Прочитать progress.json прогона. Любая неудача — None, а не исключение.
+
+    Страница опрашивает файл раз в секунду, а его может ещё не быть (прогон стоит
+    в очереди и не начинался) или он может не разобраться. Такой тик просто
+    пропускается: показывать аналитику трассировку незачем. 27.10: одна функция
+    вместо двух одинаковых (страница и закрытие сессий).
+    """
+    try:
+        return load_json(run_id, PROGRESS_FILE, RunProgress)
+    except Exception:
+        return None
+
+
 def update_meta(run_id: str, **fields: Any) -> None:
     """
     Обновить meta.json, не теряя ранее записанные поля.
@@ -294,7 +330,26 @@ def update_meta(run_id: str, **fields: Any) -> None:
     ValidationError, а не молчаливая потеря или порча данных. Если валидация не прошла,
     файл на диске остаётся нетронутым — запись происходит только после её успеха.
     """
-    meta = load_json(run_id, "meta.json", RunMeta)
+    meta = load_json(run_id, META_FILE, RunMeta)
     merged = {**meta.model_dump(), **fields}
     updated = RunMeta.model_validate(merged)
-    save_json(run_id, "meta.json", updated)
+    save_json(run_id, META_FILE, updated)
+
+
+# Лок для потокобезопасного прибавления стоимости к meta.json (27.10 перенесён сюда из узла гипотез):
+# узлы прибавляют стоимость из потоков одного процесса, оркестратор под ним же читает сумму и пишет статус
+META_LOCK = threading.Lock()
+
+
+def add_cost(run_id: str, cost_delta: float) -> None:
+    """
+    Прибавить стоимость вызовов узла к уже записанной в meta.json, не затирая её.
+
+    Лок сериализует чтение+запись между узлами [4а] и [4б], если оба вызваны
+    оркестратором параллельно в потоках одного процесса. Если оркестратор
+    когда-нибудь станет запускать узлы отдельными процессами — thread-lock не
+    защитит, потребуется файловая блокировка (например fcntl.flock).
+    """
+    with META_LOCK:
+        current = load_json(run_id, META_FILE, RunMeta)
+        update_meta(run_id, cost_usd=current.cost_usd + cost_delta)

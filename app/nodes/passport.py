@@ -16,7 +16,7 @@ runner.call со схемой ActPassport (--json-schema): реквизиты, �
 Таймаут отдельный (config.PASSPORT_TIMEOUT_S): на большом акте паспорт шёл
 до 640 с, обрыв API с ретраем в стандартные 900 с не укладывается.
 Артефакты: 02_passport.raw.json (сырой ответ, пишет runner) и 02_passport.json.
-Стоимость прибавляется к meta.json — переиспользуется _add_cost_to_meta.
+Стоимость прибавляется к meta.json — переиспользуется add_cost.
 """
 
 from __future__ import annotations
@@ -27,9 +27,8 @@ import re
 from app.config import ALLOWED_TOOLS_TEXT, PASSPORT_TIMEOUT_S, PROMPT_PASSPORT
 from app.contracts import ActPassport, ActPassportOutput, Developer
 from app.logger import get_run_logger
-from app.nodes.hypotheses import _add_cost_to_meta
 from app.runner import call, garant_available
-from app.trace import log_event, save_json
+from app.trace import PASSPORT_FILE, add_cost, log_event, save_json
 
 _YEAR_RE = re.compile(r"\b(?:19|20)\d{2}\b")
 
@@ -78,14 +77,14 @@ def make_passport(
         # 2.7 (А): кто издаёт приказы во исполнение акта — подсказка, какой орган ведёт процедуру
         mcp_tools=["garant_search"] if garant else None,
     )
-    _add_cost_to_meta(run_id, result.cost_usd)
+    add_cost(run_id, result.cost_usd)
 
     if not result.ok or result.value is None:
         logger.warning("passport: вызов модели провалился (%s)", result.error)
         return None
 
     passport = result.value
-    save_json(run_id, "02_passport.json", passport)
+    save_json(run_id, PASSPORT_FILE, passport)
     logger.info(
         "passport done: status=%s scope=%s A=%s B=%s C=%s D=%s F=%s G1=%s G2=%s H=%s cost=$%.4f",
         passport.status.status, passport.addressee.scope,

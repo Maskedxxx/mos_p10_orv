@@ -3760,6 +3760,85 @@ class DialogTurn(_Base):
     )
 
 
+# ==== ГАРАНТ-ПОМОЩНИК (платформа, 23.10; app/garant_chat.py) ====
+#
+# Ответ агента беседы: текст, источники и файлы на скачивание. Файлы собирает код по содержимому от агента.
+# 27.10 (модульность): перенесены сюда из app/garant_chat.py — все контракты ответа модели в одном модуле.
+
+class GarantTable(_Base):
+    """Таблица для файла Excel."""
+
+    headers: list[str] = Field(
+        min_length=1,
+        description="Заголовки столбцов по порядку, коротко и по-русски.",
+    )
+    rows: list[list[str]] = Field(
+        description="Строки таблицы: в каждой столько ячеек, сколько заголовков, по порядку столбцов. "
+                    "Значения — текстом, как их должен увидеть читатель.",
+    )
+
+
+class GarantFile(_Base):
+    """Файл на скачивание: содержимое даёт агент, собирает его сервис."""
+
+    purpose: str = Field(
+        min_length=1,
+        description="Что это за файл и почему выбран этот формат — одна фраза. Например: «справка по найденным "
+                    "редакциям — Word, пользователь просил документ».",
+    )
+    name: str = Field(
+        min_length=1,
+        description="Имя файла по-русски, без расширения и без пути: «Справка по редакциям акта».",
+    )
+    format: Literal["docx", "xlsx", "md", "pdf"] = Field(
+        description="Формат файла. «docx» — документ Word (по умолчанию для справок и записок). «xlsx» — таблица "
+                    "Excel, когда пользователь просит таблицу или данных много и они по столбцам. «pdf» — когда "
+                    "пользователь просит PDF. «md» — когда просит markdown или простой текст.",
+    )
+    text: str | None = Field(
+        default=None,
+        description="Содержимое для docx, pdf и md — markdown: заголовки «#», «##», «###», списки «- » и «1. », "
+                    "абзацы, таблицы в виде «| a | b |». Для xlsx — null.",
+    )
+    table: GarantTable | None = Field(
+        default=None,
+        description="Содержимое для xlsx — таблица. Для docx, pdf и md — null.",
+    )
+
+    @model_validator(mode="after")
+    def _content_matches_format(self) -> "GarantFile":
+        # Для каждого формата — своё содержимое: иначе файл собрать не из чего
+        if self.format == "xlsx" and self.table is None:
+            raise ValueError("для xlsx нужна таблица table")
+        if self.format != "xlsx" and not (self.text or "").strip():
+            raise ValueError(f"для {self.format} нужен текст text")
+        return self
+
+
+class GarantTurn(_Base):
+    """Ответ агента на одно сообщение пользователя."""
+
+    reply: str = Field(
+        min_length=1,
+        description="Ответ пользователю по-русски, в markdown: по существу, со ссылками на найденные документы "
+                    "(реквизиты, пункт). Только факты, которые ты прочитал инструментами в этом разговоре или нашёл "
+                    "в тексте приложенного документа; чего не нашёл — так и скажи. Если сделан файл — одной "
+                    "фразой, что в нём.",
+    )
+    sources: list[str] = Field(
+        default_factory=list,
+        description="Откуда взяты факты ответа, по одному источнику на элемент: документ Гаранта — реквизиты и "
+                    "что в нём (редакция, пункт); страница интернета — адрес и что на ней; приложенный документ — "
+                    "«документ пользователя, п. 2.8». Только то, что ты действительно прочитал. Пусто — в ответе "
+                    "нет фактов (уточняющий вопрос).",
+    )
+    files: list[GarantFile] = Field(
+        default_factory=list,
+        description="Файлы на скачивание — только когда пользователь просит файл, документ, таблицу или "
+                    "выгрузку. Иначе пусто.",
+    )
+
+
 # ==== СЛУЖЕБНЫЕ ====
 
 # ---- Версии диалогового режима (план итерации 3): журнал и пометки строк Excel ----
@@ -3802,14 +3881,16 @@ class Remark(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    sheet: Literal["Вердикты", "Карта гипотез", "Запрос показателей", "Вопросы органу"]   # 2.7: + вопросы (Ж2)
-    key: str                      # индикатор / № строки карты / № позиции запроса или вопроса
-    title: str                    # о чём строка: индикатор, начало гипотезы, показатель, вопрос
-    agree: str | None = None      # «Согласны?» — только на листе «Вердикты»
-    correct: str | None = None    # «Если нет — какой верный»
-    score: int | None = None      # «Оценка (1–5)» — на карте, в запросе и в вопросах
-    text: str = ""                # «Замечание»
-    where_to_search: str | None = None   # 2.7 (В): «Где искать» на листе «Вердикты» — подсказка для перепроверки
+    sheet: Literal["Вердикты", "Карта гипотез", "Запрос показателей", "Вопросы органу"] = Field(   # 2.7: + вопросы (Ж2)
+        description="Лист Excel, на котором эксперт оставил замечание.")
+    key: str = Field(description="Индикатор, № строки карты или № позиции запроса / вопроса.")
+    title: str = Field(description="О чём строка: индикатор, начало гипотезы, показатель, вопрос.")
+    agree: str | None = Field(default=None, description="«Согласны?» — только на листе «Вердикты».")
+    correct: str | None = Field(default=None, description="«Если нет — какой верный».")
+    score: int | None = Field(default=None, description="«Оценка (1–5)» — на карте, в запросе и в вопросах.")
+    text: str = Field(default="", description="«Замечание» эксперта.")
+    where_to_search: str | None = Field(   # 2.7 (В)
+        default=None, description="«Где искать» на листе «Вердикты» — подсказка эксперта для перепроверки.")
 
 
 class VersionState(BaseModel):
@@ -3822,6 +3903,95 @@ class VersionState(BaseModel):
     next_item_num: int                                        # следующий свободный номер позиции запроса
     unverified_ids: dict[int, int] = Field(default_factory=dict)  # индикатор → строка «проверка не завершена»
     marks: Marks = Field(default_factory=Marks)
+
+
+# ---- Файлы чатов (27.10, модульность): реплики, сессия CLI, «что идёт сейчас», сведения о беседе Гаранта ----
+# Помощник по прогону (app/dialog.py, папка dialog/ прогона) и Гарант-помощник (app/garant_chat.py, runs/garant/<id>/).
+# Модель этих контрактов не видит: это файлы сервиса, раньше читались словарями без схемы.
+
+ChatRole = Literal["пользователь", "ассистент", "сервис"]
+
+
+class ChatFile(BaseModel):
+    """Файл на скачивание в реплике Гарант-помощника (собран кодом в files/ беседы)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(description="Имя файла в папке files/ беседы — с ним же он скачивается.")
+    format: Literal["docx", "xlsx", "md", "pdf"] = Field(description="Формат файла.")
+
+
+class ChatEntry(BaseModel):
+    """Одна реплика чата — строка chat.jsonl. Пустые поля в файл не пишутся."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    at: str = Field(description="Когда записана, время в ISO-формате до секунд.")
+    role: ChatRole = Field(description="Кто говорит: пользователь, ассистент (помощник) или сервис (строка о действии).")
+    text: str = Field(description="Текст реплики.")
+    session: str | None = Field(default=None, description="Метка сессии браузера, чья реплика (s-7f3a91).")
+    mark: str | None = Field(default=None, description="Пометка строки сервиса: «шаг», «готово», «отменено», «сбой», "
+                                                      "«частично», «документ» и т. п. — по ней экран выбирает значок.")
+    plan: list[dict] | None = Field(default=None, description="План помощника — операции как JSON (контракт Operation); "
+                                                              "проверяются при применении.")
+    sources: list[str] | None = Field(default=None, description="Источники ответа помощника.")
+    steps: list[str] | None = Field(default=None, description="Что делал помощник в этом ходе — строки «что делаю».")
+    cost_usd: float | None = Field(default=None, description="Стоимость хода или шага, $.")
+    version: int | None = Field(default=None, description="Версия файла, которую создал этот шаг плана.")
+    files: list[ChatFile] | None = Field(default=None, description="Файлы на скачивание (Гарант-помощник).")
+
+
+class CliSession(BaseModel):
+    """Сессия CLI чата для --resume (session.json): модель помнит разговор, пока сессия жива."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str = Field(description="Номер сессии CLI.")
+    started: str = Field(description="Когда начата, время в ISO-формате.")
+    last_turn: str | None = Field(default=None, description="Когда был последний удачный ход.")
+    version_seen: int | None = Field(default=None, description="Помощник по прогону: какую версию файла модель видела "
+                                                               "в прошлом ходе — следующий ход скажет, что изменилось.")
+    cost_reported: float | None = Field(default=None, description="Стоимость сессии, как её сообщил CLI в прошлом ходе: "
+                                                                  "при --resume CLI сообщает сумму с начала сессии.")
+    resume_failures: int | None = Field(default=None, description="Помощник по прогону: сколько ходов подряд сессия "
+                                                                  "не продолжилась (с RESUME_FAILS_TO_RESET — новая).")
+
+
+class DialogStatus(BaseModel):
+    """Что идёт по прогону прямо сейчас (dialog/status.json); нет файла — ничего."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    state: Literal["думает", "шаг", "решение"] = Field(
+        description="«думает» — ход помощника, «шаг» — шаг плана или возврат версии, «решение» — ждёт человека.")
+    title: str = Field(description="Что идёт — строка над чатом.")
+    detail: str = Field(description="Подсказка к строке: сколько обычно длится или что нажать.")
+    since: str = Field(description="С какого момента, время в ISO-формате.")
+    server: str = Field(description="Процесс сервиса, записавший состояние: от прежнего процесса — действие прервано "
+                                    "перезапуском.")
+
+
+class GarantDocument(BaseModel):
+    """Документ, приложенный к беседе Гарант-помощника."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    n: int = Field(description="Номер документа в беседе: файлы docs/NN.<расширение> и docs/NN.md.")
+    name: str = Field(description="Имя файла, как его загрузил пользователь.")
+    chars: int = Field(description="Сколько знаков текста прочитано.")
+    at: str = Field(description="Когда приложен, время в ISO-формате.")
+
+
+class GarantChatInfo(BaseModel):
+    """Сведения о беседе Гарант-помощника (chat.json)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    title: str = Field(description="Название беседы; пусто — по первому сообщению или документу.")
+    created_at: str = Field(description="Когда создана, время в ISO-формате.")
+    created_by: str | None = Field(description="Метка сессии браузера создателя.")
+    documents: list[GarantDocument] = Field(default_factory=list, description="Приложенные документы по порядку.")
+
 
 class RunMeta(BaseModel):
     """Метаданные одного прогона пайплайна (для meta.json трейса)."""
@@ -3864,14 +4034,14 @@ class NodeState(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    key: str
-    title: str
-    status: NodeStatus = "ожидает"
-    started_at: str | None = None
-    finished_at: str | None = None
-    duration_s: float | None = None
-    cost_usd: float = 0.0
-    error: str | None = None
+    key: str = Field(description="Ключ узла: convert, passport, verdicts, sort, hypotheses, merge, request, excel.")
+    title: str = Field(description="Имя узла для страницы прогона.")
+    status: NodeStatus = Field(default="ожидает", description="Состояние узла.")
+    started_at: str | None = Field(default=None, description="Когда узел начал, время в ISO-формате.")
+    finished_at: str | None = Field(default=None, description="Когда узел закончил; пусто — ещё идёт или не начинался.")
+    duration_s: float | None = Field(default=None, description="Сколько шёл узел, секунд.")
+    cost_usd: float = Field(default=0.0, description="Стоимость вызовов модели в узле, $.")
+    error: str | None = Field(default=None, description="Текст сбоя узла; пусто — без сбоя.")
 
     @model_validator(mode="after")
     def _check_not_blank(self) -> "NodeState":
@@ -3891,15 +4061,15 @@ class RunSummary(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    violated: int = 0
-    compliant: int = 0
-    not_applicable: int = 0
-    no_data: int = 0
-    errors: int = 0
-    map_rows: int = 0
-    merges: int = 0
-    request_items: int = 0
-    excel_path: str | None = None
+    violated: int = Field(default=0, description="Индикаторов с вердиктом «нарушен».")
+    compliant: int = Field(default=0, description="Индикаторов с вердиктом «соблюдён».")
+    not_applicable: int = Field(default=0, description="Индикаторов с вердиктом «не применимо».")
+    no_data: int = Field(default=0, description="Индикаторов с вердиктом «нет данных».")
+    errors: int = Field(default=0, description="Индикаторов, проверка которых упала (вердикт «ошибка»).")
+    map_rows: int = Field(default=0, description="Строк в карте гипотез.")
+    merges: int = Field(default=0, description="Слияний дублей, которые записал узел слияния карты.")
+    request_items: int = Field(default=0, description="Позиций в бланке запроса показателей.")
+    excel_path: str | None = Field(default=None, description="Путь к итоговому Excel; пусто — не собран.")
 
 
 class RunProgress(BaseModel):
@@ -3917,16 +4087,17 @@ class RunProgress(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    run_id: str
-    act_filename: str
-    status: RunStatus = "в очереди"
-    nodes: list[NodeState] = Field(default_factory=list)
-    indicators: dict[str, NodeStatus] = Field(default_factory=dict)
-    hypotheses_branches: dict[str, NodeStatus] = Field(default_factory=dict)
-    started_at: str
-    finished_at: str | None = None
-    total_cost_usd: float = 0.0
-    summary: RunSummary | None = None
+    run_id: str = Field(description="Номер прогона — папка runs/<run_id>.")
+    act_filename: str = Field(description="Имя акта, как его видит оркестратор: 00_input и расширение акта.")
+    status: RunStatus = Field(default="в очереди", description="Состояние прогона целиком.")
+    nodes: list[NodeState] = Field(default_factory=list, description="Узлы графа выполнения по порядку.")
+    indicators: dict[str, NodeStatus] = Field(default_factory=dict, description="Индикатор «1»…«12» → статус вердикта.")
+    hypotheses_branches: dict[str, NodeStatus] = Field(
+        default_factory=dict, description="Ветка гипотез «violated» / «no_data» → статус.")
+    started_at: str = Field(description="Когда прогон начат, время в ISO-формате.")
+    finished_at: str | None = Field(default=None, description="Когда закончен; пусто — ещё идёт.")
+    total_cost_usd: float = Field(default=0.0, description="Стоимость прогона, $.")
+    summary: RunSummary | None = Field(default=None, description="Итог прогона; пусто — прогон ещё идёт.")
 
     @model_validator(mode="after")
     def _check_not_blank(self) -> "RunProgress":
@@ -3941,12 +4112,12 @@ class RunResult(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    run_id: str
-    status: RunStatus
-    excel_path: str | None = None
-    summary: RunSummary
-    total_cost_usd: float = 0.0
-    error: str | None = None
+    run_id: str = Field(description="Номер прогона — папка runs/<run_id>.")
+    status: RunStatus = Field(description="Чем закончился прогон.")
+    excel_path: str | None = Field(default=None, description="Путь к итоговому Excel; пусто — не собран.")
+    summary: RunSummary = Field(description="Итог прогона.")
+    total_cost_usd: float = Field(default=0.0, description="Стоимость прогона, $.")
+    error: str | None = Field(default=None, description="Текст сбоя прогона; пусто — без сбоя.")
 
     @model_validator(mode="after")
     def _check_not_blank(self) -> "RunResult":

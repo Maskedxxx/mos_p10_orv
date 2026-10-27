@@ -6,7 +6,7 @@
 
 Вход: токен машины (~/.config/garant/token, тот же, что у агентов). Выход: limits() -> {семейство: остаток} или None,
 если узнать не удалось (страница пишет «не удалось», работа не останавливается). Вызов GET /v2/limits лимит не
-тратит; ответ кэшируется на CACHE_S секунд. Гарант — напрямую, мимо прокси машины (как у агентов, config.py).
+тратит; ответ кэшируется на config.GARANT_LIMITS_CACHE_S секунд. Гарант — напрямую, мимо прокси машины (как у агентов, config.py).
 Токен никуда не пишется.
 """
 
@@ -17,10 +17,9 @@ import time
 import urllib.error
 import urllib.request
 
-from app.config import GARANT_TOKEN_FILE
+from app.config import GARANT_LIMITS_CACHE_S, GARANT_TOKEN_FILE
 
 LIMITS_URL = "https://api.garant.ru/v2/limits"
-CACHE_S = 60
 EXPORT = "Экспорт"            # семейство выгрузок текста (30 в месяц) — так оно называется в ответе /v2/limits
 LINKS = "Постановка ссылки"   # распознавание ссылок на акты (1000 в месяц)
 # Месячные лимиты токена (скилл garant-api, проверено по /v2/limits 2026-10-07) — для строки «осталось N из M»
@@ -34,7 +33,7 @@ _opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 def limits(fresh: bool = False) -> dict[str, int] | None:
     """Остаток по семействам методов: {"Экспорт": 21, …}. fresh — мимо кэша (до и после хода с выгрузкой)."""
     global _cache
-    if not fresh and _cache is not None and time.monotonic() - _cache[0] < CACHE_S:
+    if not fresh and _cache is not None and time.monotonic() - _cache[0] < GARANT_LIMITS_CACHE_S:
         return dict(_cache[1])
     try:
         token = GARANT_TOKEN_FILE.read_text(encoding="utf-8").strip()
