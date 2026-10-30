@@ -963,7 +963,7 @@ def _render_journal_sheet(wb: Workbook, journal: list[JournalEntry]) -> None:
     ws.append(["Версия", "Когда", "Что сделано", "Где", "Было", "Стало", "Почему", "Как", "Стоимость, $"])
     for e in journal:
         ws.append([e.version, e.at, e.action, e.target, e.before or "—", e.after or "—",
-                   e.reason or "—", e.kind, round(e.cost_usd, 2)])
+                   e.reason or "—", e.kind, round(e.cost_usd, 2) if e.cost_known else "не определена"])
     _format_listing_sheet(
         ws, {"A": 9, "B": 18, "C": 36, "D": 26, "E": 40, "F": 40, "G": 40, "H": 18, "I": 12}, header_row,
     )

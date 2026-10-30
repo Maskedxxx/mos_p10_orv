@@ -44,6 +44,7 @@ from dataclasses import asdict
 from app.config import ALLOWED_TOOLS_TEXT, PROMPT_REQUEST, REQUEST_YEARS_DEPTH
 from app.contracts import ActPassport, DataRequest, HypothesisMap, RequestItem, RequestOutput
 from app.mandatory_indicators import MandatoryMetric, mandatory_for
+from app.formatting import format_cost
 from app.logger import get_run_logger
 from app.nodes.common import compute_years
 from app.runner import call
@@ -346,7 +347,7 @@ def build_request(
     add_cost(run_id, result.cost_usd)
 
     logger.info(
-        "request done: items=%d years=%s cost=$%.4f",
-        len(value.items), value.years, result.cost_usd,
+        "request done: items=%d years=%s cost=%s",
+        len(value.items), value.years, format_cost(result.cost_usd, result.cost_known, digits=4),
     )
     return value

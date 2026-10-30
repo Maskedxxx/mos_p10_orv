@@ -53,6 +53,8 @@ from app.config import (
     PROMPT_HYPOTHESES_VIOLATED,
 )
 from app.contracts import ActPassport, Buckets, DataItem, HypothesisSet, HypothesisSetOutput, Verdict
+from app import config
+from app.formatting import format_cost
 from app.logger import get_run_logger
 from app.nodes.common import append_task_clarification, run_after
 from app.nodes.passport import passport_block
@@ -271,8 +273,8 @@ def _run_hypotheses(
     total_hypotheses = sum(len(s.hypotheses) for s in ordered)
 
     logger.info(
-        "hypotheses done (%s): sets=%d hypotheses=%d failed=%d cost=$%.4f duration=%.1fs",
-        branch_label, len(ordered), total_hypotheses, failed_count, cost_total, duration_total,
+        "hypotheses done (%s): sets=%d hypotheses=%d failed=%d cost=%s duration=%.1fs",
+        branch_label, len(ordered), total_hypotheses, failed_count, format_cost(cost_total, config.LLM_BACKEND == "claude", digits=4), duration_total,
     )
 
     add_cost(run_id, cost_total)

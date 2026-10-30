@@ -1,0 +1,5 @@
+{"type":"thread.started","thread_id":"01a18b62-1bba-7d33-a6eb-19798eed2862"}
+{"type":"item.completed","item":{"id":"item_0","type":"error","message":"Under-development features enabled: skip_host_skill_discovery. Under-development features are incomplete and may behave unpredictably. To suppress this warning, set `suppress_unstable_features_warning = true` in /home/masked/.codex/config.toml."}}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"{\"marker\":\"P10-957d8387403f\",\"total\":52,\"phase\":\"resume\"}"}}
+{"type":"turn.completed","usage":{"input_tokens":11935,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":62,"reasoning_output_tokens":0}}

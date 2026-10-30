@@ -3857,6 +3857,7 @@ class JournalEntry(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    cost_known: bool = Field(default=True, description="Известна ли денежная стоимость этого изменения; иначе числовое значение неполно.")
     version: int = Field(ge=1, description="Номер версии, которую создало это изменение.")
     at: str = Field(min_length=1, description="Когда применено, время в ISO-формате.")
     kind: JournalKind = Field(description="Класс изменения.")
@@ -3934,6 +3935,10 @@ class ChatEntry(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    backend: Literal["claude", "codex"] | None = Field(default=None, description="Движок ответа; у прежних реплик не записан.")
+    cost_known: bool = Field(default=True, description="Известна ли денежная стоимость; false не означает бесплатный вызов.")
+    token_usage: dict[str, int] | None = Field(default=None, description="Расход токенов этого хода, без повторного сложения накопленных значений.")
+    usage_complete: bool = Field(default=True, description="Получены ли счётчики всех попыток этого хода.")
     at: str = Field(description="Когда записана, время в ISO-формате до секунд.")
     role: ChatRole = Field(description="Кто говорит: пользователь, ассистент (помощник) или сервис (строка о действии).")
     text: str = Field(description="Текст реплики.")
@@ -3954,6 +3959,9 @@ class CliSession(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    backend: Literal["claude", "codex"] = Field(default="claude", description="Движок сессии; старый файл относится к Claude.")
+    model: str | None = Field(default=None, description="Модель, с которой начата сессия.")
+    token_reported: dict[str, int] | None = Field(default=None, description="Последние накопленные счётчики Codex для расчёта расхода следующего продолжения.")
     session_id: str = Field(description="Номер сессии CLI.")
     started: str = Field(description="Когда начата, время в ISO-формате.")
     last_turn: str | None = Field(default=None, description="Когда был последний удачный ход.")
@@ -4006,6 +4014,12 @@ class RunMeta(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    llm_backend: Literal["claude", "codex"] = Field(default="claude", description="Движок исходного анализа; у старых прогонов — Claude. Последующие вызовы могут использовать другой движок сервиса.")
+    llm_model: str = Field(default="sonnet", description="Модель исходного анализа; у старых прогонов — sonnet.")
+    cost_known: bool = Field(default=True, description="Известна ли полная денежная стоимость. false — числовое cost_usd неполно и не означает бесплатную работу.")
+    token_usage: dict[str, int] = Field(default_factory=dict, description="Известный расход токенов Codex по новым вызовам без повторного сложения накопленных счётчиков сессии.")
+    token_usage_complete: bool = Field(default=True, description="Получены ли счётчики всех попыток Codex; false — часть расхода неизвестна, например после обрыва.")
+
     run_id: str = Field(description="Номер прогона — папка runs/<run_id>: дата, время и короткий код.")
     act_filename: str = Field(description="Имя файла акта, как его загрузил пользователь.")
     started_at: str = Field(description="Когда прогон начат, время в ISO-формате.")
@@ -4050,6 +4064,7 @@ class NodeState(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    cost_known: bool = Field(default=True, description="Известна ли денежная стоимость узла.")
     key: str = Field(description="Ключ узла: convert, passport, verdicts, sort, hypotheses, merge, request, excel.")
     title: str = Field(description="Имя узла для страницы прогона.")
     status: NodeStatus = Field(default="ожидает", description="Состояние узла.")
@@ -4103,6 +4118,7 @@ class RunProgress(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    cost_known: bool = Field(default=True, description="Известна ли полная денежная стоимость; иначе total_cost_usd неполно.")
     run_id: str = Field(description="Номер прогона — папка runs/<run_id>.")
     act_filename: str = Field(description="Имя акта, как его видит оркестратор: 00_input и расширение акта.")
     status: RunStatus = Field(default="в очереди", description="Состояние прогона целиком.")
@@ -4128,6 +4144,7 @@ class RunResult(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    cost_known: bool = Field(default=True, description="Известна ли полная денежная стоимость результата.")
     run_id: str = Field(description="Номер прогона — папка runs/<run_id>.")
     status: RunStatus = Field(description="Чем закончился прогон.")
     excel_path: str | None = Field(default=None, description="Путь к итоговому Excel; пусто — не собран.")

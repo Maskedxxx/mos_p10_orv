@@ -214,7 +214,7 @@ class DialogJobs:
                         if not await self._decision(run_id, title, result.candidate):
                             rejected += 1
                             dialog.append_chat(run_id, "сервис", f"Шаг {number} отклонён — файл не изменён.",
-                                               mark="отменено", cost_usd=round(result.cost_usd, 4), session=session)
+                                               mark="отменено", cost_usd=round(result.cost_usd, 4) if result.cost_known else None, cost_known=result.cost_known, session=session)
                             continue
                         dialog.set_status(run_id, "шаг", f"Записываю шаг {number} из {total}", "обычно несколько секунд")
                         result = await nicegui_run.io_bound(operations.accept, run_id, result.candidate)
@@ -227,7 +227,7 @@ class DialogJobs:
                                     after.marks if after is not None else Marks())
                 text = step_text(result) + ("\nУстарело: " + "; ".join(notes) if notes else "")
                 dialog.append_chat(run_id, "сервис", text, mark="шаг", version=result.version,
-                                   cost_usd=round(result.cost_usd, 4), session=session)
+                                   cost_usd=round(result.cost_usd, 4) if result.cost_known else None, cost_known=result.cost_known, session=session)
         finally:
             dialog.clear_status(run_id)
         text, mark = plan_summary(total, applied, rejected, failed, why, current_version(run_id))

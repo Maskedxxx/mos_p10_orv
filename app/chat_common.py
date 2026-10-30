@@ -17,11 +17,16 @@ from __future__ import annotations
 
 import datetime
 import json
+import hashlib
+import secrets
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import get_args
 
+from app import config
 from app.config import GARANT_ALL_TOOLS
-from app.contracts import ChatEntry, ChatRole
+from app.contracts import ChatEntry, ChatRole, CliSession
+from app.agent_events import codex_tool_event
 
 # Пометка служебной строки хода, когда файла токена Гаранта нет (15.10)
 GARANT_OFF_NOTE = ("Гарант сейчас недоступен (нет файла токена): инструментов Гаранта в этом ходе нет. "
@@ -37,6 +42,64 @@ GARANT_TOOLS = list(GARANT_ALL_TOOLS)
 ROLES = get_args(ChatRole)   # пользователь, ассистент, сервис — контракт реплики ChatEntry
 # Кто в журнале сессии (events.jsonl) для каждой роли чата
 CHAT_WHO = {"пользователь": "пользователь", "ассистент": "помощник", "сервис": "система"}
+
+
+def archive_cli_session(path: Path) -> Path | None:
+    """Сохранить старый файл до сброса: история, идентификатор и расход не теряются."""
+    if not path.is_file():
+        return None
+    data = path.read_bytes()
+    folder = path.parent / "cli_sessions"
+    folder.mkdir(exist_ok=True)
+    target = folder / f"{hashlib.sha256(data).hexdigest()[:12]}-{secrets.token_hex(4)}.json"
+    path.rename(target)
+    return target
+
+
+def resume_arguments(cli: CliSession) -> dict:
+    values = {"resume_backend": cli.backend}
+    if cli.backend == "codex":
+        values["resume_token_base"] = cli.token_reported
+    return values
+
+
+def session_reset_reason(cli: CliSession) -> str | None:
+    if cli.backend != config.LLM_BACKEND:
+        return "смена движка"
+    if cli.backend == "codex" and not cli.token_reported:
+        return "нет надёжного накопленного расхода"
+    return None
+
+
+def cli_result_fields(result) -> dict:
+    """Прежний накопленный расход хранится даже после неудачной проверки ответа."""
+    values = {"backend": result.backend, "model": result.model or config.BACKEND_MODELS[result.backend]}
+    if result.cost_known:
+        values["cost_reported"] = result.session_cost_usd
+    if result.session_token_usage is not None:
+        values["token_reported"] = result.session_token_usage
+    return values
+
+
+@dataclass
+class ChatUsage:
+    """Один ход может продолжить старую сессию и открыть новую; учитываются оба вызова."""
+    cost_usd: float = 0.0
+    cost_known: bool = True
+    token_usage: dict[str, int] = field(default_factory=dict)
+    usage_complete: bool = True
+
+    def add(self, result) -> None:
+        self.cost_usd += result.cost_usd
+        self.cost_known = self.cost_known and result.cost_known
+        self.usage_complete = self.usage_complete and result.usage_complete
+        for key, value in (result.token_usage or {}).items():
+            self.token_usage[key] = self.token_usage.get(key, 0) + value
+
+    def fields(self) -> dict:
+        return {"cost_usd": round(self.cost_usd, 4) if self.cost_known else None,
+                "cost_known": self.cost_known, "token_usage": self.token_usage or None,
+                "usage_complete": self.usage_complete, "backend": config.LLM_BACKEND}
 
 
 # ---- Файл реплик ----
@@ -75,7 +138,21 @@ def turn_tools(turns_dir: Path, n: int) -> tuple[list[dict], set[str]]:
                 event = json.loads(line).get("event") or {}
             except (ValueError, AttributeError):
                 continue
-            if not isinstance(event, dict) or event.get("type") not in ("assistant", "user"):
+            if not isinstance(event, dict):
+                continue
+            tool = codex_tool_event(event)
+            if tool is not None:
+                key = tool["id"]
+                if key not in seen:
+                    seen.add(key)
+                    uses.append({"id": key, "type": "tool_use", "name": tool["name"], "input": tool["input"], "status": tool["status"]})
+                else:
+                    previous = next(u for u in uses if u["id"] == key)
+                    previous.update(name=tool["name"], input=tool["input"], status=tool["status"])
+                if tool["is_error"]:
+                    errors.add(str(key))
+                continue
+            if event.get("type") not in ("assistant", "user"):
                 continue
             for block in (event.get("message") or {}).get("content") or []:
                 if not isinstance(block, dict):

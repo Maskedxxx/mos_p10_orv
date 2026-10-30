@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app import trace  # noqa: E402
 from app.chat_common import read_chat_file  # noqa: E402
+from app.formatting import format_cost
 from app.sessions import split_costs  # noqa: E402
 from scripts._monitor import SCHEMA_RETRY, STRUCTURED_OUTPUT, load_raw, tool_calls  # noqa: E402
 
@@ -77,15 +78,25 @@ def agents(run_path: Path, journal: list[dict]) -> list[dict]:
         files = [p for _, p in sorted(groups[base])]
         cost = turns = seconds = 0.0
         calls = []
+        cost_known = True
+        cumulative_usage = None
         for path in files:
             events = load_raw(path)
             calls += tool_calls(events)
+            codex_finished = next((e for e in reversed(events) if isinstance(e, dict) and e.get("type") == "turn.completed"), None)
+            if any(isinstance(e, dict) and e.get("type") == "thread.started" for e in events):
+                cost_known = False
+            if codex_finished is not None:
+                cumulative_usage = codex_finished.get("usage")
             final = next((e for e in events if isinstance(e, dict) and e.get("type") == "result"), None)
             if final:
                 cost += float(final.get("total_cost_usd") or 0)
                 turns += final.get("num_turns") or 0
                 seconds += (final.get("duration_ms") or 0) / 1000
         attempts = outcomes.get(base) or []
+        cost_known = cost_known and all(a.get("cost_known", True) for a in attempts)
+        done = next((e for e in reversed(journal) if e.get("event") == "agent_finished" and e.get("trace", "").removesuffix(".raw.json") == base), {})
+        cost_known = cost_known and done.get("cost_known", True)
         if attempts:
             seconds = sum(a.get("duration_s") or 0 for a in attempts)
         if attempts and all("cost_usd" in a for a in attempts):
@@ -95,7 +106,8 @@ def agents(run_path: Path, journal: list[dict]) -> list[dict]:
         result.append({
             "agent": base, "attempts": len(files),
             "outcomes": [a["outcome"] for a in attempts],
-            "cost_usd": round(cost, 4), "turns": int(turns), "seconds": round(seconds),
+            "cost_usd": round(cost, 4), "cost_known": cost_known,
+            "token_usage": done.get("token_usage"), "session_token_usage": cumulative_usage, "turns": int(turns), "seconds": round(seconds),
             # Запрещённый изоляцией вызов не выполнялся — в счёт инструментов не идёт (виден в ошибках)
             "tools": Counter(c["name"] for c in calls
                              if c["name"] != STRUCTURED_OUTPUT and c["error"] != "не разрешён агенту"),
@@ -128,17 +140,18 @@ def report(run: str, compare: str | None = None) -> str:
     add(f"акт: {meta.get('act_filename')} · тип: {', '.join(meta.get('act_types') or []) or '—'}")
     chat = read_chat_file(run_path / "dialog" / "chat.jsonl")
     # 15.10: та же разбивка, что в итоге сессии (progress после правок — уже итог вместе с диалогом)
-    costs = split_costs(journal, meta.get("cost_usd"), progress.get("total_cost_usd"), chat)
+    costs = split_costs(journal, meta.get("cost_usd"), progress.get("total_cost_usd"), chat,
+                        meta_cost_known=meta.get("cost_known", True))
     add(f"начат: {meta.get('started_at')} · разбор: {progress.get('status')} · "
-        f"стоимость: разбор ${costs['разбор']:.2f} · диалог ${costs['диалог']:.2f} · всего ${costs['всего']:.2f}")
+        f"стоимость: разбор {format_cost(costs['разбор'])} · диалог {format_cost(costs['диалог'])} · всего {format_cost(costs['всего'])}")
     # 23.10: прогон можно открыть заново — итоги прошлых сессий в sessions/NN.json
     for past in sorted((run_path / trace.SESSIONS_DIR).glob("[0-9][0-9].json")):
         old = _json(past) or {}
         add(f"сессия {old.get('session_no', past.stem)}: {old.get('started_at')} — {old.get('closed_at')} "
-            f"({old.get('closed_by')}) · всего ${old['cost_usd']['всего']:.2f} · версия {old.get('version')}")
+            f"({old.get('closed_by')}) · всего {format_cost(old['cost_usd']['всего'])} · версия {old.get('version')}")
     if summary:
         add(f"закрыта: {summary.get('closed_at')} ({summary.get('closed_by')}) · "
-            f"всего ${summary['cost_usd']['всего']:.2f} · версия {summary.get('version')}")
+            f"всего {format_cost(summary['cost_usd']['всего'])} · версия {summary.get('version')}")
     else:
         add("сессия открыта" if journal else "журнала нет (прогон до 2.7)")
 
@@ -149,7 +162,7 @@ def report(run: str, compare: str | None = None) -> str:
     for node in progress.get("nodes") or []:
         e = node_events.get(node["key"], {})
         status = node.get("status")
-        add(f"{node['key']:<11} {status:<8} {node.get('duration_s') or 0:>7.1f} с  ${float(node.get('cost_usd') or 0):.2f}"
+        add(f"{node['key']:<11} {status:<8} {node.get('duration_s') or 0:>7.1f} с  {format_cost(node.get('cost_usd'), node.get('cost_known', meta.get('cost_known', True)))}"
             + (f"  ⚠ {node.get('error') or e.get('error')}" if status == "сбой" else ""))
         if status == "сбой":
             problems.append(f"узел {node['key']}: {node.get('error') or e.get('error')}")
@@ -165,8 +178,12 @@ def report(run: str, compare: str | None = None) -> str:
         outcome = ",".join(a["outcomes"]) if a["outcomes"] else "—"
         tools = ", ".join(f"{k}×{v}" for k, v in a["tools"].most_common())
         errors = ", ".join(f"{k}×{v}" for k, v in a["errors"].most_common())
-        add(f"{a['agent']:<26} попыток {a['attempts']} · {outcome} · {a['seconds']} с · ${a['cost_usd']:.2f} · "
+        add(f"{a['agent']:<26} попыток {a['attempts']} · {outcome} · {a['seconds']} с · {format_cost(a['cost_usd'], a['cost_known'])} · "
             f"ходов {a['turns']}" + (f" · {tools}" if tools else "") + (f" · ⚠ {errors}" if errors else ""))
+        usage = a["token_usage"] or a["session_token_usage"]
+        if usage is not None:
+            note = "за вызов" if a["token_usage"] is not None else "накопленно по сессии"
+            add(f"  токены ({note}): вход {usage.get('input_tokens', '—')}, выход {usage.get('output_tokens', '—')}")
         if a["outcomes"] and a["outcomes"][-1] != "ok":
             problems.append(f"агент {a['agent']}: не удался ({outcome})")
         elif a["outcomes"].count("timeout"):

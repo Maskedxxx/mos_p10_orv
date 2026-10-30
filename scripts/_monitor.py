@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from app.agent_events import codex_tool_event
+from app.formatting import format_cost
 
 GARANT_PREFIX = "mcp__garant__"
 # Служебный инструмент CLI: так модель сдаёт ответ по --json-schema. Не поиск — в счёт инструментов не идёт;
@@ -34,7 +36,7 @@ def error_kind(text: str) -> str:
         return "не разрешён агенту"
     if "transport dropped" in text or "session expired" in text or "ECONNRESET" in text:
         return "обрыв связи"
-    if "timed out" in text or "timeout of" in text:
+    if "timed out" in text or "timeout" in text:
         return "таймаут"
     if "Нет прав" in text:
         return "нет прав"
@@ -58,6 +60,16 @@ def tool_calls(events: list[dict]) -> list[dict]:
     order: list[str] = []
     for e in events:
         if not isinstance(e, dict):
+            continue
+        normalized = codex_tool_event(e)
+        if normalized is not None:
+            key = str(normalized["id"])
+            if key not in calls:
+                order.append(key)
+            text = _text_of(normalized["answer"]) if normalized["answer"] is not None else ""
+            calls[key] = {"name": short_tool(normalized["name"]), "input": normalized["input"],
+                          "error": error_kind(text) if normalized["is_error"] else None,
+                          "answer": text[:300]}
             continue
         for b in ((e.get("message") or {}).get("content") or []) if e.get("type") in ("assistant", "user") else []:
             if not isinstance(b, dict):
@@ -99,6 +111,23 @@ def describe_agent_event(event: dict) -> list[str]:
     """Строки ленты для одного события агента: вызов инструмента, ошибка ответа, текст, итог."""
     out = []
     kind = event.get("type")
+    tool = codex_tool_event(event)
+    if tool is not None:
+        if event.get("type") == "item.completed" and tool["is_error"]:
+            return [f"⚠ ошибка инструмента {short_tool(tool['name'])}: {_text_of(tool['answer'])[:120]}"]
+        return [f"→ {short_tool(tool['name'])} {short_input(tool['input'])}"] if event.get("type") == "item.started" else []
+    if kind == "thread.started":
+        return ["старт Codex"]
+    if kind == "turn.completed":
+        usage = event.get("usage") or {}
+        return [f"итог Codex: вход {usage.get('input_tokens', '—')}, выход {usage.get('output_tokens', '—')} токенов (накопленно по сессии); стоимость не определена"]
+    if kind in ("error", "turn.failed"):
+        return [f"⚠ сбой Codex: {_text_of(event.get('error') or event.get('message'))[:120]}"]
+    item = event.get("item") or {}
+    if kind == "item.completed" and item.get("type") == "error":
+        message = str(item.get("message", ""))
+        label = "предупреждение CLI" if message.startswith("Under-development features enabled:") else "⚠ ошибка CLI"
+        return [f"{label}: {message[:180]}"]
     if kind == "system" and event.get("subtype") == "init":
         mcp = [s.get("name") + ":" + s.get("status", "") for s in event.get("mcp_servers") or []]
         out.append("старт" + (f" · MCP {', '.join(mcp)}" if mcp else ""))
@@ -128,13 +157,13 @@ def describe_journal_event(e: dict) -> str | None:
     if ev == "node_started":
         return f"старт (вход: {', '.join(e.get('inputs') or [])})"
     if ev == "node_finished":
-        return f"готов за {e.get('duration_s')} с · ${float(e.get('cost_usd') or 0):.2f} → {', '.join(e.get('outputs') or [])}"
+        return f"готов за {e.get('duration_s')} с · {format_cost(e.get('cost_usd'), e.get('cost_known', True))} → {', '.join(e.get('outputs') or [])}"
     if ev == "node_failed":
         return f"⚠ СБОЙ: {e.get('error')}"
     if ev == "agent_attempt" and e.get("outcome") != "ok":
         return f"⚠ попытка {e.get('attempt')}/{e.get('max_attempts')}: {e.get('outcome')} за {e.get('duration_s')} с"
     if ev == "run_finished":
-        return f"разбор закончен: {e.get('status')} · ${float(e.get('cost_usd') or 0):.2f}"
+        return f"разбор закончен: {e.get('status')} · {format_cost(e.get('cost_usd'), e.get('cost_known', True))}"
     if ev == "chat":
         return f"чат ({e.get('role')}): {e.get('text', '')[:120]}"
     if ev == "user_action":
@@ -142,5 +171,5 @@ def describe_journal_event(e: dict) -> str | None:
     if ev in ("version_created", "version_restored"):
         return f"{'версия' if ev == 'version_created' else 'возврат к версии'} {e.get('version')}"
     if ev == "session_closed":
-        return f"сессия закрыта ({e.get('by')}) · всего ${float(e.get('cost_usd') or 0):.2f}"
+        return f"сессия закрыта ({e.get('by')}) · всего {format_cost(e.get('cost_usd'), e.get('cost_known', True))}"
     return None

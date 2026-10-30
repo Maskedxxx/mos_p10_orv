@@ -40,12 +40,13 @@ import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from app import garant_limits, trace
+from app import garant_limits, trace, config
 from app.chat_common import (
     CHAT_WHO, GARANT_OFF_NOTE, GARANT_TOOLS, NEW_SESSION_INSTRUCTION, SESSION_GONE, append_chat_file, read_chat_file,
     tool_step_text, turn_tools,
 )
 from app.config import ALLOWED_TOOLS_WEB, DIALOG_MODEL, GARANT_MAX_PARALLEL_TURNS, HISTORY_MESSAGES, PROMPT_GARANT_CHAT
+from app.chat_common import ChatUsage, archive_cli_session, cli_result_fields, resume_arguments, session_reset_reason
 from app.contracts import (
     ChatEntry, CliSession, GarantChatInfo, GarantDocument, GarantFile, GarantTable, GarantTurn,
 )
@@ -72,6 +73,7 @@ class TurnResult:
     reply: str
     ok: bool
     cost_usd: float = 0.0
+    cost_known: bool = True
     files: list[dict] = field(default_factory=list)
 
 
@@ -134,7 +136,7 @@ def list_chats() -> list[dict]:
                     "created_at": info.created_at, "created_by": info.created_by,
                     "messages": sum(1 for m in chat if m.role != "сервис"),
                     "documents": len(info.documents),
-                    "cost_usd": round(sum(m.cost_usd or 0.0 for m in chat), 4)})
+                    "cost_usd": round(sum(m.cost_usd or 0.0 for m in chat), 4) if all(m.cost_known for m in chat) else None})
     out.sort(key=lambda c: c["chat_id"], reverse=True)
     return out
 
@@ -148,7 +150,7 @@ def append_chat(chat_id: str, role: str, text: str, **extra) -> ChatEntry:
     entry = append_chat_file(run_dir(chat_run_id(chat_id)) / CHAT, role, text, **extra)
     extra = {k: v for k, v in extra.items() if v is not None}
     log_event(chat_run_id(chat_id), "chat", who=CHAT_WHO[role], role=role, text=text[:300],
-              **{k: v for k, v in extra.items() if k in ("cost_usd", "session", "mark")})
+              **{k: v for k, v in extra.items() if k in ("cost_usd", "cost_known", "backend", "token_usage", "usage_complete", "session", "mark")})
     return entry
 
 
@@ -195,7 +197,7 @@ def add_document(chat_id: str, filename: str, data: bytes, session: str | None =
     info = chat_info(chat_id)
     _update_info(chat_id, documents=docs, title=info.title or Path(filename).stem)
     # Новый документ — в системном промпте новой сессии: старую больше не продолжаем
-    (root / SESSION).unlink(missing_ok=True)
+    archive_cli_session(root / SESSION)
     append_chat(chat_id, "сервис", f"Документ «{filename}» приложен: {len(text):,} знаков текста.".replace(",", " "),
                 mark="документ", session=session)
     log_event(rid, "garant_document_added", file=filename, chars=len(text))
@@ -244,7 +246,7 @@ def _turn_tools(chat_id: str, n: int) -> tuple[list[dict], set[str]]:
 def _report_exports(chat_id: str, n: int, session: str | None) -> None:
     """Ход с выгрузками Гаранта — строка в беседу: сколько потрачено и сколько осталось на всех в этом месяце."""
     uses, errors = _turn_tools(chat_id, n)
-    spent = sum(1 for u in uses if str(u.get("name", "")).startswith("mcp__garant__garant_export")
+    spent = sum(1 for u in uses if u.get("status", "completed") == "completed" and str(u.get("name", "")).startswith("mcp__garant__garant_export")
                 and str(u.get("id")) not in errors)
     if not spent:
         return
@@ -284,28 +286,35 @@ def _turn(chat_id: str, rid: str, message: str, history: list[dict], n: int, ses
                   shared_context=shared_context(chat_id), mcp_tools=GARANT_TOOLS if garant else None,
                   short_cache_ttl=False)   # кэш 1 час: человек думает между сообщениями дольше 5 минут
     cli = _load_session(chat_id)
+    if cli is not None and session_reset_reason(cli):
+        archive_cli_session(run_dir(rid) / SESSION)
+        log_event(rid, "cli_session_reset", previous=cli.backend, backend=config.LLM_BACKEND, reason=session_reset_reason(cli))
+        cli = None
     cost = 0.0
+    usage = ChatUsage()
     result = None
     if cli is not None:
         result = call(resume_message(message, note), None, GarantTurn, trace_name=f"turns/{n:04d}.raw.json",
-                      resume_session_id=cli.session_id, resume_cost_base=float(cli.cost_reported or 0.0),
+                      resume_session_id=cli.session_id, resume_cost_base=float(cli.cost_reported or 0.0), **resume_arguments(cli),
                       **common)
         cost += result.cost_usd
+        usage.add(result)
         if not (result.ok and result.value is not None):
             # Упрощённо (в отличие от помощника прогона): любая неудача продолжения — новая сессия с историей
             kind = "garant_session_lost" if SESSION_GONE in (result.error or "") else "garant_resume_failed"
             log_event(rid, kind, session_id=cli.session_id, error=(result.error or "")[:300])
-            (run_dir(rid) / SESSION).unlink(missing_ok=True)
+            archive_cli_session(run_dir(rid) / SESSION)
             cli = None
     if cli is None:
         result = call(NEW_SESSION_INSTRUCTION, build_document(message, history, note), GarantTurn,
                       trace_name=f"turns/{n:04d}{'.new' if result is not None else ''}.raw.json", **common)
         cost += result.cost_usd
+        usage.add(result)
         if result.ok and result.value is not None and result.session_id:
-            cli = CliSession(session_id=result.session_id, started=_now())
+            cli = CliSession(session_id=result.session_id, started=_now(), **cli_result_fields(result))
             log_event(rid, "garant_session_started", session_id=result.session_id)
     ok = result.ok and result.value is not None
-    log_event(rid, "garant_turn", ok=ok, cost_usd=round(cost, 4), session_id=cli.session_id if cli else None)
+    log_event(rid, "garant_turn", ok=ok, **usage.fields(), session_id=cli.session_id if cli else None)
     _report_exports(chat_id, n, session)
     steps = [s for s in (tool_step_text(u.get("name", ""), u.get("input") or {}) for u in _turn_tools(chat_id, n)[0]) if s]
     if not ok:
@@ -313,10 +322,10 @@ def _turn(chat_id: str, rid: str, message: str, history: list[dict], n: int, ses
         log_event(rid, "garant_turn_failed", error=(result.error or "")[:500])
         reply = ("Не получилось ответить: помощник не уложился во время или сервис модели не ответил. "
                  "Попробуйте ещё раз.")
-        append_chat(chat_id, "ассистент", reply, cost_usd=round(cost, 4), mark="сбой", steps=steps or None)
-        return TurnResult(reply=reply, ok=False, cost_usd=cost)
+        append_chat(chat_id, "ассистент", reply, **usage.fields(), mark="сбой", steps=steps or None)
+        return TurnResult(reply=reply, ok=False, cost_usd=cost, cost_known=usage.cost_known)
     if cli is not None:
-        _write_json(run_dir(rid) / SESSION, cli.model_copy(update={"last_turn": _now(), "cost_reported": result.session_cost_usd})
+        _write_json(run_dir(rid) / SESSION, cli.model_copy(update={"last_turn": _now(), **cli_result_fields(result)})
                     .model_dump(mode="json", exclude_none=True))
     value = result.value
     files, failed = [], []
@@ -327,11 +336,11 @@ def _turn(chat_id: str, rid: str, message: str, history: list[dict], n: int, ses
             log_event(rid, "garant_file_failed", name=spec.name, format=spec.format, error=str(error)[:300])
             failed.append(f"{spec.name}.{spec.format}")
     append_chat(chat_id, "ассистент", value.reply, sources=value.sources or None, files=files or None,
-                steps=steps or None, cost_usd=round(cost, 4))
+                steps=steps or None, **usage.fields())
     if failed:
         append_chat(chat_id, "сервис", "Не удалось собрать файл: " + ", ".join(failed)
                     + ". Попросите помощника сделать его ещё раз или в другом формате.", mark="сбой", session=session)
-    return TurnResult(reply=value.reply, ok=True, cost_usd=cost, files=files)
+    return TurnResult(reply=value.reply, ok=True, cost_usd=cost, cost_known=usage.cost_known, files=files)
 
 
 # ---- Файлы на скачивание ----

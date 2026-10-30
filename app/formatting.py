@@ -8,6 +8,11 @@ from __future__ import annotations
 from datetime import datetime
 
 
+def format_cost(value: float | None, known: bool = True, *, digits: int = 2) -> str:
+    """Неизвестная стоимость не отображается как бесплатный вызов."""
+    return f"${value:.{digits}f}" if known and value is not None else "не определена"
+
+
 def plural(number: int, one: str, few: str, many: str) -> str:
     """Русское склонение при числе: 1 гипотеза, 2 гипотезы, 5 гипотез."""
     if 11 <= number % 100 <= 14:

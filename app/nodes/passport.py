@@ -26,6 +26,7 @@ import re
 
 from app.config import ALLOWED_TOOLS_TEXT, PASSPORT_TIMEOUT_S, PROMPT_PASSPORT
 from app.contracts import ActPassport, ActPassportOutput, Developer
+from app.formatting import format_cost
 from app.logger import get_run_logger
 from app.runner import call, garant_available
 from app.trace import PASSPORT_FILE, add_cost, log_event, save_json
@@ -86,12 +87,12 @@ def make_passport(
     passport = result.value
     save_json(run_id, PASSPORT_FILE, passport)
     logger.info(
-        "passport done: status=%s scope=%s A=%s B=%s C=%s D=%s F=%s G1=%s G2=%s H=%s cost=$%.4f",
+        "passport done: status=%s scope=%s A=%s B=%s C=%s D=%s F=%s G1=%s G2=%s H=%s cost=%s",
         passport.status.status, passport.addressee.scope,
         passport.requirements.state, passport.procedure.state, passport.documents.state,
         passport.deadlines.state, passport.references.state,
         passport.allocation.competitive.state, passport.allocation.appointed.state,
-        passport.control.state, result.cost_usd,
+        passport.control.state, format_cost(result.cost_usd, result.cost_known, digits=4),
     )
     return passport
 

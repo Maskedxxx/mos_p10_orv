@@ -72,7 +72,11 @@ SESSION_IDLE_S = 3600
 # машины, то есть движок сервиса зависел бы от чужого файла — правка чужих
 # настроек молча меняла бы качество вердиктов, и в логах прогона это никак
 # не отразилось бы.
-MODEL = "sonnet"
+LLM_BACKEND = os.environ.get("P10_LLM_BACKEND", "claude")
+if LLM_BACKEND not in ("claude", "codex"):
+    raise ValueError("P10_LLM_BACKEND: допустимы только claude или codex")
+BACKEND_MODELS = {"claude": "sonnet", "codex": "gpt-6.1-terra"}
+MODEL = BACKEND_MODELS[LLM_BACKEND]
 EFFORT = "medium"
 
 # Форматы акта, которые принимает сервис.

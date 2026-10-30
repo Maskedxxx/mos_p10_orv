@@ -46,6 +46,7 @@ import re
 
 from app.config import ALLOWED_TOOLS_TEXT, PROMPT_MERGE
 from app.contracts import Hypothesis, HypothesisMap, HypothesisSet, MapRow, MergeOutput
+from app.formatting import format_cost
 from app.logger import get_run_logger
 from app.runner import call
 from app.trace import MAP_FILE, add_cost, save_json
@@ -265,8 +266,8 @@ def merge_map(
     add_cost(run_id, result.cost_usd)
 
     logger.info(
-        "merge done: input=%d rows=%d merges=%d candidates=%d decisions=%d cost=$%.4f",
+        "merge done: input=%d rows=%d merges=%d candidates=%d decisions=%d cost=%s",
         n_input, len(hyp_map.rows), len(hyp_map.merges), len(candidates),
-        len(hyp_map.decisions), result.cost_usd,
+        len(hyp_map.decisions), format_cost(result.cost_usd, result.cost_known, digits=4),
     )
     return hyp_map

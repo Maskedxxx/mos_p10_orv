@@ -25,7 +25,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 
-from app import versions
+from app import versions, config
 from app.chat_common import (
     CHAT_WHO, GARANT_OFF_NOTE, GARANT_TOOLS, NEW_SESSION_INSTRUCTION, SESSION_GONE, append_chat_file, read_chat_file,
     tool_step_text, turn_tools,
@@ -33,6 +33,7 @@ from app.chat_common import (
 from app.config import (
     ALLOWED_TOOLS_WEB, DIALOG_MODEL, GARANT_MCP_CONFIG, HISTORY_MESSAGES, PROJECT_ROOT, PROMPT_DIALOG, RESUME_FAILS_TO_RESET,
 )
+from app.chat_common import ChatUsage, archive_cli_session, cli_result_fields, resume_arguments, session_reset_reason
 from app.contracts import ChatEntry, CliSession, DialogStatus, DialogTurn, Operation, Remark
 from app.run_map import build_run_map
 from app.runner import call, garant_available
@@ -58,6 +59,7 @@ class TurnResult:
     reply: str
     plan: list[Operation] = field(default_factory=list)
     cost_usd: float = 0.0
+    cost_known: bool = True
     sources: list[str] = field(default_factory=list)
 
 
@@ -72,7 +74,7 @@ def append_chat(run_id: str, role: str, text: str, **extra) -> ChatEntry:
     # Журнал сессии: роль и начало текста (полный текст — в chat.jsonl)
     log_event(run_id, "chat", who=CHAT_WHO[role], role=role, text=text[:300],
               plan_steps=len(extra["plan"]) if "plan" in extra else None,
-              **{k: v for k, v in extra.items() if k in ("cost_usd", "session", "mark", "version")})
+              **{k: v for k, v in extra.items() if k in ("cost_usd", "cost_known", "backend", "token_usage", "usage_complete", "session", "mark", "version")})
     return entry
 
 
@@ -177,63 +179,70 @@ def turn(run_id: str, message: str, *, session: str | None = None, timeout_s: in
                   shared_context=shared_context(run_id), mcp_tools=mcp_tools, mcp_config=mcp_config(run_id, garant),
                   short_cache_ttl=False)   # срок кэша 1 час: человек думает между сообщениями дольше 5 минут
     cli = load_session(run_id)
+    if cli is not None and session_reset_reason(cli):
+        archive_cli_session(run_dir(run_id) / SESSION)
+        log_event(run_id, "cli_session_reset", previous=cli.backend, backend=config.LLM_BACKEND, reason=session_reset_reason(cli))
+        cli = None
     cost = 0.0
+    usage = ChatUsage()
     result = None
     if cli is not None:
         # Продолжение разговора: модель помнит прошлые ходы, служебная строка — что изменилось
         result = call(resume_message(run_id, message, cli.version_seen, note), None, DialogTurn,
                       trace_name=f"dialog/turns/{n:04d}.raw.json", resume_session_id=cli.session_id,
-                      resume_cost_base=float(cli.cost_reported or 0.0), **common)
+                      resume_cost_base=float(cli.cost_reported or 0.0), **resume_arguments(cli), **common)
         cost += result.cost_usd
+        usage.add(result)
         if result.ok and result.value is not None:
             log_event(run_id, "dialog_session_resumed", session_id=cli.session_id)
         elif SESSION_GONE in (result.error or ""):
             log_event(run_id, "dialog_session_lost", session_id=cli.session_id, error=(result.error or "")[:300])
-            (run_dir(run_id) / SESSION).unlink(missing_ok=True)   # мёртвую сессию больше не продолжаем
+            archive_cli_session(run_dir(run_id) / SESSION)   # мёртвую сессию больше не продолжаем
             cli = None
         else:
             # 15.10 (код-ревью): сбой продолжения (таймаут, ошибка API) — память помощника не стираем: ход
             # «не получилось», следующий продолжит ту же сессию. Не продолжилась второй ход подряд — сессия сломана
             # (длинная или испорченная история): новая с историей чата (повторное ревью)
             fails = int(cli.resume_failures or 0) + 1
-            if result.session_id == cli.session_id and result.session_cost_usd:
-                cli = cli.model_copy(update={"cost_reported": result.session_cost_usd})   # CLI считает сессию нарастающим итогом
+            if result.session_id == cli.session_id:
+                cli = cli.model_copy(update=cli_result_fields(result))   # CLI считает сессию нарастающим итогом
             if fails >= RESUME_FAILS_TO_RESET:
                 log_event(run_id, "dialog_session_lost", session_id=cli.session_id,
                           error=(result.error or "")[:300])
-                (run_dir(run_id) / SESSION).unlink(missing_ok=True)
+                archive_cli_session(run_dir(run_id) / SESSION)
                 cli = None
             else:
                 log_event(run_id, "dialog_resume_failed", session_id=cli.session_id,
                           error=(result.error or "")[:300])
-                _save_session(run_id, cli.model_copy(update={"resume_failures": fails}))
+                _save_session(run_id, cli.model_copy(update={**cli_result_fields(result), "resume_failures": fails}))
     if cli is None:
         # Новая сессия: история чата — во входе, всё остальное — в системном промпте и инструментах
         result = call(NEW_SESSION_INSTRUCTION, build_document(run_id, message, history, note), DialogTurn,
                       trace_name=f"dialog/turns/{n:04d}{'.new' if result is not None else ''}.raw.json", **common)
         cost += result.cost_usd
+        usage.add(result)
         if result.ok and result.value is not None and result.session_id:
-            cli = CliSession(session_id=result.session_id, started=_now())
+            cli = CliSession(session_id=result.session_id, started=_now(), **cli_result_fields(result))
             log_event(run_id, "dialog_session_started", session_id=result.session_id)
     add_cost(run_id, cost)
     state = versions.load_state(run_id)
     current = state.current if state is not None else 0
     ok = result.ok and result.value is not None
-    log_event(run_id, "dialog_turn", ok=ok, version=current, cost_usd=round(cost, 4),
+    log_event(run_id, "dialog_turn", ok=ok, version=current, **usage.fields(),
               session_id=cli.session_id if cli else None)
     _log_exports(run_id, n)   # выгрузки Гаранта за ход — в журнал прогона
     if not ok:
         reply = f"Не получилось ответить: {result.error or 'неизвестная ошибка'}. Попробуйте ещё раз."
-        append_chat(run_id, "ассистент", reply, cost_usd=round(cost, 4), mark="сбой")
-        out = TurnResult(reply=reply, cost_usd=cost)
+        append_chat(run_id, "ассистент", reply, **usage.fields(), mark="сбой")
+        out = TurnResult(reply=reply, cost_usd=cost, cost_known=usage.cost_known)
     else:
         if cli is not None:
             _save_session(run_id, cli.model_copy(update={"last_turn": _now(), "version_seen": current,
-                                                         "cost_reported": result.session_cost_usd, "resume_failures": 0}))
+                                                         **cli_result_fields(result), "resume_failures": 0}))
         value = result.value
         append_chat(run_id, "ассистент", value.reply, plan=[op.model_dump(mode="json") for op in value.plan],
-                    sources=value.sources or None, steps=turn_steps(run_id, n) or None, cost_usd=round(cost, 4))
-        out = TurnResult(reply=value.reply, plan=list(value.plan), cost_usd=cost, sources=list(value.sources))
+                    sources=value.sources or None, steps=turn_steps(run_id, n) or None, **usage.fields())
+        out = TurnResult(reply=value.reply, plan=list(value.plan), cost_usd=cost, cost_known=usage.cost_known, sources=list(value.sources))
     return out
 
 
@@ -255,7 +264,7 @@ def turn_steps(run_id: str, n: int) -> list[str]:
 def _turn_exports(run_id: str, n: int) -> int:
     """Сколько выгрузок Гаранта сделал помощник в ходе n: удачные вызовы выгрузки (ошибка Гаранта — не трата)."""
     uses, errors = _turn_tools(run_id, n)
-    return sum(1 for u in uses if str(u.get("name", "")).startswith("mcp__garant__garant_export")
+    return sum(1 for u in uses if u.get("status", "completed") == "completed" and str(u.get("name", "")).startswith("mcp__garant__garant_export")
                and str(u.get("id")) not in errors)
 
 

@@ -42,6 +42,8 @@ from app.config import (
     prompt_path,
 )
 from app.contracts import ActPassport, Indicator01Output, Indicator02Output, Indicator03Output, Indicator04Output, Indicator05Output, Indicator06Output, Indicator07Output, Indicator08Output, Indicator09Output, Indicator10Output, Indicator11Output, Indicator12Output, Verdict, VerdictOutput
+from app import config
+from app.formatting import format_cost
 from app.logger import get_run_logger
 from app.runner import call
 from app.nodes.common import append_task_clarification, run_after
@@ -288,9 +290,9 @@ def run_verdicts(
     counts = Counter(v.verdict for v in ordered)
     logger.info(
         "verdicts done: violated=%d checked=%d not_applicable=%d no_data=%d errors=%d "
-        "cost=$%.4f duration=%.1fs",
+        "cost=%s duration=%.1fs",
         counts.get("нарушен", 0), counts.get("соблюдён", 0), counts.get("не применимо", 0),
-        counts.get("нет данных", 0), counts.get("ошибка", 0), cost_total, duration_total,
+        counts.get("нет данных", 0), counts.get("ошибка", 0), format_cost(cost_total, config.LLM_BACKEND == "claude", digits=4), duration_total,
     )
     # Прибавляем, а не перезаписываем: в meta уже лежит стоимость паспорта, а в диалоге —
     # всего прогона (раньше здесь было update_meta(cost_usd=...), паспорт терялся).

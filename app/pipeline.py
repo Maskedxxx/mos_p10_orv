@@ -77,6 +77,7 @@ from app.contracts import (
     RunSummary,
     Verdict,
 )
+from app.formatting import format_cost
 from app.logger import get_run_logger
 from app.config import PASSPORT_TIMEOUT_S
 from app.nodes.convert import convert_to_markdown
@@ -131,6 +132,11 @@ def _now() -> str:
     return datetime.now().isoformat()
 
 
+def _cost_known(run_id: str) -> bool:
+    with META_LOCK:
+        return load_json(run_id, META_FILE, RunMeta).cost_known
+
+
 def _cost_now(run_id: str) -> float:
     """
     Прочитать текущую суммарную стоимость прогона из meta.json.
@@ -166,6 +172,7 @@ class _Progress:
             run_id=run_id,
             act_filename=act_filename,
             status="идёт",
+            cost_known=_cost_known(run_id),
             nodes=[NodeState(key=key, title=title) for key, title in _NODES],
             indicators={str(ind.number): "ожидает" for ind in all_indicators()},
             hypotheses_branches={"violated": "ожидает", "no_data": "ожидает"},
@@ -222,14 +229,16 @@ class _Progress:
             node.duration_s = round(time.monotonic() - self._started_mono[key], 3)
             # Вклад узла — разница по meta.json: прибавляют туда сами узлы
             node.cost_usd = round(total_cost - self._cost_base[key], 6)
+            node.cost_known = _cost_known(self._run_id)
+            self._state.cost_known = node.cost_known
             self._state.total_cost_usd = round(total_cost, 6)
             self._save()
         if status == "готов":
             log_event(self._run_id, "node_finished", who=f"узел {key}", node=key, outputs=NODE_GRAPH[key][1],
-                      duration_s=node.duration_s, cost_usd=node.cost_usd)
+                      duration_s=node.duration_s, cost_usd=node.cost_usd, cost_known=node.cost_known)
         else:
             log_event(self._run_id, "node_failed", who=f"узел {key}", node=key, error=error,
-                      duration_s=node.duration_s, cost_usd=node.cost_usd)
+                      duration_s=node.duration_s, cost_usd=node.cost_usd, cost_known=node.cost_known)
 
     # ---- индикаторы узла [2] ----
 
@@ -278,11 +287,12 @@ class _Progress:
         """Записать финальное состояние прогона: статус, время, сводку, стоимость."""
         with self._lock:
             self._state.status = status
+            self._state.cost_known = _cost_known(run_id=self._run_id)
             self._state.finished_at = _now()
             self._state.summary = summary
             self._state.total_cost_usd = round(_cost_now(self._run_id), 6)
             self._save()
-        log_event(self._run_id, "run_finished", status=status, cost_usd=self._state.total_cost_usd,
+        log_event(self._run_id, "run_finished", status=status, cost_usd=self._state.total_cost_usd, cost_known=self._state.cost_known,
                   summary=summary.model_dump(mode="json"))
 
     @property
@@ -418,6 +428,7 @@ def _finish(
         excel_path=summary.excel_path,
         summary=summary,
         total_cost_usd=progress.total_cost_usd,
+        cost_known=_cost_known(run_id),
         error=error,
     )
 
@@ -566,9 +577,9 @@ def run_pipeline(
     summary = build_summary(verdicts, hypothesis_map, request, excel_path)
     logger.info(
         "прогон завершён: нарушено=%d соблюдено=%d не_применимо=%d нет_данных=%d "
-        "ошибок=%d строк=%d слияний=%d показателей=%d стоимость=$%.4f",
+        "ошибок=%d строк=%d слияний=%d показателей=%d стоимость=%s",
         summary.violated, summary.compliant, summary.not_applicable, summary.no_data,
         summary.errors, summary.map_rows, summary.merges, summary.request_items,
-        progress.total_cost_usd,
+        format_cost(progress.total_cost_usd, _cost_known(run_id), digits=4),
     )
     return _finish(progress, run_id, "готов", summary)

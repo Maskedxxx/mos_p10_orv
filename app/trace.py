@@ -221,6 +221,9 @@ def new_run(
     path.mkdir(parents=True, exist_ok=False)
 
     meta = RunMeta(
+        llm_backend=config.LLM_BACKEND,
+        llm_model=config.BACKEND_MODELS[config.LLM_BACKEND],
+        cost_known=config.LLM_BACKEND == "claude",
         run_id=run_id,
         act_filename=act_filename,
         started_at=datetime.now().isoformat(),
@@ -339,6 +342,18 @@ def update_meta(run_id: str, **fields: Any) -> None:
 # Лок для потокобезопасного прибавления стоимости к meta.json (27.10 перенесён сюда из узла гипотез):
 # узлы прибавляют стоимость из потоков одного процесса, оркестратор под ним же читает сумму и пишет статус
 META_LOCK = threading.Lock()
+
+def record_codex_usage(run_id: str, usage: dict[str, int], complete: bool) -> None:
+    """Расход нового вызова; исходный движок анализа и старые денежные суммы не переписываем."""
+    with META_LOCK:
+        if not (run_dir(run_id) / META_FILE).is_file():
+            return
+        meta = load_json(run_id, META_FILE, RunMeta)
+        combined = dict(meta.token_usage)
+        for key, amount in usage.items():
+            combined[key] = combined.get(key, 0) + amount
+        update_meta(run_id, cost_known=False, token_usage=combined,
+                    token_usage_complete=meta.token_usage_complete and complete)
 
 
 def add_cost(run_id: str, cost_delta: float) -> None:

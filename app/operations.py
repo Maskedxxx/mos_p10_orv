@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 
 from pydantic import ValidationError
 
-from app import versions
+from app import versions, config
 from app.config import NO_DATA_TEXT_FAMILY
 from app.contracts import (
     ActPassport, AddMapRow, AppendRequest, BuildHypotheses, Buckets, DataRequest, DeleteMapRow, DeleteRequestItem,
@@ -70,7 +70,8 @@ class Candidate:
     before: str
     after: str
     cost_usd: float
-    checks: bytes | None = None   # 14.10: таблица проверки индикатора из перепроверки — в корень при «Принять»
+    checks: bytes | None = None  # таблица перепроверки — в корень при «Принять»
+    cost_known: bool = True
 
 
 @dataclass
@@ -81,6 +82,7 @@ class StepResult:
     change: Change | None = None
     candidate: Candidate | None = None
     cost_usd: float = 0.0
+    cost_known: bool = True
 
 
 @dataclass
@@ -405,7 +407,7 @@ def _prepare_recheck(ctx: _Ctx, op: RecheckIndicator, prefix: str) -> Candidate:
     checks_path = run_dir(ctx.run_id) / f"{prefix}{VERDICTS_DIR}/{op.indicator:02d}.checks.json"
     return Candidate(op, new, f"{old.verdict}\n{points_text(old.rationale_brief, old.rationale)}",
                      f"{new.verdict}\n{points_text(new.rationale_brief, new.rationale)}", cost,
-                     checks=checks_path.read_bytes() if checks_path.is_file() else None)
+                     checks=checks_path.read_bytes() if checks_path.is_file() else None, cost_known=config.LLM_BACKEND == "claude")
 
 
 def _accept_recheck(ctx: _Ctx, cand: Candidate) -> Change:
@@ -438,7 +440,7 @@ def _prepare_hypotheses(ctx: _Ctx, op: BuildHypotheses, prefix: str) -> Candidat
         raise OperationError(f"агент гипотез не предложил ни одной: {hset.why_this_many[:400]}")
     have = [r.row_id for r in ctx.hyp_map.rows if op.indicator in r.indicators]
     after = "\n".join(f"— {h.hypothesis}" for h in hset.hypotheses)
-    return Candidate(op, hset, f"строк карты по индикатору {op.indicator}: {len(have)}", after, cost)
+    return Candidate(op, hset, f"строк карты по индикатору {op.indicator}: {len(have)}", after, cost, cost_known=config.LLM_BACKEND == "claude")
 
 
 def _accept_hypotheses(ctx: _Ctx, cand: Candidate) -> Change:
@@ -466,7 +468,7 @@ def _prepare_request(ctx: _Ctx, op: AppendRequest, prefix: str) -> Candidate:
     cost = _meta_cost(ctx.run_id) - start
     new_items = extended.items[len(ctx.request.items):]
     after = "\n".join(f"— {it.metric}" for it in new_items) or "новых позиций нет — всё покрыто существующими"
-    return Candidate(op, extended, f"позиций в бланке: {len(ctx.request.items)}", after, cost)
+    return Candidate(op, extended, f"позиций в бланке: {len(ctx.request.items)}", after, cost, cost_known=config.LLM_BACKEND == "claude")
 
 
 def _accept_request(ctx: _Ctx, cand: Candidate) -> Change:
@@ -522,7 +524,7 @@ def run_step(run_id: str, op: Operation) -> StepResult:
     ctx = _load(run_id, versions.ensure_v0(run_id))
     if op.kind in _MODEL_OPS:
         cand = _MODEL_OPS[op.kind][0](ctx, op, f"dialog/v{ctx.state.current + 1}/")
-        return StepResult(version=None, candidate=cand, cost_usd=cand.cost_usd)
+        return StepResult(version=None, candidate=cand, cost_usd=cand.cost_usd, cost_known=cand.cost_known)
     change = _CODE_OPS[op.kind](ctx, op)
     return _commit(ctx, op, change, 0.0)
 
@@ -531,7 +533,7 @@ def accept(run_id: str, cand: Candidate) -> StepResult:
     """«Принять» кандидата операции с моделью — записать его и зафиксировать версию."""
     ctx = _load(run_id, versions.ensure_v0(run_id))
     change = _MODEL_OPS[cand.op.kind][1](ctx, cand)
-    return _commit(ctx, cand.op, change, cand.cost_usd)
+    return _commit(ctx, cand.op, change, cand.cost_usd, cand.cost_known)
 
 
 def rollback(run_id: str, n: int) -> StepResult:
@@ -553,13 +555,13 @@ def rollback(run_id: str, n: int) -> StepResult:
     return _commit(ctx, _Rollback(reason=f"возврат к версии {n}"), change, 0.0)
 
 
-def _commit(ctx: _Ctx, op: Operation, change: Change, cost: float) -> StepResult:
+def _commit(ctx: _Ctx, op: Operation, change: Change, cost: float, cost_known: bool = True) -> StepResult:
     run_id, state = ctx.run_id, ctx.state
     n = state.current + 1
     entry = JournalEntry(version=n, at=datetime.datetime.now().isoformat(timespec="seconds"),
                          kind=_JOURNAL_KIND.get(op.kind, "решение эксперта"), target=change.target,
                          action=change.action, before=_short(change.before), after=_short(change.after),
-                         reason=op.reason, cost_usd=round(cost, 4))
+                         reason=op.reason, cost_usd=round(cost, 4), cost_known=cost_known)
     try:
         for v in ctx.verdicts.values():
             save_json(run_id, f"{VERDICTS_DIR}/{v.indicator:02d}.json", v)
@@ -585,7 +587,7 @@ def _commit(ctx: _Ctx, op: Operation, change: Change, cost: float) -> StepResult
     except Exception:
         versions.restore(run_id, state.current)
         raise
-    return StepResult(version=n, change=change, cost_usd=cost)
+    return StepResult(version=n, change=change, cost_usd=cost, cost_known=cost_known)
 
 
 def _run_gaps(run_id: str, journal: list[JournalEntry]) -> set[int] | None:
@@ -618,4 +620,5 @@ def _refresh_progress(run_id: str, ctx: _Ctx, excel) -> None:
     progress = load_json(run_id, PROGRESS_FILE, RunProgress)
     summary = build_summary(list(ctx.verdicts.values()), ctx.hyp_map, ctx.request, excel)
     save_json(run_id, PROGRESS_FILE, progress.model_copy(update={
-        "summary": summary, "total_cost_usd": load_json(run_id, META_FILE, RunMeta).cost_usd}))
+        "summary": summary, "total_cost_usd": load_json(run_id, META_FILE, RunMeta).cost_usd,
+        "cost_known": load_json(run_id, META_FILE, RunMeta).cost_known}))

@@ -1,5 +1,11 @@
 """
-Обёртка над `claude -p` — единая точка запуска модели для узлов пайплайна П-10.
+Общий вызов модели П-10: Claude CLI и Codex CLI.
+
+30.10: P10_LLM_BACKEND выбирает движок; проверки контрактов и повторы общие.
+Codex использует gpt-6.1-terra/medium, схему файлом, stdin и сохранённую авторизацию.
+Codex получает только разрешённые узлу поиск и MCP-инструменты Гаранта/чтения прогона.
+Чаты сохраняют происхождение сессий. Денежная стоимость Codex неизвестна; токены учитываются
+по разнице накопленных значений сессии. Ниже — подробности прежнего режима Claude.
 
 Берёт на себя: сборку команды, передачу документа через stdin, разбор вывода
 `--output-format stream-json`, валидацию ответа и ретраи при сбоях. Про доменную логику
@@ -82,13 +88,20 @@ import logging
 import os
 import subprocess
 import threading
+
+from app.formatting import format_cost
 import time
 from datetime import datetime
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+import tempfile
+import copy
+import uuid
+import sys
+from app import config
 from typing import Any, Generic, TypeVar
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ValidationError, Field
 
 from app.config import (
     CLI_SETTINGS_FILE, EFFORT, GARANT_ALL_TOOLS, GARANT_MAX_OUTPUT_TOKENS, GARANT_MCP_CONFIG, GARANT_NO_PROXY_HOST,
@@ -96,7 +109,7 @@ from app.config import (
 )
 from app.json_fix import repair_json
 from app.logger import get_run_logger
-from app.trace import log_event, run_dir, save_bytes, save_raw
+from app.trace import log_event, run_dir, save_bytes, save_raw, record_codex_usage
 
 # Тип модели ответа для call() — только pydantic-модели (--json-schema требует схему)
 ModelT = TypeVar("ModelT", bound=BaseModel)
@@ -109,7 +122,7 @@ ValueT = TypeVar("ValueT")
 
 @dataclass
 class CallResult(Generic[ValueT]):
-    """Итог вызова claude -p: провалидированный ответ (или строка) либо признак неудачи."""
+    """Итог любого CLI; cost_usd полон только при cost_known, usage_complete отделяет неполные токены."""
 
     value: ValueT | None
     ok: bool
@@ -122,6 +135,12 @@ class CallResult(Generic[ValueT]):
     # Стоимость всей сессии CLI, как её сообщил последний запуск (14.10: при --resume CLI сообщает стоимость
     # сессии с начала, а не одного запуска) — помощник хранит её, чтобы следующий ход считал только свой расход
     session_cost_usd: float = 0.0
+    backend: str = "claude"
+    model: str | None = None
+    cost_known: bool = True
+    token_usage: dict[str, int] | None = None
+    session_token_usage: dict[str, int] | None = None
+    usage_complete: bool = True
 
 
 @dataclass
@@ -149,6 +168,7 @@ class _AttemptOutcome:
     permission_denials: list[Any]
     duration_s: float
     first_answer: str | None = None
+    session_token_usage: dict[str, int] | None = None
 
 
 # Изоляция каждого вызова модели от окружения машины. Проверено 2026-09-25
@@ -414,12 +434,14 @@ def _log_attempt(
     """Единая строка лога попытки: артефакт, номер, длительность, стоимость, ходы, исход — и событие журнала сессии."""
     turns = str(num_turns) if num_turns is not None else "-"
     logger.info(
-        "call: artifact=%s attempt=%d/%d duration=%.1fs cost=$%.4f turns=%s outcome=%s",
-        trace_name, attempt, max_attempts, duration_s, cost_usd, turns, outcome,
+        "call: artifact=%s attempt=%d/%d duration=%.1fs cost=%s turns=%s outcome=%s",
+        trace_name, attempt, max_attempts, duration_s,
+        format_cost(cost_usd, config.LLM_BACKEND == "claude", digits=4), turns, outcome,
     )
     log_event(run_id, "agent_attempt", who=_agent_label(trace_name), trace=trace_name, attempt=attempt,
               max_attempts=max_attempts, outcome=outcome, duration_s=round(duration_s, 1), cost_usd=cost_usd,
-              turns=num_turns, error=(error or "")[:500] or None)
+              turns=num_turns, error=(error or "")[:500] or None,
+              backend=config.LLM_BACKEND, cost_known=config.LLM_BACKEND == "claude")
 
 
 def _agent_label(trace_name: str) -> str:
@@ -431,14 +453,15 @@ def _log_agent_started(run_id: str, trace_name: str, model: str, allowed_tools: 
                        mcp_tools: list[str] | None, timeout_s: int) -> None:
     """Событие журнала: агент запущен — модель, встроенные инструменты, инструменты Гаранта, таймаут."""
     log_event(run_id, "agent_started", who=_agent_label(trace_name), trace=trace_name, model=model,
-              tools=list(allowed_tools), garant=list(mcp_tools or []), timeout_s=timeout_s)
+              tools=list(allowed_tools), garant=list(mcp_tools or []), timeout_s=timeout_s, backend=config.LLM_BACKEND)
 
 
 def _log_agent_finished(run_id: str, trace_name: str, result: "CallResult") -> None:
     """Событие журнала: итог вызова агента — успех, число попыток, стоимость, время, последняя ошибка."""
     log_event(run_id, "agent_finished", who=_agent_label(trace_name), trace=trace_name, ok=result.ok,
               attempts=result.attempts, cost_usd=result.cost_usd, duration_s=round(result.duration_s, 1),
-              error=(result.error or "")[:500] or None)
+              error=(result.error or "")[:500] or None, backend=result.backend, model=result.model,
+              cost_known=result.cost_known, token_usage=result.token_usage, usage_complete=result.usage_complete)
 
 
 def _stream_path(run_id: str, trace_name: str) -> Path:
@@ -471,6 +494,7 @@ def _exec(
     document: str | None,
     stream_path: Path,
     attempt: int,
+    cwd: Path | None = None,
 ) -> subprocess.CompletedProcess:
     """
     Запустить claude -p и читать его вывод построчно: каждое событие сразу дописывается в файл
@@ -482,9 +506,10 @@ def _exec(
     убивается, бросается subprocess.TimeoutExpired с тем, что агент успел вывести (output),
     как это делал subprocess.run.
     """
+    cwd_options = {"cwd": cwd} if cwd is not None else {}
     proc = subprocess.Popen(
         cmd, stdin=subprocess.PIPE if document is not None else subprocess.DEVNULL,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", env=env, **cwd_options,
     )
     lines: list[str] = []
     stderr_parts: list[str] = []
@@ -532,7 +557,7 @@ def _exec(
         proc.wait()
         for t in threads:
             t.join(timeout=10)
-        raise subprocess.TimeoutExpired(cmd, timeout_s, output=_as_stdout(lines)) from None
+        raise subprocess.TimeoutExpired(cmd, timeout_s, output=_as_stdout(lines), stderr="".join(stderr_parts)) from None
     for t in threads:
         t.join()
     return subprocess.CompletedProcess(cmd, proc.returncode, _as_stdout(lines), "".join(stderr_parts))
@@ -632,6 +657,252 @@ def _run_attempt(
     )
 
 
+def codex_output_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Строгая форма для CLI: значения и ограничения сохраняются, исходник не меняется."""
+    def convert(node):
+        if isinstance(node, list):
+            return [convert(item) for item in node]
+        if not isinstance(node, dict):
+            return node
+        # properties/$defs — словари имён, а не схемы: поле с именем default нельзя удалить.
+        result = {}
+        for key, value in node.items():
+            if key == "default":
+                continue
+            if key in ("properties", "$defs", "definitions", "patternProperties", "dependentSchemas"):
+                result[key] = {name: convert(child) for name, child in value.items()}
+            elif key in ("enum", "const", "examples", "dependentRequired"):
+                result[key] = copy.deepcopy(value)
+            else:
+                result[key] = convert(value)
+        if isinstance(result.get("additionalProperties"), dict) or result.get("additionalProperties") is True:
+            raise ValueError("Codex: свободный словарь в схеме требует отдельной проверки совместимости")
+        if "properties" in result:
+            result["additionalProperties"] = False
+            result["required"] = list(result["properties"])
+        return result
+    return convert(schema)
+
+
+_CODEX_COUNTERS = ("input_tokens", "cached_input_tokens", "cache_write_input_tokens",
+                   "output_tokens", "reasoning_output_tokens")
+
+
+def _codex_usage(value: Any) -> dict[str, int] | None:
+    if not isinstance(value, dict) or not {"input_tokens", "output_tokens"} <= value.keys():
+        return None
+    usage = {key: value[key] for key in _CODEX_COUNTERS if key in value}
+    if any(type(amount) is not int or amount < 0 for amount in usage.values()):
+        raise ValueError("usage_error: счётчики токенов должны быть неотрицательными целыми")
+    return usage
+
+
+def _usage_delta(current: dict[str, int], previous: dict[str, int]) -> dict[str, int]:
+    """CLI сообщает накопленное по сессии — проба 30.10 подтверждена её журналом."""
+    if not previous.keys() <= current.keys():
+        raise ValueError("usage_error: в продолжении пропали прежние счётчики")
+    delta = {key: amount - previous.get(key, 0) for key, amount in current.items()}
+    if any(amount < 0 for amount in delta.values()):
+        raise ValueError("usage_error: накопленный расход сессии уменьшился")
+    return delta
+
+
+def _valid_codex_session(value: str) -> bool:
+    try:
+        uuid.UUID(value)
+    except (ValueError, TypeError, AttributeError):
+        return False
+    return True
+
+
+class _CodexInvocation:
+    """Техническая обёртка Codex. Проверки контракта и цикл повторов остаются в call()."""
+
+    def __init__(self, run_id: str, trace_name: str, model: str,
+                 schema: dict[str, Any], shared_context: str | None, allowed_tools: list[str],
+                 mcp_tools: list[str] | None, mcp_config: str | None):
+        self.run_id, self.trace_name, self.model = run_id, trace_name, model
+        self.workspace = (run_dir(run_id) / "_codex" / "workspace").resolve()
+        self.workspace.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.directory = Path(tempfile.mkdtemp(prefix="call-", dir=self.workspace))
+        self.schema_file = self.directory / "schema.json"
+        self.system_file = self.directory / "instructions.md"
+        for path, text in (
+            (self.schema_file, json.dumps(codex_output_schema(schema), ensure_ascii=False)),
+            (self.system_file, SERVICE_SYSTEM_PROMPT + ("\n\n" + shared_context if shared_context else "")),
+        ):
+            save_bytes(run_id, path.relative_to(run_dir(run_id).resolve()).as_posix(), text.encode())
+        self.env = dict(os.environ)
+        for key in ("OPENAI_API_KEY", "CODEX_API_KEY", "GARANT_TOKEN", "FORCE_PROMPT_CACHING_5M"):
+            self.env.pop(key, None)
+        self.web_enabled = bool(allowed_tools)
+        if set(allowed_tools) not in (set(), {"WebSearch", "WebFetch"}):
+            raise ValueError("Codex: разрешена только пара WebSearch/WebFetch либо отсутствие поиска")
+        self.mcp_options: dict[str, Any] = {}
+        self.allowed_mcp: set[tuple[str, str]] = set()
+        if mcp_tools:
+            servers = json.loads(Path(mcp_config or GARANT_MCP_CONFIG).read_text(encoding="utf-8"))["mcpServers"]
+            groups: dict[str, list[str]] = {}
+            for tool in mcp_tools:
+                name = _mcp_tool_name(tool)
+                parts = name.split("__", 2)
+                if len(parts) != 3 or parts[0] != "mcp":
+                    raise ValueError("Codex: неверное имя инструмента MCP")
+                server, method = parts[1:]
+                permitted = GARANT_ALL_TOOLS if server == "garant" else ("list_artifacts", "read_artifact") if server == "p10run" else ()
+                if method not in permitted:
+                    raise ValueError("Codex: неизвестный инструмент MCP")
+                groups.setdefault(server, [])
+                if method not in groups[server]:
+                    groups[server].append(method)
+                self.allowed_mcp.add((server, method))
+            for server, methods in groups.items():
+                source = servers.get(server)
+                if not isinstance(source, dict):
+                    raise ValueError("Codex: сервер MCP отсутствует в конфигурации")
+                prefix = f"mcp_servers.{server}."
+                if server == "garant":
+                    if source.get("url") != "https://mcp.garant.ru/mcp" or source.get("headers", {}) not in ({}, {"Authorization": "Bearer ${GARANT_TOKEN}"}):
+                        raise ValueError("Codex: Гарант требует штатный адрес и токен только из окружения")
+                    self.mcp_options[prefix + "url"] = source["url"]
+                    self.mcp_options[prefix + "bearer_token_env_var"] = "GARANT_TOKEN"
+                    self.env.update(_mcp_env())
+                else:
+                    expected = str(run_dir(run_id).resolve())
+                    if (Path(source.get("command", "")).resolve() != Path(sys.executable).resolve()
+                            or source.get("args") != [str(config.PROJECT_ROOT / "app" / "mcp_run.py")]
+                            or source.get("env") != {"P10_RUN_DIR": expected}):
+                        raise ValueError("Codex: p10run должен читать только текущий прогон штатным сервером")
+                    for key in ("command", "args"):
+                        self.mcp_options[prefix + key] = source[key]
+                    self.mcp_options[prefix + "env.P10_RUN_DIR"] = expected
+                self.mcp_options[prefix + "required"] = True
+                self.mcp_options[prefix + "enabled_tools"] = methods
+                for method in methods:
+                    self.mcp_options[prefix + f"tools.{method}.approval_mode"] = "approve"
+                    self.mcp_options[prefix + f"tools.{method}.output_token_limit"] = GARANT_MAX_OUTPUT_TOKENS
+        elif mcp_config:
+            raise ValueError("Codex: конфигурация MCP без разрешённых методов не используется")
+
+    def command(self, attempt: int, resume: str | None) -> tuple[list[str], Path]:
+        output = self.directory / f"answer-{attempt}.json"
+        command = ["codex", "exec"] + (["resume"] if resume else [])
+        command += ["--ignore-user-config", "--ignore-rules", "--strict-config", "--skip-git-repo-check",
+                    "--model", self.model, "--json", "--output-schema", str(self.schema_file),
+                    "--output-last-message", str(output)]
+        options = {
+            "model_reasoning_effort": EFFORT, "approval_policy": "never", "sandbox_mode": "read-only",
+            "web_search": "live" if self.web_enabled else "disabled", "project_doc_max_bytes": 0,
+            "model_instructions_file": str(self.system_file),
+            "features.shell_tool": False, "features.shell_snapshot": False, "features.apps": False,
+            "features.multi_agent": False, "features.hooks": False, "features.memories": False,
+            "features.skill_search": False, "features.skip_host_skill_discovery": True,
+            "memories.use_memories": False, "memories.generate_memories": False,
+            **self.mcp_options,
+        }
+        for key, value in options.items():
+            command += ["-c", key + "=" + json.dumps(value, ensure_ascii=False)]
+        command += [resume, "-"] if resume else ["-"]
+        relative = (self.directory / f"attempt-{attempt}.command.json").relative_to(run_dir(self.run_id).resolve())
+        save_bytes(self.run_id, relative.as_posix(), json.dumps(command, ensure_ascii=False).encode())
+        return command, output
+
+    def attempt(self, message: str, document: str | None, send_document: bool,
+                resume: str | None, attempt: int, timeout_s: int) -> _AttemptOutcome:
+        command, output = self.command(attempt, resume)
+        text = message + ("\n\n" + document if send_document and document is not None else "")
+        relative = (self.directory / f"attempt-{attempt}.input.txt").relative_to(run_dir(self.run_id).resolve())
+        save_bytes(self.run_id, relative.as_posix(), text.encode())
+        started = time.monotonic()
+        raw, stderr = "", ""
+        thread, usage = None, None
+
+        def outcome(kind, error=None, answer=None):
+            return _AttemptOutcome(kind=kind, error=(f"{kind}: {error}" if error else None),
+                result_text=answer, session_id=thread, cost_usd=0.0, num_turns=None,
+                permission_denials=[], duration_s=time.monotonic() - started,
+                session_token_usage=usage)
+        try:
+            process = _exec(command, timeout_s=timeout_s, env=self.env, document=text,
+                            stream_path=_stream_path(self.run_id, self.trace_name), attempt=attempt,
+                            cwd=self.workspace)
+            raw, stderr = process.stdout or "", process.stderr or ""
+        except FileNotFoundError as error:
+            raise RuntimeError("бинарь 'codex' не найден") from error
+        except subprocess.TimeoutExpired as error:
+            raw, stderr = error.stdout or "", error.stderr or ""
+            return outcome("timeout", f"таймаут процесса после {timeout_s} с")
+        finally:
+            save_raw(self.run_id, self.trace_name, raw)
+            save_raw(self.run_id, self.trace_name + ".stderr.txt", stderr)
+        try:
+            events = json.loads(raw)
+            if not isinstance(events, list) or any(not isinstance(e, dict) for e in events):
+                raise ValueError("ожидался список событий")
+        except (ValueError, TypeError) as error:
+            if process.returncode:
+                return outcome("process_error", f"код {process.returncode}: {stderr[:2000]}")
+            return outcome("top_level_json_error", str(error))
+        thread = next((e.get("thread_id") for e in events if e.get("type") == "thread.started"), None)
+        completed = next((e for e in reversed(events) if e.get("type") == "turn.completed"), None)
+        if completed is not None:
+            try:
+                usage = _codex_usage(completed.get("usage"))
+            except ValueError as error:
+                return outcome("usage_error", str(error))
+        if process.returncode:
+            return outcome("process_error", f"код {process.returncode}: {stderr[:2000]}")
+        if resume and thread != resume:
+            thread, usage = None, None
+            return outcome("session_mismatch", "CLI продолжил другую сессию")
+        for event in events:
+            if event.get("type") in ("error", "turn.failed"):
+                return outcome("api_error", json.dumps(event, ensure_ascii=False)[:2000])
+            if str(event.get("type", "")).startswith("item."):
+                item = event.get("item") or {}
+                if not isinstance(item, dict):
+                    return outcome("api_error", "повреждено событие item")
+                kind = item.get("type")
+                if kind == "error":
+                    if str(item.get("message", "")).startswith("Under-development features enabled:"):
+                        log_event(self.run_id, "cli_notice", backend="codex", trace=self.trace_name,
+                                  message=item.get("message"))
+                    else:
+                        return outcome("api_error", str(item.get("message", ""))[:2000])
+                elif kind == "mcp_tool_call":
+                    # CLI может сначала запросить перечень ресурсов у своих настроенных MCP.
+                    # Это чтение каталога; произвольные методы и серверы по-прежнему запрещены.
+                    arguments = item.get("arguments") or {}
+                    discovery = (
+                        bool(self.allowed_mcp)
+                        and item.get("server") in {"codex", *(server for server, _ in self.allowed_mcp)}
+                        and item.get("tool") in ("list_mcp_resources", "list_mcp_resource_templates")
+                        and isinstance(arguments, dict) and set(arguments) <= {"server", "cursor"}
+                        and (arguments.get("server") is None
+                             or (isinstance(arguments["server"], str)
+                                 and arguments["server"] in {server for server, _ in self.allowed_mcp}))
+                    )
+                    if not discovery and (item.get("server"), item.get("tool")) not in self.allowed_mcp:
+                        return outcome("unexpected_tool", "метод MCP не разрешён этому агенту")
+                elif kind == "web_search":
+                    if not self.web_enabled:
+                        return outcome("unexpected_tool", "поиск не разрешён этому агенту")
+                elif kind not in ("agent_message", "reasoning"):
+                    return outcome("unexpected_tool", str(kind))
+        if not isinstance(thread, str) or not thread or completed is None:
+            return outcome("no_result", "нет thread.started или turn.completed")
+        if not _valid_codex_session(thread):
+            thread, usage = None, None
+            return outcome("invalid_session", "thread_id должен быть UUID, не флагом CLI")
+        try:
+            answer = output.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            return outcome("no_result", "нет читаемого файла итогового ответа")
+        if not answer.strip():
+            return outcome("no_result", "пустой итоговый ответ")
+        return outcome("ok", answer=answer)
+
+
 def call(
     instruction: str,
     document: str | None,
@@ -643,7 +914,7 @@ def call(
     max_attempts: int = 3,
     timeout_s: int = 900,
     max_budget_usd: float | None = None,
-    model: str = MODEL,
+    model: str | None = None,
     shared_context: str | None = None,
     short_cache_ttl: bool = True,
     mcp_tools: list[str] | None = None,
@@ -651,6 +922,8 @@ def call(
     resume_session_id: str | None = None,
     mcp_config: str | None = None,
     resume_cost_base: float = 0.0,
+    resume_backend: str | None = None,
+    resume_token_base: dict[str, int] | None = None,
 ) -> CallResult[ModelT]:
     """
     Вызвать `claude -p` с ретраями и вернуть провалидированный ответ.
@@ -693,6 +966,20 @@ def call(
     if max_attempts < 1:
         raise ValueError("max_attempts должен быть >= 1")
 
+    backend = config.LLM_BACKEND
+    model = model or config.BACKEND_MODELS[backend]
+    if resume_session_id and (resume_backend or "claude") != backend:
+        raise ValueError("сессия другого движка: начните новую с нужной историей")
+    if backend == "codex":
+        if resume_session_id and not _valid_codex_session(resume_session_id):
+            raise ValueError("Codex resume принимает только явный UUID сессии")
+        if model != config.BACKEND_MODELS["codex"]:
+            raise ValueError("Codex в P-10 использует только gpt-6.1-terra")
+        if max_budget_usd is not None:
+            raise ValueError("Codex CLI не поддерживает заданный денежный лимит")
+        if resume_session_id and _codex_usage(resume_token_base) is None:
+            raise ValueError("для продолжения Codex нужен прежний накопленный расход токенов")
+
     logger = get_run_logger(run_id)
     schema = model_cls.model_json_schema()
     schema_json = json.dumps(schema, ensure_ascii=False)
@@ -705,11 +992,15 @@ def call(
     attempts_made = 0
     permission_denials_total: list[Any] = []
 
-    system_file = _shared_context_file(run_id, shared_context) if shared_context is not None else None
-    env = {**os.environ, **_SHORT_CACHE_ENV} if short_cache_ttl else None
+    codex = _CodexInvocation(run_id, trace_name, model, schema, shared_context, allowed_tools, mcp_tools, mcp_config) if backend == "codex" else None
+    system_file = _shared_context_file(run_id, shared_context) if backend == "claude" and shared_context is not None else None
+    env = {**os.environ, **_SHORT_CACHE_ENV} if backend == "claude" and short_cache_ttl else None
     if mcp_tools:
         with_garant = any(_mcp_tool_name(tool).startswith(_GARANT_TOOL_PREFIX) for tool in mcp_tools)
         env = {**(env if env is not None else os.environ), **_mcp_env(with_garant)}
+    token_total: dict[str, int] = {}
+    usage_complete = True
+    token_reported = {resume_session_id: dict(resume_token_base)} if resume_session_id and resume_token_base is not None else {}
     _log_agent_started(run_id, trace_name, model, allowed_tools, mcp_tools, timeout_s)
 
     # Состояние следующей попытки: что слать и слать ли документ в stdin.
@@ -723,9 +1014,25 @@ def call(
     for attempt in range(1, max_attempts + 1):
         attempts_made = attempt
 
-        cmd = _build_cmd(message, schema_json, allowed_tools, resume_session_id, max_budget_usd, model, system_file,
-                         mcp_tools, mcp_config)
-        outcome = _run_attempt(cmd, document, send_document, timeout_s, run_id, trace_name, env, attempt)
+        if codex is None:
+            cmd = _build_cmd(message, schema_json, allowed_tools, resume_session_id, max_budget_usd, model, system_file,
+                             mcp_tools, mcp_config)
+            outcome = _run_attempt(cmd, document, send_document, timeout_s, run_id, trace_name, env, attempt)
+        else:
+            outcome = codex.attempt(message, document, send_document, resume_session_id, attempt, timeout_s)
+            if outcome.session_token_usage is None:
+                usage_complete = False
+            else:
+                previous = token_reported.get(outcome.session_id, {})
+                try:
+                    delta = _usage_delta(outcome.session_token_usage, previous)
+                except ValueError as error:
+                    usage_complete = False
+                    outcome.kind, outcome.error, outcome.result_text = "usage_error", str(error), None
+                else:
+                    for key, amount in delta.items():
+                        token_total[key] = token_total.get(key, 0) + amount
+                    token_reported[outcome.session_id] = outcome.session_token_usage
 
         session_id = outcome.session_id or session_id
         attempt_cost = outcome.cost_usd
@@ -786,6 +1093,8 @@ def call(
             # Модели при повторе — ошибка последнего проверенного ответа: сессия CLI кончилась на нём; если тот
             # отбракован как урезанный — и ошибка первого ответа, иначе модель повторит её
             kind, last_error = failures[-1]
+            if backend == "codex":
+                last_error = f"{kind}: {last_error}"
             if kind == "answer_truncated":
                 last_error = f"{failures[0][1]}\n\n{last_error}"
             _log_attempt(logger, trace_name, attempt, max_attempts, outcome.duration_s,
@@ -818,9 +1127,19 @@ def call(
         permission_denials=permission_denials_total,
         duration_s=duration_total,
         session_cost_usd=reported.get(session_id, 0.0) if session_id else 0.0,
+        backend=backend, model=model, cost_known=backend == "claude",
+        token_usage=token_total or None,
+        session_token_usage=token_reported.get(session_id), usage_complete=usage_complete,
     )
+    if backend == "codex":
+        record_codex_usage(run_id, token_total, usage_complete)
     _log_agent_finished(run_id, trace_name, result)
     return result
+
+
+class _TextReply(BaseModel):
+    model_config = {"extra": "forbid"}
+    text: str = Field(min_length=1, description="Полный текст ответа на переданное задание.")
 
 
 def call_text(
@@ -848,6 +1167,11 @@ def call_text(
 
     Исчерпание попыток — НЕ исключение, а CallResult(ok=False, ...), как и в call().
     """
+    if config.LLM_BACKEND == "codex":
+        result = call(instruction + "\nВерни полный текст ответа в поле text схемы.", document, _TextReply,
+                      run_id=run_id, trace_name=trace_name, allowed_tools=allowed_tools,
+                      max_attempts=max_attempts, timeout_s=timeout_s, max_budget_usd=max_budget_usd)
+        return replace(result, value=result.value.text if result.value is not None else None)
     if max_attempts < 1:
         raise ValueError("max_attempts должен быть >= 1")
 
@@ -910,6 +1234,7 @@ def call_text(
         error=last_error,
         permission_denials=permission_denials_total,
         duration_s=duration_total,
+        model=MODEL,
     )
     _log_agent_finished(run_id, trace_name, result)
     return result
