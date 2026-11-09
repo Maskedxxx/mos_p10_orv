@@ -302,3 +302,81 @@ def test_legacy_meta_is_readable_with_original_provenance(valid_run_meta):
     meta = RunMeta.model_validate(valid_run_meta)
     assert meta.llm_backend == "claude" and meta.llm_model == "sonnet"
     assert meta.cost_known and meta.token_usage == {}
+
+
+def test_recovered_connection_accepts_completed_answer_and_records_notice(codex, tmp_runs_dir, monkeypatch):
+    events = [
+        {"type": "thread.started", "thread_id": THREAD},
+        {"type": "turn.started"},
+        {"type": "error", "message": "Reconnecting... 2/5 (workspace routing discovery timed out)"},
+        {"type": "item.completed", "item": {"type": "agent_message", "text": json.dumps(ANSWER)}},
+        {"type": "turn.completed", "usage": USAGE},
+    ]
+    calls = prepared(monkeypatch, [{"events": events}])
+    result = invoke(max_attempts=1)
+    assert result.ok and result.attempts == 1 and len(calls) == 1
+    assert any(e.get("event") == "cli_notice" and "Reconnecting" in e.get("message", "")
+               for e in trace.read_events("probe"))
+
+
+def test_reconnect_without_completed_turn_is_still_error(codex, tmp_runs_dir, monkeypatch):
+    events = [
+        {"type": "thread.started", "thread_id": THREAD},
+        {"type": "error", "message": "Reconnecting... 5/5 (workspace routing discovery failed)"},
+        {"type": "turn.failed", "error": {"message": "Connection failed"}},
+    ]
+    prepared(monkeypatch, [{"events": events}])
+    result = invoke(max_attempts=1)
+    assert not result.ok and "api_error" in result.error
+
+
+def test_metadata_fallback_notice_is_visible_and_completed_answer_is_accepted(codex, tmp_runs_dir, monkeypatch):
+    message = "Model metadata for `gpt-6.1-terra` not found. Defaulting to fallback metadata; this can degrade performance and cause issues."
+    events = [
+        {"type": "thread.started", "thread_id": THREAD},
+        {"type": "item.completed", "item": {"type": "error", "message": message}},
+        {"type": "item.completed", "item": {"type": "agent_message", "text": json.dumps(ANSWER)}},
+        {"type": "turn.completed", "usage": USAGE},
+    ]
+    prepared(monkeypatch, [{"events": events}])
+    result = invoke(max_attempts=1)
+    assert result.ok and result.value.model_dump() == ANSWER
+    assert any(e.get("event") == "cli_notice" and e.get("message") == message
+               for e in trace.read_events("probe"))
+
+
+def test_unrelated_error_remains_failure_even_after_completed_turn(codex, tmp_runs_dir, monkeypatch):
+    events = [
+        {"type": "thread.started", "thread_id": THREAD},
+        {"type": "error", "message": "Unexpected authorization error"},
+        {"type": "turn.completed", "usage": USAGE},
+    ]
+    prepared(monkeypatch, [{"events": events}])
+    result = invoke(max_attempts=1)
+    assert not result.ok and "api_error" in result.error
+
+
+def test_transport_fallback_accepts_completed_answer_and_records_notice(codex, tmp_runs_dir, monkeypatch):
+    message = "Falling back from WebSockets to HTTPS transport. workspace routing discovery timed out"
+    events = [
+        {"type": "thread.started", "thread_id": THREAD},
+        {"type": "item.completed", "item": {"type": "error", "message": message}},
+        {"type": "item.completed", "item": {"type": "agent_message", "text": json.dumps(ANSWER)}},
+        {"type": "turn.completed", "usage": USAGE},
+    ]
+    calls = prepared(monkeypatch, [{"events": events}])
+    result = invoke(max_attempts=1)
+    assert result.ok and result.value.model_dump() == ANSWER and len(calls) == 1
+    assert any(e.get("event") == "cli_notice" and e.get("message") == message
+               for e in trace.read_events("probe"))
+
+
+def test_transport_fallback_without_completed_turn_remains_error(codex, tmp_runs_dir, monkeypatch):
+    events = [
+        {"type": "thread.started", "thread_id": THREAD},
+        {"type": "item.completed", "item": {"type": "error", "message": "Falling back from WebSockets to HTTPS transport. timed out"}},
+        {"type": "turn.failed", "error": {"message": "Connection failed"}},
+    ]
+    prepared(monkeypatch, [{"events": events}])
+    result = invoke(max_attempts=1)
+    assert not result.ok and "api_error" in result.error

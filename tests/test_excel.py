@@ -587,8 +587,8 @@ def test_basis_cell_states_when_no_quote_but_sources():
 
     cell = _render_basis_cell(None, "п. 2.2, 2.3, 4-6", ["https://www.privatmed.ru/a"])
     assert cell.startswith("Норма акта, п. 2.2, 2.3, 4-6:")   # префикс «п.» не удваивается
-    assert "цитата не приведена" in cell
-    assert "внешних источниках" in cell
+    assert "цитата из акта не приведена" in cell
+    assert "не на тексте акта" not in cell
     assert "— https://www.privatmed.ru/a" in cell
 
 
@@ -1241,17 +1241,107 @@ def test_questions_sheet_after_request_and_not_in_request(tmp_runs_dir):
     ws = wb["Вопросы органу"]
     rows = _sheet_rows(ws)
     header = next(r for r in rows if r and r[0] == "№")
-    assert header[:4] == ["№", "Вопрос", "Пункт акта", "Строки карты"]
+    assert header[:5] == ["№", "Вопрос", "Пояснение", "Пункт акта", "Строки карты"]
     assert "Оценка (1–5)" in header and "Замечание" in header
     q = next(r for r in rows if r and r[0] == "2")
-    assert q[1] == "Назовите три наиболее частых основания для продления срока ГЭЭ" and q[2] == "2.7.1.2"
-    assert "стр. 1" in q[3]
+    assert q[1] == "Назовите три наиболее частых основания для продления срока ГЭЭ" and q[3] == "2.7.1.2"
+    assert "стр. 1" in q[4]
     assert "Вопросы органу словами" in str(rows[0])
 
 
 def test_questions_sheet_says_none_when_empty(tmp_runs_dir):
     wb = load_workbook(build_excel(_map(), _request(), _buckets(with_failed=False), _passport(), "run_q0"))
     assert "вопросов нет" in str(_sheet_rows(wb["Вопросы органу"]))
+
+
+def test_question_note_survives_export_and_feedback_columns(tmp_runs_dir):
+    """Пояснение сохраняется, а сдвиг колонок не ломает импорт замечания эксперта."""
+    from app.feedback import read_remarks
+
+    request = _request_iter4()
+    note = "Общий вопрос дополнен отдельной частью; связи с исходными строками сохранены."
+    request = request.model_copy(update={"items": [
+        item.model_copy(update={"note": note}) if item.kind == "открытый вопрос" else item
+        for item in request.items
+    ]})
+    path = build_excel(_map_iter4(), request, _buckets(with_failed=False), _passport(), "run_q_note")
+    assert read_remarks(path) == []
+    wb = load_workbook(path)
+    ws = wb["Вопросы органу"]
+    hdr = _find_header_row(ws, "Вопрос")
+    row = next(r for r in range(hdr + 1, ws.max_row + 1) if ws.cell(r, 1).value == "2")
+    assert ws.cell(row, _col(ws, hdr, "Пояснение")).value == note
+    assert ws.cell(row, _col(ws, hdr, "Пункт акта")).value == "2.7.1.2"
+    assert "стр. 1" in ws.cell(row, _col(ws, hdr, "Строки карты")).value
+    ws.cell(row, _col(ws, hdr, "Оценка (1–5)"), 4)
+    ws.cell(row, _col(ws, hdr, "Замечание"), "Уточнить охват вопроса")
+    wb.save(path)
+    remarks = read_remarks(path)
+    assert len(remarks) == 1
+    assert (remarks[0].sheet, remarks[0].key, remarks[0].score, remarks[0].text) == (
+        "Вопросы органу", "2", 4, "Уточнить охват вопроса",
+    )
+
+
+def test_overlap_warning_is_visible_only_on_affected_rows_without_changing_map(tmp_runs_dir):
+    """Готовое предупреждение видно с обеих сторон, поля и чужие строки не меняются."""
+    from app.contracts import PairDecision
+
+    hyp_map = _map()
+    third = hyp_map.rows[1].model_copy(update={"row_id": 3})
+    note = "Общие случаи учитывать один раз; разные эффекты автоматически не складывать."
+    hyp_map = hyp_map.model_copy(update={
+        "rows": hyp_map.rows + [third],
+        "decisions": [PairDecision(row_ids=[1, 2], merge=False,
+                                   reason="Разные последствия могут относиться к общим случаям",
+                                   overlap="Общая часть обращений", accounting_note=note)],
+    })
+    before = hyp_map.model_dump()
+    wb = load_workbook(build_excel(hyp_map, _request(), _buckets(with_failed=False),
+                                  _passport(), "run_overlap_note"))
+    rows = {r[0]: r for r in _sheet_rows(wb["Карта гипотез"]) if r and isinstance(r[0], int)}
+    assert note in rows[1][4] and "Пересечение со строками 2" in rows[1][4]
+    assert note in rows[2][4] and "Пересечение со строками 1" in rows[2][4]
+    assert note not in rows[3][4]
+    for row in hyp_map.rows:
+        assert row.hypothesis in rows[row.row_id][2]
+        assert row.effects[0].metric in rows[row.row_id][3]
+    assert hyp_map.model_dump() == before
+
+
+def _map_with_merge_and_partial_overlap() -> HypothesisMap:
+    from app.contracts import Merge, PairDecision
+
+    return HypothesisMap(
+        rows=_map().rows,
+        merges=[Merge(merged_row_ids=[1, 2], reason="Один механизм")],
+        decisions=[PairDecision(row_ids=[2, 3], merge=False, reason="Разные последствия",
+                                overlap="Часть общих обращений",
+                                accounting_note="Не складывать пересекающиеся случаи.")],
+    )
+
+
+def test_overlap_warning_uses_final_row_numbers_after_full_merge(tmp_runs_dir):
+    """Исходные1/2 слиты в итоговую1, исходная3 стала итоговой2."""
+    wb = load_workbook(build_excel(_map_with_merge_and_partial_overlap(), _request(),
+                                  _buckets(with_failed=False), _passport(), "run_overlap_merged"))
+    rows = {r[0]: r for r in _sheet_rows(wb["Карта гипотез"]) if r and isinstance(r[0], int)}
+    assert "Пересечение со строками 2" in rows[1][4]
+    assert "Пересечение со строками 1" in rows[2][4]
+    assert "Не складывать пересекающиеся случаи." in rows[1][4]
+    assert "Не складывать пересекающиеся случаи." in rows[2][4]
+    assert "Пересечение со строками 3" not in str(rows)
+
+
+def test_edited_map_keeps_original_warning_without_guessing_current_rows(tmp_runs_dir):
+    """Версия диалога сохраняет предупреждение, не выдавая исходные ID за текущие."""
+    wb = load_workbook(build_excel(_map_with_merge_and_partial_overlap(), _request(),
+                                  _buckets(with_failed=False), _passport(), "run_overlap_version", version=1))
+    rows = _sheet_rows(wb["Карта гипотез"])
+    assert "Исходные гипотезы 2, 3" in str(rows)
+    assert "Не складывать пересекающиеся случаи." in str(rows)
+    data_rows = [r for r in rows if r and isinstance(r[0], int)]
+    assert all("Пересечение со строками" not in str(r[4]) for r in data_rows)
 
 
 def test_map_data_cell_groups_question_and_not_tracked(tmp_runs_dir):

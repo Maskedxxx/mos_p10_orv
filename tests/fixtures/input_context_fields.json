@@ -1,0 +1,544 @@
+{
+  "1": {
+    "status": [
+      "status_basis",
+      "status",
+      "effective_date",
+      "effective_date_clause",
+      "deferred",
+      "repealed_clauses"
+    ],
+    "addressee": [
+      "categories",
+      "distinctions",
+      "scope"
+    ],
+    "nature": [
+      "actions",
+      "issued_under",
+      "input_kind"
+    ],
+    "documents": [
+      "justification",
+      "state",
+      "items",
+      "transfer_clauses"
+    ],
+    "procedure": [
+      "state",
+      "participants",
+      "clauses"
+    ]
+  },
+  "2": {
+    "status": [
+      "status_basis",
+      "status",
+      "effective_date",
+      "effective_date_clause",
+      "deferred",
+      "repealed_clauses"
+    ],
+    "addressee": [
+      "categories",
+      "distinctions",
+      "scope"
+    ],
+    "nature": [
+      "actions",
+      "issued_under",
+      "input_kind"
+    ],
+    "documents": [
+      "justification",
+      "state",
+      "items",
+      "transfer_clauses"
+    ],
+    "procedure": [
+      "state",
+      "participants",
+      "clauses"
+    ]
+  },
+  "3": {
+    "requisites": [
+      "kind",
+      "number",
+      "date",
+      "authority",
+      "title"
+    ],
+    "status": [
+      "status_basis",
+      "status",
+      "effective_date",
+      "effective_date_clause",
+      "deferred",
+      "repealed_clauses"
+    ],
+    "nature": [
+      "actions",
+      "issued_under",
+      "input_kind"
+    ],
+    "references": [
+      "justification",
+      "state",
+      "acts",
+      "authorities"
+    ]
+  },
+  "4": {
+    "requisites": [
+      "kind",
+      "number",
+      "date",
+      "authority",
+      "title"
+    ],
+    "status": [
+      "status_basis",
+      "status",
+      "effective_date",
+      "effective_date_clause",
+      "deferred",
+      "repealed_clauses"
+    ],
+    "nature": [
+      "actions",
+      "issued_under",
+      "input_kind"
+    ],
+    "requirements": [
+      "justification",
+      "state",
+      "groups"
+    ],
+    "references": [
+      "acts"
+    ]
+  },
+  "5": {
+    "status": [
+      "status_basis",
+      "status",
+      "effective_date",
+      "effective_date_clause",
+      "deferred",
+      "repealed_clauses"
+    ],
+    "nature": [
+      "actions",
+      "issued_under",
+      "input_kind"
+    ],
+    "addressee": [
+      "categories",
+      "distinctions",
+      "scope"
+    ],
+    "procedure": [
+      "justification",
+      "state",
+      "participants",
+      "result",
+      "has_document_check",
+      "refusal_grounds",
+      "clauses"
+    ],
+    "documents": [
+      "items"
+    ]
+  },
+  "6": {
+    "status": [
+      "status_basis",
+      "status",
+      "effective_date",
+      "effective_date_clause",
+      "deferred",
+      "repealed_clauses"
+    ],
+    "nature": [
+      "actions",
+      "issued_under",
+      "input_kind"
+    ],
+    "addressee": [
+      "categories",
+      "distinctions",
+      "scope"
+    ],
+    "requirements": [
+      "justification",
+      "state",
+      "groups"
+    ]
+  },
+  "7": {
+    "status": [
+      "status_basis",
+      "status",
+      "effective_date",
+      "effective_date_clause",
+      "deferred",
+      "repealed_clauses"
+    ],
+    "nature": [
+      "actions",
+      "issued_under",
+      "input_kind"
+    ],
+    "addressee": [
+      "categories",
+      "distinctions",
+      "scope"
+    ],
+    "procedure": [
+      "justification",
+      "state",
+      "participants",
+      "result",
+      "has_document_check",
+      "refusal_grounds",
+      "clauses"
+    ],
+    "control": [
+      "justification",
+      "state",
+      "authority",
+      "subject",
+      "measures",
+      "outcomes",
+      "clauses"
+    ],
+    "documents": [
+      "items"
+    ],
+    "deadlines": [
+      "items"
+    ]
+  },
+  "8": {
+    "status": [
+      "status_basis",
+      "status",
+      "effective_date",
+      "effective_date_clause",
+      "deferred",
+      "repealed_clauses"
+    ],
+    "nature": [
+      "actions",
+      "issued_under",
+      "input_kind"
+    ],
+    "addressee": [
+      "categories",
+      "distinctions",
+      "scope"
+    ],
+    "documents": [
+      "justification",
+      "state",
+      "items",
+      "transfer_clauses"
+    ],
+    "procedure": [
+      "state",
+      "participants",
+      "result",
+      "clauses"
+    ]
+  },
+  "9": {
+    "status": [
+      "status_basis",
+      "status",
+      "effective_date",
+      "effective_date_clause",
+      "deferred",
+      "repealed_clauses"
+    ],
+    "nature": [
+      "actions",
+      "issued_under",
+      "input_kind"
+    ],
+    "addressee": [
+      "categories",
+      "distinctions",
+      "scope"
+    ],
+    "requirements": [
+      "justification",
+      "state",
+      "groups"
+    ],
+    "procedure": [
+      "justification",
+      "state",
+      "participants",
+      "result",
+      "has_document_check",
+      "refusal_grounds",
+      "clauses"
+    ],
+    "documents": [
+      "justification",
+      "state",
+      "items",
+      "transfer_clauses"
+    ],
+    "deadlines": [
+      "justification",
+      "state",
+      "items"
+    ],
+    "allocation": [
+      "competitive",
+      "appointed"
+    ],
+    "control": [
+      "justification",
+      "state",
+      "authority",
+      "subject",
+      "measures",
+      "outcomes",
+      "clauses"
+    ]
+  },
+  "10": {
+    "requisites": [
+      "kind",
+      "number",
+      "date",
+      "authority",
+      "title",
+      "developers",
+      "developers_absence_reason"
+    ],
+    "status": [
+      "status_basis",
+      "status",
+      "effective_date",
+      "effective_date_clause",
+      "deferred",
+      "repealed_clauses"
+    ],
+    "addressee": [
+      "categories",
+      "distinctions",
+      "scope"
+    ],
+    "nature": [
+      "actions",
+      "issued_under",
+      "input_kind"
+    ],
+    "requirements": [
+      "justification",
+      "state",
+      "groups"
+    ],
+    "procedure": [
+      "justification",
+      "state",
+      "participants",
+      "result",
+      "has_document_check",
+      "refusal_grounds",
+      "clauses"
+    ],
+    "control": [
+      "justification",
+      "state",
+      "authority",
+      "subject",
+      "measures",
+      "outcomes",
+      "clauses"
+    ],
+    "allocation": [
+      "competitive",
+      "appointed"
+    ]
+  },
+  "11": {
+    "requisites": [
+      "kind",
+      "number",
+      "date",
+      "authority",
+      "title"
+    ],
+    "status": [
+      "status_basis",
+      "status",
+      "effective_date",
+      "effective_date_clause",
+      "deferred",
+      "repealed_clauses"
+    ],
+    "nature": [
+      "actions",
+      "issued_under",
+      "input_kind"
+    ],
+    "addressee": [
+      "categories",
+      "distinctions",
+      "scope"
+    ],
+    "procedure": [
+      "state",
+      "participants",
+      "result",
+      "clauses"
+    ],
+    "deadlines": [
+      "justification",
+      "state",
+      "items"
+    ],
+    "references": [
+      "acts"
+    ]
+  },
+  "12": {
+    "status": [
+      "status_basis",
+      "status",
+      "effective_date",
+      "effective_date_clause",
+      "deferred",
+      "repealed_clauses"
+    ],
+    "nature": [
+      "actions",
+      "issued_under",
+      "input_kind"
+    ],
+    "addressee": [
+      "categories",
+      "distinctions",
+      "scope"
+    ],
+    "requirements": [
+      "justification",
+      "state",
+      "groups"
+    ],
+    "procedure": [
+      "state",
+      "participants",
+      "result",
+      "clauses"
+    ],
+    "allocation": [
+      "competitive",
+      "appointed"
+    ]
+  },
+  "violated": {
+    "requisites": [
+      "developers"
+    ],
+    "status": [
+      "status_basis",
+      "status",
+      "effective_date",
+      "effective_date_clause",
+      "deferred",
+      "repealed_clauses"
+    ],
+    "addressee": [
+      "categories",
+      "distinctions",
+      "scope"
+    ],
+    "procedure": [
+      "state",
+      "participants",
+      "result",
+      "clauses"
+    ],
+    "documents": [
+      "items"
+    ],
+    "deadlines": [
+      "items"
+    ],
+    "allocation": [
+      "competitive",
+      "appointed"
+    ],
+    "control": [
+      "justification",
+      "state",
+      "authority",
+      "subject",
+      "measures",
+      "outcomes",
+      "clauses"
+    ]
+  },
+  "no_data": {
+    "requisites": [
+      "developers"
+    ],
+    "status": [
+      "status_basis",
+      "status",
+      "effective_date",
+      "effective_date_clause",
+      "deferred",
+      "repealed_clauses"
+    ],
+    "addressee": [
+      "categories",
+      "distinctions",
+      "scope"
+    ],
+    "procedure": [
+      "state",
+      "participants",
+      "result",
+      "clauses"
+    ],
+    "documents": [
+      "items"
+    ],
+    "deadlines": [
+      "items"
+    ],
+    "allocation": [
+      "competitive",
+      "appointed"
+    ],
+    "control": [
+      "justification",
+      "state",
+      "authority",
+      "subject",
+      "measures",
+      "outcomes",
+      "clauses"
+    ]
+  },
+  "request": {
+    "requisites": [
+      "developers"
+    ],
+    "status": [
+      "status_basis",
+      "status",
+      "effective_date",
+      "effective_date_clause",
+      "deferred",
+      "repealed_clauses"
+    ]
+  }
+}

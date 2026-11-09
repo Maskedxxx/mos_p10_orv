@@ -107,20 +107,13 @@ def test_nonexistent_for_rows_is_caught(run_id, tmp_prompt, monkeypatch):
     assert "№ 1" in log_text
 
 
-def test_open_source_only_row_is_warned(run_id, tmp_prompt, monkeypatch):
-    """Показатель ссылается только на строку без «запрос органу» -> предупреждение в лог."""
+def test_open_source_only_row_is_skipped(run_id, tmp_prompt, monkeypatch):
     hyp_map = _map([_row(1, source="открытый")])
-    req = DataRequest(
-        items=[RequestItem(num="1", kind="показатель по годам", metric="показатель 1", unit="ед.", for_rows=[1], sources=[SourceRef(row_id=1, metric="показатель 1")])],
-        years=[2024, 2025, 2026],
-    )
-    monkeypatch.setattr(request_module, "call", Mock(return_value=_ok_call_result(req)))
-
-    build_request(hyp_map, run_id)
-
-    log_text = (run_dir(run_id) / "run.log").read_text(encoding="utf-8")
-    assert "WARNING" in log_text
-    assert "притащила лишнее" in log_text
+    mock = Mock()
+    monkeypatch.setattr(request_module, "call", mock)
+    result = build_request(hyp_map, run_id)
+    assert not mock.called and result.items == []
+    assert "целевых данных для органа нет" in (run_dir(run_id) / "run.log").read_text(encoding="utf-8")
 
 
 def test_model_failure_gives_empty_request(run_id, tmp_prompt, monkeypatch):
@@ -298,7 +291,8 @@ def test_document_carries_act_passport_and_years(run_id, tmp_prompt, monkeypatch
                   effective_year=2025)
     doc = seen["doc"]
     assert "## ПОЛНЫЙ ТЕКСТ АКТА" in doc and "ТЕКСТ АКТА ЗДЕСЬ" in doc
-    assert "## ПАСПОРТ АКТА" in doc and "Департамент" in doc
+    assert "## ПАСПОРТ АКТА" in doc and '"developers": []' in doc
+    assert "Департамент" not in doc
     assert "## КАРТА ГИПОТЕЗ (JSON)" in doc
     assert "## ГОДЫ БЛАНКА (JSON)" in doc
     assert doc.index("## ПОЛНЫЙ ТЕКСТ АКТА") < doc.index("## ПАСПОРТ АКТА") < doc.index("## КАРТА ГИПОТЕЗ (JSON)") < doc.index("## ГОДЫ БЛАНКА (JSON)")
@@ -479,3 +473,36 @@ def test_no_act_type_no_mandatory_block(run_id, tmp_prompt, monkeypatch):
     monkeypatch.setattr(request_module, "call", mock_call)
     out = build_request(hyp_map, run_id, act_types=["нет подходящего типа"])
     assert "ОБЯЗАТЕЛЬНЫЕ ПОКАЗАТЕЛИ" not in mock_call.call_args.args[1] and len(out.items) == 1
+
+
+@pytest.mark.parametrize("append", [False, True])
+def test_append_instruction_only_when_existing_blank_present(run_id, tmp_prompt, monkeypatch, append):
+    from app.config import PROMPT_REQUEST_APPEND
+    existing = DataRequest(items=[], years=[2022]) if append else None
+    mock = Mock(return_value=_ok_call_result(DataRequest(items=[], years=[2025])))
+    monkeypatch.setattr(request_module, "call", mock)
+    build_request(_map([_row(1)]), run_id, existing=existing)
+    instruction = mock.call_args.args[0]
+    assert ("Режим дополнения:" in instruction) is append
+    assert mock.call_args.kwargs["validation_context"]["request_sources"] == [{"row_id": 1, "metric": "показатель 1"}]
+
+
+def test_open_only_rows_do_not_trigger_model_or_remove_map(run_id, monkeypatch):
+    original = _map([_row(5, source="открытый")])
+    before = original.model_dump(mode="json")
+    mock = Mock()
+    monkeypatch.setattr(request_module, "call", mock)
+    result = build_request(original, run_id)
+    assert result.items == [] and not mock.called
+    assert original.model_dump(mode="json") == before
+
+
+def test_open_only_map_with_mandatory_still_uses_act_for_breakdown(run_id, tmp_prompt, monkeypatch):
+    mock = Mock(return_value=_ok_call_result(DataRequest(items=[], years=[2025])))
+    monkeypatch.setattr(request_module, "call", mock)
+    result = build_request(_map([_row(1, source="открытый")]), run_id, document_md="Полный акт для разрезов",
+                           act_types=["предоставление госуслуги"])
+    assert mock.call_count == 1 and result.items
+    assert mock.call_args.kwargs["validation_context"]["request_sources"] == []
+    assert mock.call_args.kwargs["validation_context"]["request_mandatory"]
+    assert "Полный акт для разрезов" in mock.call_args.args[1]

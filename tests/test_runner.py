@@ -1219,3 +1219,86 @@ def test_validation_retry_via_resume_not_double_counted(tmp_runs_dir, valid_verd
     monkeypatch.setattr(subprocess, "run", Mock(side_effect=[_proc(bad), _proc(good)]))
     res = call("и", "док", Verdict, run_id="run_rc2", trace_name="a.raw.json", allowed_tools=[])
     assert res.ok and res.cost_usd == pytest.approx(0.15)
+
+
+@pytest.mark.parametrize("repair_succeeds", [True, False])
+def test_hypothesis_source_ids_use_bounded_existing_repair(tmp_runs_dir, monkeypatch, repair_succeeds):
+    from app.contracts import NoDataHypothesisSetOutput
+    from app import config
+    monkeypatch.setattr(config, "LLM_BACKEND", "claude")
+    def payload(ids):
+        return {"indicator": 10, "name": "Практика", "violation_kind": "издержки", "why_this_many": "Один вопрос",
+                "hypotheses": [{"hypothesis": "Неизвестен результат", "grounds": "Нет данных",
+                                "effects": [{"affected": "бизнес", "metric": "Число решений", "how_to_calculate": "Подсчитать",
+                                             "expected_trend": "Ответ закроет пробел", "how_to_calculate_brief": ["Подсчитать"],
+                                             "expected_trend_brief": ["Закрыть пробел"]}],
+                                "data": [{"metric": "Переформулированный показатель", "source": "запрос органу", "origin_request_ids": ids}],
+                                "questions": [], "hypothesis_brief": ["Вопрос"], "grounds_brief": ["Пробел"]}]}
+    bad = _stdout_with_events(_result_event(json.dumps(payload([]))))
+    good = _stdout_with_events(_result_event(json.dumps(payload(["source-1"]))))
+    mock = Mock(side_effect=[_proc(bad), _proc(good)] if repair_succeeds else [_proc(bad)] * 3)
+    monkeypatch.setattr(subprocess, "run", mock)
+    result = call("Задание", "Текст акта", NoDataHypothesisSetOutput,
+                  run_id="coverage", trace_name="05_hypotheses/10.raw.json", allowed_tools=[],
+                  validation_context={"act_text": "Текст акта", "required_request_ids": ["source-1"]})
+    assert result.ok is repair_succeeds
+    assert result.attempts == (2 if repair_succeeds else 3)
+    second = mock.call_args_list[1].args[0]
+    assert "--resume" in second
+    assert "source-1" in _extract_message(second)
+    if repair_succeeds:
+        assert result.value.hypotheses[0].data[0].origin_request_ids == ["source-1"]
+    else:
+        assert result.value is None and "source-1" in result.error
+    assert len(list((tmp_runs_dir / "coverage" / "05_hypotheses").glob("10.raw*.json"))) == result.attempts
+
+
+@pytest.mark.parametrize("repair_succeeds", [True, False])
+def test_merge_preservation_uses_bounded_repair(tmp_runs_dir, monkeypatch, repair_succeeds):
+    from copy import deepcopy
+    from app import config
+    from app.contracts import Hypothesis, MergeOutput
+    monkeypatch.setattr(config, "LLM_BACKEND", "claude")
+    h = Hypothesis(hypothesis="Исходная гипотеза", grounds="Исходное основание", hypothesis_brief=["Гипотеза"], grounds_brief=["Основание"],
+                   effects=[dict(affected="бизнес", metric="Число случаев", how_to_calculate="Подсчитать", expected_trend="Факт подтвердит механизм",
+                                 how_to_calculate_brief=["Подсчитать"], expected_trend_brief=["Критерий"])],
+                   data=[dict(metric="Показатель", source="запрос органу", origin_request_ids=["source-1"])])
+    source = h.model_dump(mode="json") | {"row_id": 1, "indicator": 7}
+    good = dict(rows=[h.model_dump(mode="json") | {"row_id": 1, "indicators": [7]}], merges=[], decisions=[])
+    bad = deepcopy(good)
+    bad["rows"][0]["hypothesis"] = "Подменённая гипотеза при том же количестве строк"
+    bad_reply = _stdout_with_events(_result_event(json.dumps(bad)))
+    good_reply = _stdout_with_events(_result_event(json.dumps(good)))
+    mock = Mock(side_effect=[_proc(bad_reply), _proc(good_reply)] if repair_succeeds else [_proc(bad_reply)] * 3)
+    monkeypatch.setattr(subprocess, "run", mock)
+    result = call("Собери карту", "Входные гипотезы", MergeOutput, run_id="merge_guard", trace_name="06_map.raw.json",
+                  allowed_tools=[], validation_context={"merge_inputs": [source]})
+    assert result.ok is repair_succeeds
+    assert result.attempts == (2 if repair_succeeds else 3)
+    assert "--resume" in mock.call_args_list[1].args[0]
+    assert "неслитая" in _extract_message(mock.call_args_list[1].args[0])
+    if repair_succeeds:
+        assert result.value.rows[0].hypothesis == h.hypothesis
+    else:
+        assert result.value is None
+    assert len(list((tmp_runs_dir / "merge_guard").glob("06_map.raw*.json"))) == result.attempts
+
+
+@pytest.mark.parametrize("repair_succeeds", [True, False])
+def test_request_source_links_use_existing_bounded_repair(tmp_runs_dir, monkeypatch, repair_succeeds):
+    from app import config
+    from app.contracts import RequestOutput
+    monkeypatch.setattr(config, "LLM_BACKEND", "claude")
+    def payload(metric):
+        return {"items": [{"num": "1", "kind": "показатель по годам", "metric": "Число случаев", "unit": "ед.",
+                           "for_rows": [3], "sources": [{"row_id": 3, "metric": metric}]}], "years": [2025]}
+    bad = _stdout_with_events(_result_event(json.dumps(payload("Искажённый исходный показатель"))))
+    good = _stdout_with_events(_result_event(json.dumps(payload("Исходный показатель"))))
+    mock = Mock(side_effect=[_proc(bad), _proc(good)] if repair_succeeds else [_proc(bad)] * 3)
+    monkeypatch.setattr(subprocess, "run", mock)
+    result = call("Составь запрос", "Вход", RequestOutput, run_id="request_guard", trace_name="07_request.raw.json", allowed_tools=[],
+                  validation_context={"request_sources": [{"row_id": 3, "metric": "Исходный показатель"}], "request_mandatory": []})
+    assert result.ok is repair_succeeds and result.attempts == (2 if repair_succeeds else 3)
+    assert "--resume" in mock.call_args_list[1].args[0]
+    assert "sources" in _extract_message(mock.call_args_list[1].args[0])
+    assert len(list((tmp_runs_dir / "request_guard").glob("07_request.raw*.json"))) == result.attempts

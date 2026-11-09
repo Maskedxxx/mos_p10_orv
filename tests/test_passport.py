@@ -159,6 +159,7 @@ def test_outside_only_scope_contradicts_organ_duties(valid_passport, block):
         ActPassportOutput(**bad)
     assert ActPassport(**bad).addressee.scope == "внешним лицам"
     bad["addressee"] = dict(valid_passport["addressee"], scope="и тем и другим")
+    bad["requisites"] = dict(bad["requisites"], developers_absence_reason="Из текста исполнитель не установлен; названные роли недостаточны.")
     assert ActPassportOutput(**bad).addressee.scope == "и тем и другим"
 
 

@@ -378,16 +378,16 @@ def test_hypotheses_defaults_unchanged(run_id, tmp_prompts, monkeypatch):
 
 
 def test_no_data_skips_text_family_indicators(run_id, tmp_prompts, monkeypatch):
-    """Б1 (ОС 2026-09-04). «Нет данных» у индикаторов 1-6 — незавершённая проверка
+    """Б1 (ОС 2026-09-04). «Нет данных» у индикаторов 1-6 и 11 — незавершённая проверка
     по тексту или правовой базе, а не пробел в практике: узел [4б] для них
-    не вызывается, гипотез нет. Индикаторы 7-12 обрабатываются как прежде."""
+    не вызывается, гипотез нет. Индикатор 10 обрабатывается как прежде."""
     mock_call = Mock(side_effect=_default_side_effect)
     monkeypatch.setattr(hyp_module, "call", mock_call)
 
     result = run_hypotheses_no_data(_buckets_no_data([3, 4, 10, 11]), "текст", run_id)
 
-    assert mock_call.call_count == 2
-    assert [s.indicator for s in result] == [10, 11]
+    assert mock_call.call_count == 1
+    assert [s.indicator for s in result] == [10]
 
 
 def test_passport_block_between_text_and_card(run_id, tmp_prompts, monkeypatch, valid_passport):
@@ -435,24 +435,23 @@ def test_first_hypothesis_call_starts_before_others(run_id, tmp_prompts, monkeyp
 # ---- 14.10: числа для органа из вердикта доходят до гипотез целиком ----
 
 
-def test_to_request_goes_to_card_and_missing_numbers_added_by_code(run_id, tmp_prompts, monkeypatch):
-    """Список to_request индикатора (03_verdicts/10.checks.json) — в карточку агенту отдельным блоком; число,
-    которое агент не положил в data, код дописывает в первую гипотезу; уже положенное не дублируется."""
+def test_to_request_goes_to_card_with_ids_without_python_additions(run_id, tmp_prompts, monkeypatch):
     import json
     to_request = [{"metric": "число заявок", "unit": "ед.", "clause": "п. 2"},
                   {"metric": "число несостоявшихся отборов", "unit": "ед.", "clause": "п. 2.19"}]
     path = run_dir(run_id) / "03_verdicts/10.checks.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"findings": [], "to_request": to_request}, ensure_ascii=False), encoding="utf-8")
+    path.write_text(json.dumps({"to_request": to_request}, ensure_ascii=False))
     mock = Mock(side_effect=_default_side_effect)
     monkeypatch.setattr(hyp_module, "call", mock)
     sets = run_hypotheses_no_data(_buckets_no_data([10]), "текст акта", run_id)
-    assert "## ЧИСЛА ДЛЯ ОРГАНА (JSON)" in mock.call_args.args[1] and "несостоявшихся" in mock.call_args.args[1]
-    metrics = [d.metric for d in sets[0].hypotheses[0].data]
-    assert metrics == ["число заявок", "число несостоявшихся отборов, ед. (п. 2.19)"]   # «число заявок» уже было
-    assert sets[0].hypotheses[0].data[-1].source == "запрос органу"
-    saved = load_json(run_id, "05_hypotheses/10.json", HypothesisSet)
-    assert [d.metric for d in saved.hypotheses[0].data] == metrics
+    assert "## ЧИСЛА ДЛЯ ОРГАНА (JSON)" in mock.call_args.args[1]
+    assert "request_id" in mock.call_args.args[1]
+    assert len(mock.call_args.kwargs["validation_context"]["required_request_ids"]) == 2
+    from app.contracts import NoDataHypothesisSetOutput
+    assert mock.call_args.args[2] is NoDataHypothesisSetOutput
+    # This mock bypasses runner validation; it proves the node never appends data itself.
+    assert [d.metric for d in sets[0].hypotheses[0].data] == ["число заявок"]
 
 
 def test_no_to_request_card_unchanged(run_id, tmp_prompts, monkeypatch):
@@ -494,17 +493,9 @@ def test_to_request_not_used_for_violated_verdict(run_id, tmp_prompts, monkeypat
     assert "число отозванных заявок" not in [d.metric for d in sets[0].hypotheses[0].data]
 
 
-def test_ensure_requests_recognizes_reworded_metric():
-    """Проба 152-ПП 14.10: агент вставил пункт в середину названия — это то же число, дубль не дописывается."""
-    from app.nodes.hypotheses import _ensure_requests
-    hset = _ok_call_result(10).value
-    first = hset.hypotheses[0].model_copy(update={"data": [DataItem(
-        metric="число поданных заявок на субсидию (приложение 1, п. 2.1), ед., по годам 2023-2025",
-        source="запрос органу")]})
-    hset = hset.model_copy(update={"hypotheses": [first]})
-    out, added = _ensure_requests(hset, [{"metric": "число поданных заявок на субсидию (приложение 1)",
-                                          "unit": "ед.", "clause": "п. 2.1"}])
-    assert added == [] and len(out.hypotheses[0].data) == 1
+def test_name_matching_and_automatic_append_are_removed():
+    assert not hasattr(hyp_module, "_ensure_requests")
+    assert not hasattr(hyp_module, "_metric_key")
 
 
 def test_questions_moved_to_data_as_before():
@@ -522,3 +513,26 @@ def test_questions_moved_to_data_as_before():
     hset = _questions_to_data(value)
     assert [(d.metric, d.source) for d in hset.hypotheses[0].data] == [
         ("число заявок", "запрос органу"), ("Какие основания продления чаще всего? (п. 2.7)", "вопрос органу")]
+
+
+@pytest.mark.parametrize("branch", ["violated", "no_data"])
+def test_both_branches_send_selected_passport(run_id, tmp_prompts, monkeypatch, valid_passport, branch):
+    import json
+    from app.contracts import ActPassport
+    seen = {}
+
+    def capture(instruction, document, schema, **kwargs):
+        seen["shared"] = kwargs["shared_context"]
+        seen["card"] = document
+        return _ok_call_result(10)
+
+    monkeypatch.setattr(hyp_module, "call", capture)
+    run = run_hypotheses_violated if branch == "violated" else run_hypotheses_no_data
+    buckets = _buckets_violated([10]) if branch == "violated" else _buckets_no_data([10])
+    run(buckets, "ПОЛНЫЙ АКТ", run_id, passport=ActPassport(**valid_passport))
+    assert seen["shared"].startswith("## ПОЛНЫЙ ТЕКСТ АКТА\n\nПОЛНЫЙ АКТ")
+    data = json.loads(seen["shared"].split("```json\n")[1].split("\n```")[0])
+    assert data["requisites"] == {"developers": []}
+    assert set(data["procedure"]) == {"state", "participants", "result", "clauses"}
+    assert "nature" not in data and "references" not in data
+    assert "## КАРТОЧКА ВЕРДИКТА (JSON)" in seen["card"]

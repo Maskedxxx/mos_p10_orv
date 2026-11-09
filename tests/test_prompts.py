@@ -85,10 +85,10 @@ def _read(path) -> str:
 
 
 def test_prompts_dir_has_exactly_the_expected_files():
-    """19 промптов: паспорт + 12 индикаторов + 04a, 04b, 05, 06, помощник 07, Гарант-помощник 08. Саммари больше нет."""
+    """20 промптов, включая отдельный режим дополнения: паспорт + 12 индикаторов + 04a, 04b, 05, 06, помощник 07, Гарант-помощник 08. Саммари больше нет."""
     names = sorted(p.name for p in PROMPTS_DIR.glob("*.md"))
     expected = sorted(
-        ["01_passport.md", "04a_hypotheses.md", "04b_hypotheses.md", "05_merge.md", "06_request.md", "07_dialog.md",
+        ["01_passport.md", "04a_hypotheses.md", "04b_hypotheses.md", "05_merge.md", "06_request.md", "06_request_append.md", "07_dialog.md",
          "08_garant_chat.md"]
         + [f"02_indicator_{n:02d}.md" for n in range(1, 13)]
     )
@@ -136,12 +136,8 @@ def _example_json(text: str, start_marker: str, end_marker: str) -> dict:
 
 
 @pytest.mark.parametrize("path, model_cls, start, end", [
-    (PROMPT_HYPOTHESES_VIOLATED, HypothesisSetOutput, '{\n  "indicator": 7', "\n\nПоле grounds"),
-    (PROMPT_HYPOTHESES_NO_DATA, HypothesisSetOutput, '{\n  "indicator": 10', "\n\nПоле where"),
-    (PROMPT_MERGE, MergeOutput, '{\n  "rows"', "\n\nПоле decisions"),
-    (PROMPT_REQUEST, DataRequest, '{\n  "items"', "\n\nПоле years"),
     (PROMPT_DIALOG, DialogTurn, '{\n  "reply"', "\n\nПоле plan"),
-], ids=["04a", "04b", "05", "06", "07"])
+], ids=["07"])
 def test_example_in_prompt_validates_against_contract(path, model_cls, start, end):
     """Образец ответа в промпте обязан проходить контракт узла — иначе он учит
     модель невалидному ответу, который runner отвергнет."""
@@ -150,9 +146,11 @@ def test_example_in_prompt_validates_against_contract(path, model_cls, start, en
 
 @pytest.mark.parametrize("name", ["04a_hypotheses.md", "04b_hypotheses.md", "05_merge.md"])
 def test_hypothesis_prompts_mention_expected_trend(name):
-    """Пул 3, п. 1б: ключ expected_trend контракта Effect назван в правилах и примерах промптов гипотез и слияния."""
-    text = _read(PROMPTS_DIR / name)
-    assert text.count("expected_trend") >= 2, name
+    """Правило передаётся в схеме, без обязательного повторения в промпте."""
+    from app.contracts import EffectOutput
+    rule = EffectOutput.model_fields["expected_trend"].description
+    assert "Критерий проверки" in rule and "сам по себе не доказывает" in rule
+    assert "Направление явно (рост или снижение)" not in _read(PROMPTS_DIR / name)
 
 
 def test_passport_prompt_does_not_mention_summary():
@@ -167,10 +165,13 @@ def test_no_prompt_mentions_summary_as_input():
 
 
 def test_request_prompt_knows_existing_blank_block():
-    """Промпт 06 описывает блок текущего бланка ровно под тем заголовком, что шлёт код (шаг 1.4)."""
     from app.nodes.request import EXISTING_BLANK_HEADER
-    text = (PROMPTS_DIR / "06_request.md").read_text(encoding="utf-8")
-    assert EXISTING_BLANK_HEADER.removeprefix("## ") in text
+    from app.config import PROMPT_REQUEST_APPEND
+    initial = PROMPT_REQUEST.read_text(encoding="utf-8")
+    append = PROMPT_REQUEST_APPEND.read_text(encoding="utf-8")
+    assert EXISTING_BLANK_HEADER not in initial
+    assert EXISTING_BLANK_HEADER in append
+    assert "breakdown" in append and "why_dropped" in append
 
 
 
@@ -195,18 +196,23 @@ def test_indicator_contracts_share_one_brief_rule():
     assert RUBRIC_INDICATORS == set(range(1, 13))
 
 
-def test_hypotheses_prompts_share_one_brief_block():
-    """Блок выжимки одинаков в 04a, 04b и 05 — гипотезы, основания, эффекты пишутся по одному правилу."""
-    blocks = {_brief_block(p) for p in (PROMPT_HYPOTHESES_VIOLATED, PROMPT_HYPOTHESES_NO_DATA, PROMPT_MERGE)}
-    assert len(blocks) == 1
-    block = blocks.pop()
-    for key in ("hypothesis_brief", "grounds_brief", "how_to_calculate_brief", "expected_trend_brief"):
-        assert key in block, key
+def test_hypotheses_have_branch_specific_briefs_and_no_few_shot():
+    from app.contracts import HypothesisOutput, NoDataHypothesisOutput, EffectOutput
+    for path in (PROMPT_HYPOTHESES_VIOLATED, PROMPT_HYPOTHESES_NO_DATA):
+        text = _read(path)
+        assert "<example>" not in text and '"hypotheses":' not in text
+        assert "оценка эксперта" not in text and "прошлая версия" not in text.lower()
+    assert HypothesisOutput.model_fields["hypothesis_brief"].description != NoDataHypothesisOutput.model_fields["hypothesis_brief"].description
+    assert "не пиши установленное нарушение" in NoDataHypothesisOutput.model_fields["hypothesis_brief"].description
+    assert "Динамика не обязательна" in EffectOutput.model_fields["expected_trend_brief"].description
 
 
 def test_merge_prompt_says_how_to_brief_merged_rows():
     text = PROMPT_MERGE.read_text(encoding="utf-8")
-    assert "для слитой — заново по итоговой формулировке" in text
+    assert "Для слитой строки составь общую формулировку и согласованные выжимки" in text
+    assert "<example>" not in text and '\"rows\":' not in text
+    assert "overlap" in text and "accounting_note" in text
+    assert "Кандидаты Python помогают проверке, но не ограничивают её" in text
 
 
 # ---- 2.7 (итерация 4): промпты индикаторов по разбору обратной связи В. Д. Чуракова ----
@@ -239,18 +245,18 @@ _ITER4_REMOVED = {
 }
 
 _ITER4_ADDED = {
-    1: ["организации, принимающей документы по поручению органа"],   # О — 13.10 в контракте
+    1: ["required_from_applicant", "coverage_gaps"],   # О — 13.10 в контракте
     2: ["электронно, но обязательна бумага"],   # Р — 13.10 в контракте
     3: ["Ссылка на акт без указания редакции"],
-    4: ["заявитель вправе представить сам"],   # У — 13.10 в контракте
+    4: ["Двойной сбор документов в эту проверку не включай"],   # У — 13.10 в контракте
     5: ["исправить в той же заявке"],   # 13.10 — рубрика в контракте
     6: ["247-ФЗ", "устанавливает сам", "дата вступления в силу"],   # 13.10 — рубрика в контракте
     7: ["явный повтор"],   # Ш — 13.10 в контракте: «повторно проходит то же согласование», «второй этап»
     8: ["повторяет другой"],   # Я — 13.10 в контракте: «отдельное согласие, когда оно уже дано в заявлении»
-    9: ["можно понять двумя способами"],   # АБ — 13.10 в контракте
-    10: ["доклад о виде государственного контроля (надзора) (ст. 30)"],
-    11: ["срок подачи заявки", "срок исполнения обязанности", "в рабочих днях, другие — в календарных"],   # АД, АЕ, АГ — 14.10 в контракте
-    12: ["Навязанный исполнитель"],   # АЗ — 14.10: требование к опыту — не нарушение (оценка), в контракте
+    9: ["существенная неопределённость", "Два прочтения не обязательны"],   # АБ — 13.10 в контракте
+    10: ["targets", "coverage", "только если акт"],
+    11: ["срок подачи заявки", "срок исполнения обязанности", "Различие единиц само по себе не доказывает"],   # АД, АЕ, АГ — 14.10 в контракте
+    12: ["за свой счёт", "у указанного актом исполнителя"],   # АЗ — 14.10: требование к опыту — не нарушение (оценка), в контракте
 }
 
 
@@ -281,28 +287,27 @@ def test_region_labels_only_in_comparison_prompts(path):
     assert "{{" not in fill_prompt_labels(text, limit=5)   # потолок подставляется всегда (узел вердиктов)
 
 
-def test_iter4_hypotheses_prompts():
-    """Г, Ж1, Ж2, АИ в промптах гипотез: жалобы — у органа, вопрос органу с условиями, процент по исключению."""
-    for path in (PROMPT_HYPOTHESES_VIOLATED, PROMPT_HYPOTHESES_NO_DATA):
-        text = " ".join(path.read_text(encoding="utf-8").split())   # без учёта переносов строк
-        assert "число жалоб и судебных споров по применению акта" in text
-        assert "орган их не ведёт" not in text
-        assert "Вопрос органу словами — не в data, а в отдельный список questions" in text   # 14.10, ошибка 4
-        assert "Исключение: показатель, который орган сам ведёт как официальный" in text
-    v = " ".join(PROMPT_HYPOTHESES_VIOLATED.read_text(encoding="utf-8").split())
-    assert "прошивка (если акт её требует)" in v and "время на дорогу и курьера" not in v
-    assert "сослаться на его результат" not in v
+def test_hypotheses_data_rules_preserved_in_schema():
+    from app.contracts import NumberItemOutput, OrganQuestion, EffectOutput
+    rule = NumberItemOutput.model_fields["source"].description
+    assert "число жалоб и судебных споров по применению акта" in rule
+    assert "официальное значение" in rule and "доли или коэффициента" in rule
+    assert "source" in NumberItemOutput.model_fields
+    assert "числовое измерение" in OrganQuestion.model_fields["question"].description
+    how = EffectOutput.model_fields["how_to_calculate"].description
+    assert "прошивка (только если акт её требует)" in how
+    assert "не добавляй обязательную поездку без основания" in how
 
 
 def test_iter4_request_prompt():
-    """АИ, АК, АЛ, Ж2 в промпте запроса; без упоминания того, что делает код с отбором."""
-    text = " ".join(PROMPT_REQUEST.read_text(encoding="utf-8").split())
-    assert "Доля не запрашивается никогда" not in text and "Процентов и долей в перечне нет" not in text
-    assert "«%» — только по исключению выше" in text
-    assert "«Объявленные» и «проведённые» (торги, отборы, конкурсы) по умолчанию — разные показатели" in text
-    assert "Если у строки несколько пунктов, выбери тот, о котором именно этот показатель" in text
-    assert "«открытый вопрос»" in text and "«вопрос органу»" in text
-    assert "код увидит это и запишет" not in text
+    from app.contracts import RequestItem
+    text = PROMPT_REQUEST.read_text(encoding="utf-8")
+    assert "<example>" not in text and '\"items\":' not in text
+    assert "отдельные позиции с подстроками" in text
+    assert "Похожие, но разные показатели" in text
+    assert "официально учитываемая доля/коэффициент" in RequestItem.model_fields["metric"].description
+    assert "Одна числовая ячейка — одна величина" in RequestItem.model_fields["metric"].description
+    assert "более узкое измерение не удаляй" in RequestItem.model_fields["note"].description
 
 
 def test_iter4_dialog_prompt():
@@ -333,10 +338,10 @@ def test_dialog_prompt_assistant_tools():
 
 
 def test_iter4_request_prompt_mandatory_block():
-    """АМ: агент запроса знает блок обязательных показателей; средние формы — как есть."""
-    text = " ".join(PROMPT_REQUEST.read_text(encoding="utf-8").split())
-    assert "<обязательные_показатели>" in text and "## ОБЯЗАТЕЛЬНЫЕ ПОКАЗАТЕЛИ (JSON)" in text
-    assert "Не переделывай их в счётчики" in text
+    text = PROMPT_REQUEST.read_text(encoding="utf-8")
+    assert "## ОБЯЗАТЕЛЬНЫЕ ПОКАЗАТЕЛИ (JSON)" in text
+    assert "Среднее из обязательного блока не заменяй счётчиком" in text
+    assert "со всеми кодами" in text
     from app.nodes.request import MANDATORY_HEADER
     assert MANDATORY_HEADER == "## ОБЯЗАТЕЛЬНЫЕ ПОКАЗАТЕЛИ (JSON)"
 
@@ -365,7 +370,8 @@ def test_iter4_garant_in_indicator_prompts():
         for t in tools:
             assert t in block, (n, t)
         named = set(re.findall(r"garant_[a-z_]+", text))
-        assert named <= set(tools), (n, named - set(tools))   # агент не зовёт то, чего у него нет
+        allowed_names = {t.split("__")[-1] for t in tools}
+        assert named <= allowed_names, (n, named - allowed_names)   # агент не зовёт то, чего у него нет
         assert "{{" not in fill_prompt_labels(text, limit=7)
     for n in (3, 4, 10, 11):
         assert "{{ПОТОЛОК_ЗАХОДОВ}} ЗАХОДОВ ПОИСКА В ИНТЕРНЕТЕ" in prompt_path(n).read_text(encoding="utf-8"), n

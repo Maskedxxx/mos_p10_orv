@@ -7,8 +7,9 @@
 работает только с уже готовой картой, в интернет ходить незачем.
 
 В stdin уходит карта гипотез (список строк карты) в читаемом JSON, отдельным
-помеченным блоком (_build_document). Текст акта тут не нужен — карта уже
-содержит всё необходимое (гипотеза, эффект, показатели с пометкой источника),
+помеченным блоком (_build_document). Карта передаётся как выбранные поля
+строк с показателями и вопросами органу. Полный текст акта сохраняется
+для раскрытия разрезов; справка паспорта содержит исполнителей и статус,
 см. prompts/06_request.md.
 
 Провал вызова НЕ выдумывает запрос — возвращается DataRequest с пустым
@@ -40,8 +41,9 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict
+from app.input_contexts import request_input
 
-from app.config import ALLOWED_TOOLS_TEXT, PROMPT_REQUEST, REQUEST_YEARS_DEPTH
+from app.config import ALLOWED_TOOLS_TEXT, PROMPT_REQUEST, PROMPT_REQUEST_APPEND, REQUEST_YEARS_DEPTH
 from app.contracts import ActPassport, DataRequest, HypothesisMap, RequestItem, RequestOutput
 from app.mandatory_indicators import MandatoryMetric, mandatory_for
 from app.formatting import format_cost
@@ -91,31 +93,22 @@ def _build_document(
     Блоки акта и паспорта опускаются, если не переданы (совместимость с вызовом
     из пайплайна до внедрения паспорта). Merges карты не нужны.
     """
-    rows_json = json.dumps(
-        [row.model_dump(mode="json") for row in hypothesis_map.rows],
-        ensure_ascii=False, indent=2,
-    )
+    packet = request_input(hypothesis_map, years, document_md, passport, existing, mandatory).model_dump(mode="json")
+    rows_json = json.dumps(packet["rows"], ensure_ascii=False, indent=2)
     parts: list[str] = []
-    if document_md is not None:
-        parts.append("## ПОЛНЫЙ ТЕКСТ АКТА\n\n" f"{document_md}\n")
-    if passport is not None:
-        parts.append(
-            "## ПАСПОРТ АКТА\n\n"
-            f"```json\n{json.dumps(passport.model_dump(mode='json'), ensure_ascii=False, indent=2)}\n```\n"
-        )
-    if existing is not None:
-        # Режим дополнения: модель видит уже составленный бланк, чтобы не повторять
-        # его позиции; в карте при этом только новые строки
-        blank = [
-            {"num": it.num, "kind": it.kind, "metric": it.metric, "unit": it.unit, "clause": it.clause}
-            for it in existing.items
-        ]
-        parts.append(f"{EXISTING_BLANK_HEADER}\n\n```json\n{json.dumps(blank, ensure_ascii=False, indent=2)}\n```\n")
+    if packet["act_text"] is not None:
+        parts.append("## ПОЛНЫЙ ТЕКСТ АКТА\n\n" + packet["act_text"] + "\n")
+    if packet["passport"] is not None:
+        parts.append("## ПАСПОРТ АКТА\n\n```json\n" +
+                     json.dumps(packet["passport"], ensure_ascii=False, indent=2) + "\n```\n")
+    if packet["existing_items"] is not None:
+        parts.append(f"{EXISTING_BLANK_HEADER}\n\n```json\n" +
+                     json.dumps(packet["existing_items"], ensure_ascii=False, indent=2) + "\n```\n")
     parts.append("## КАРТА ГИПОТЕЗ (JSON)\n\n" f"```json\n{rows_json}\n```\n")
-    if mandatory:
-        # 2.7 (АМ): обязательные показатели выбранных типов акта — дословно из формы Владимира
-        parts.append(f"{MANDATORY_HEADER}\n\n```json\n{json.dumps([asdict(m) for m in mandatory], ensure_ascii=False, indent=2)}\n```\n")
-    parts.append("## ГОДЫ БЛАНКА (JSON)\n\n" f"```json\n{json.dumps(years)}\n```\n")
+    if packet["mandatory"]:
+        parts.append(f"{MANDATORY_HEADER}\n\n```json\n" +
+                     json.dumps(packet["mandatory"], ensure_ascii=False, indent=2) + "\n```\n")
+    parts.append("## ГОДЫ БЛАНКА (JSON)\n\n" f"```json\n{json.dumps(packet['years'])}\n```\n")
     return "\n".join(parts)
 
 
@@ -133,15 +126,28 @@ def _mandatory_item(entry: MandatoryMetric) -> RequestItem:
 def _ensure_mandatory(request: DataRequest, mandatory: list[MandatoryMetric], logger) -> DataRequest:
     """
     Каждый обязательный код — хотя бы в одной позиции. Пропущенный моделью показатель
-    код дописывает дословно (решение владельца Р4, 12.10: «всегда добавляются» иначе
-    не гарантировать) и пишет предупреждение.
+    код дописывает дословно по действующему правилу обязательного блока. Если
+    та же запись формы уже покрыта одним из своих кодов, дополняются только
+    недостающие коды в той позиции, без нового измерения. Пишется предупреждение.
     """
-    covered = {c for it in request.items for c in it.mandatory}
-    added = [_mandatory_item(e) for e in mandatory if not set(e.codes) & covered]
-    for it in added:
-        logger.warning("request: обязательный показатель %s не вошёл в ответ модели — дописан кодом дословно",
-                       ", ".join(it.mandatory))
-    return request.model_copy(update={"items": request.items + added}) if added else request
+    items = list(request.items)
+    changed = False
+    for entry in mandatory:
+        covered = {code for item in items for code in item.mandatory}
+        missing = set(entry.codes) - covered
+        if not missing:
+            continue
+        matching = next((i for i, item in enumerate(items) if set(entry.codes) & set(item.mandatory)), None)
+        if matching is not None:
+            item = items[matching]
+            codes = list(dict.fromkeys([*item.mandatory, *entry.codes]))
+            items[matching] = item.model_copy(update={"mandatory": codes})
+            logger.warning("request: дополнены коды того же обязательного показателя %s без новой позиции", sorted(missing))
+        else:
+            items.append(_mandatory_item(entry))
+            logger.warning("request: обязательный показатель %s не вошёл в ответ модели — дописан кодом дословно", ", ".join(entry.codes))
+        changed = True
+    return request.model_copy(update={"items": items}) if changed else request
 
 
 def _order_and_number(request: DataRequest) -> DataRequest:
@@ -162,7 +168,7 @@ def _norm(text: str) -> str:
 def _check_coverage(hyp_map: HypothesisMap, request: DataRequest, logger) -> None:
     """
     Проверка 4 (Г4): каждый показатель карты с источником «запрос органу» вошёл
-    ровно в одну позицию бланка либо назван в why_dropped.
+    в позиции бланка либо назван в why_dropped; составной показатель может быть разделён.
 
     Аналог _check_no_loss узла [5]. Показатель в нескольких позициях — WARNING,
     не ERROR: разделение «сумма и количество» на две позиции законно (Г1).
@@ -278,8 +284,9 @@ def build_request(
     кандидат без записи 07_request.json.
 
     Провал вызова возвращает пустой DataRequest с годами по умолчанию (см.
-    docstring модуля), успешный ответ проходит две проверки-предупреждения,
-    ни одна из них не роняет узел. Артефакты: сырой ответ сохраняет runner.call
+    docstring модуля). Свежий ответ проверяет ссылки sources и mandatory через
+    контекст RequestOutput; нарушение исправляется существующим runner.
+    Диагностика смыслового покрытия и возможного разделения остаётся в журнале. Артефакты: сырой ответ сохраняет runner.call
     под именем 07_request.raw.json, готовый запрос — здесь под именем
     07_request.json. Стоимость прибавляется к уже записанной в meta.json.
 
@@ -292,24 +299,27 @@ def build_request(
     years = existing.years if existing is not None else _request_years(effective_year)
     mandatory = mandatory_for(act_types or []) if existing is None else []
 
+    has_targets = bool(_rows_with_internal_data(hypothesis_map))
     if not hypothesis_map.rows and mandatory:
         # Карта пуста, но тип акта выбран — бланк из одних обязательных показателей, модель не нужна
-        logger.info("request: строк карты нет — бланк из %d обязательных показателей", len(mandatory))
+        logger.info("request: целевых данных карты для органа нет — бланк из %d обязательных показателей", len(mandatory))
         value = _order_and_number(_ensure_mandatory(DataRequest(items=[], years=years), mandatory, logger))
         if save:
             save_json(run_id, REQUEST_FILE, value)
         return value
 
-    if not hypothesis_map.rows:
+    if not has_targets and not mandatory:
         # Карта пуста (все индикаторы соблюдены/не применимы) либо новых строк нет —
         # запрашивать нечего, вызывать модель незачем, это честный результат.
-        logger.info("request: строк карты нет, вызов модели пропущен")
+        logger.info("request: целевых данных для органа нет, вызов модели пропущен")
         value = existing if existing is not None else DataRequest(items=[], years=years)
         if save:
             save_json(run_id, REQUEST_FILE, value)
         return value
 
     instruction = PROMPT_REQUEST.read_text(encoding="utf-8")
+    if existing is not None:
+        instruction += "\n\n" + PROMPT_REQUEST_APPEND.read_text(encoding="utf-8")
     document = _build_document(hypothesis_map, years, document_md, passport, existing, mandatory)
 
     result = call(
@@ -321,6 +331,11 @@ def build_request(
         allowed_tools=ALLOWED_TOOLS_TEXT,
         timeout_s=timeout_s,
         max_budget_usd=max_budget_usd,
+        validation_context={
+            "request_sources": [{"row_id": row.row_id, "metric": data.metric}
+                                for row in hypothesis_map.rows for data in row.data if data.source in _TO_AUTHORITY],
+            "request_mandatory": [asdict(entry) for entry in mandatory],
+        },
     )
 
     if not result.ok or result.value is None:

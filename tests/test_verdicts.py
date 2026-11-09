@@ -502,7 +502,8 @@ def test_indicator01_uses_own_contract_and_saves_checked_documents(run_id, tmp_p
     out = Indicator01Output(
         indicator=1, name=get_indicator(1).name, rationale="разбор", verdict="нарушен", rationale_brief=["пункт"],
         checked_documents=[{"name": "выписка из реестра", "clause": "п. 2", "held_by_state": True,
-                            "held_by": "налоговый орган", "requested_by_body": False}],
+                            "held_by": "налоговый орган", "requested_by_body": False,
+                            "required_from_applicant": True, "availability_basis": "Сведения уже в реестре"}],
     )
     mock = Mock(return_value=CallResult(value=out, ok=True, attempts=1, cost_usd=0.01, session_id="s",
                                         error=None, permission_denials=[], duration_s=0.1))
@@ -634,3 +635,26 @@ def test_indicator_3_gets_longer_timeout(run_id, tmp_prompts_dir, monkeypatch):
     run_verdicts("текст", run_id, indicators=[3, 4], timeout_s=900)
     by_n = {_n_from_trace_name(c.kwargs["trace_name"]): c.kwargs["timeout_s"] for c in mock_call.call_args_list}
     assert by_n[3] == INDICATOR_TIMEOUT_S[3] > 900 and by_n[4] == 900
+
+
+def test_each_indicator_receives_its_own_passport_view(run_id, monkeypatch, valid_passport):
+    import json
+    from app.contracts import ActPassport
+    from app.input_contexts import INDICATOR_CONTEXTS, passport_context
+    passport = ActPassport(**valid_passport)
+    seen = {}
+
+    def capture(instruction, document, schema, **kwargs):
+        n = int(kwargs["trace_name"].split("/")[-1].split(".")[0])
+        shared = kwargs["shared_context"]
+        assert shared.startswith("## ПОЛНЫЙ ТЕКСТ АКТА\n\nПОЛНЫЙ АКТ")
+        seen[n] = json.loads(shared.split("```json\n")[1].split("\n```")[0])
+        return _ok_call_result(n)
+
+    monkeypatch.setattr(verdicts_module, "call", capture)
+    run_verdicts("ПОЛНЫЙ АКТ", run_id, passport=passport)
+    assert set(seen) == set(range(1, 13))
+    for n in seen:
+        assert seen[n] == passport_context(passport, INDICATOR_CONTEXTS[n]).model_dump(mode="json")
+    assert "references" not in seen[1] and "references" in seen[3]
+    assert "requisites" not in seen[1] and "developers" in seen[10]["requisites"]

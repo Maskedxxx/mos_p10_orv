@@ -87,7 +87,7 @@ EXCEL_MAP: list[ExcelColumn] = [
     ExcelColumn("Запрос показателей", "Откуда запрос", REQUEST_FILE, ("items[].for_rows", "items[].mandatory")),
     ExcelColumn("Запрос показателей", "Пункт акта", REQUEST_FILE, ("items[].clause",)),
     ExcelColumn("Запрос показателей", "годы", REQUEST_FILE, ("years",), "колонки лет; клетки заполняет орган"),
-    ExcelColumn("Вопросы органу", "№ / Вопрос / Пункт / Строки карты", REQUEST_FILE,
+    ExcelColumn("Вопросы органу", "№ / Вопрос / Пояснение / Пункт / Строки карты", REQUEST_FILE,
                 ("items[].num", "items[].metric", "items[].clause", "items[].for_rows"),
                 "позиции с items[].kind = «открытый вопрос»"),
     ExcelColumn("Вердикты", "Индикатор / Вердикт", f"{VERDICTS_DIR}/NN.json", ("indicator", "name", "verdict")),

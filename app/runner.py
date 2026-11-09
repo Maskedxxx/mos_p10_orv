@@ -86,6 +86,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import subprocess
 import threading
 
@@ -109,7 +110,7 @@ from app.config import (
 )
 from app.json_fix import repair_json
 from app.logger import get_run_logger
-from app.trace import log_event, run_dir, save_bytes, save_raw, record_codex_usage
+from app.trace import VERDICTS_DIR, log_event, run_dir, save_bytes, save_raw, record_codex_usage
 
 # Тип модели ответа для call() — только pydantic-модели (--json-schema требует схему)
 ModelT = TypeVar("ModelT", bound=BaseModel)
@@ -743,14 +744,18 @@ class _CodexInvocation:
         if mcp_tools:
             servers = json.loads(Path(mcp_config or GARANT_MCP_CONFIG).read_text(encoding="utf-8"))["mcpServers"]
             groups: dict[str, list[str]] = {}
+            allowed_methods = {
+                "garant": GARANT_ALL_TOOLS,
+                "p10run": ("list_artifacts", "read_artifact"),
+                "garantweb": ("garant_web",),
+            }
             for tool in mcp_tools:
                 name = _mcp_tool_name(tool)
                 parts = name.split("__", 2)
                 if len(parts) != 3 or parts[0] != "mcp":
                     raise ValueError("Codex: неверное имя инструмента MCP")
                 server, method = parts[1:]
-                permitted = GARANT_ALL_TOOLS if server == "garant" else ("list_artifacts", "read_artifact") if server == "p10run" else ()
-                if method not in permitted:
+                if method not in allowed_methods.get(server, ()):
                     raise ValueError("Codex: неизвестный инструмент MCP")
                 groups.setdefault(server, [])
                 if method not in groups[server]:
@@ -762,11 +767,37 @@ class _CodexInvocation:
                     raise ValueError("Codex: сервер MCP отсутствует в конфигурации")
                 prefix = f"mcp_servers.{server}."
                 if server == "garant":
-                    if source.get("url") != "https://mcp.garant.ru/mcp" or source.get("headers", {}) not in ({}, {"Authorization": "Bearer ${GARANT_TOKEN}"}):
-                        raise ValueError("Codex: Гарант требует штатный адрес и токен только из окружения")
-                    self.mcp_options[prefix + "url"] = source["url"]
-                    self.mcp_options[prefix + "bearer_token_env_var"] = "GARANT_TOKEN"
+                    if source.get("command"):
+                        from app.mcp_garant import ALLOWED
+                        cache = (source.get("env") or {}).get("P10_GARANT_CACHE_DIR", "")
+                        root = (run_dir(run_id) / "_garant").resolve()
+                        if (Path(source["command"]).resolve() != Path(sys.executable).resolve()
+                                or source.get("args") != [str(config.PROJECT_ROOT / "app/mcp_garant.py"),
+                                                         str(run_dir(run_id).resolve() / VERDICTS_DIR / "03.garant")]
+                                or not cache or root not in Path(cache).resolve().parents
+                                or source.get("env") != {"P10_GARANT_CACHE_DIR": cache}
+                                or not set(methods).issubset(ALLOWED)):
+                            raise ValueError("Codex: неверная изолированная обёртка Гаранта")
+                        self.mcp_options[prefix + "command"] = source["command"]
+                        self.mcp_options[prefix + "args"] = source["args"]
+                        self.mcp_options[prefix + "env.P10_GARANT_CACHE_DIR"] = cache
+                        self.mcp_options[prefix + "env_vars"] = ["GARANT_TOKEN"]
+                    else:
+                        if source.get("url") != "https://mcp.garant.ru/mcp" or source.get("headers", {}) not in ({}, {"Authorization": "Bearer ${GARANT_TOKEN}"}):
+                            raise ValueError("Codex: Гарант требует штатный адрес и токен только из окружения")
+                        self.mcp_options[prefix + "url"] = source["url"]
+                        self.mcp_options[prefix + "bearer_token_env_var"] = "GARANT_TOKEN"
                     self.env.update(_mcp_env())
+                elif server == "garantweb":
+                    expected = {"type": "stdio", "command": sys.executable,
+                                "args": [str(config.PROJECT_ROOT / "app/mcp_garant_web.py")],
+                                "env": {"GARANT_TOKEN": ""}}
+                    if source != expected:
+                        raise ValueError("Codex: неверная конфигурация веб-чтения Гаранта")
+                    self.mcp_options[prefix + "command"] = source["command"]
+                    self.mcp_options[prefix + "args"] = source["args"]
+                    self.mcp_options[prefix + "env.GARANT_TOKEN"] = ""
+                    self.mcp_options[prefix + "tool_timeout_sec"] = 250  # сам инструмент ждёт не больше 240 с
                 else:
                     expected = str(run_dir(run_id).resolve())
                     if (Path(source.get("command", "")).resolve() != Path(sys.executable).resolve()
@@ -856,7 +887,13 @@ class _CodexInvocation:
             thread, usage = None, None
             return outcome("session_mismatch", "CLI продолжил другую сессию")
         for event in events:
-            if event.get("type") in ("error", "turn.failed"):
+            if event.get("type") == "error":
+                message = event.get("message")
+                if completed is not None and isinstance(message, str) and re.match(r"^Reconnecting\.\.\.\s+\d+/\d+\b", message):
+                    log_event(self.run_id, "cli_notice", backend="codex", trace=self.trace_name, message=message)
+                    continue
+                return outcome("api_error", json.dumps(event, ensure_ascii=False)[:2000])
+            if event.get("type") == "turn.failed":
                 return outcome("api_error", json.dumps(event, ensure_ascii=False)[:2000])
             if str(event.get("type", "")).startswith("item."):
                 item = event.get("item") or {}
@@ -864,11 +901,16 @@ class _CodexInvocation:
                     return outcome("api_error", "повреждено событие item")
                 kind = item.get("type")
                 if kind == "error":
-                    if str(item.get("message", "")).startswith("Under-development features enabled:"):
-                        log_event(self.run_id, "cli_notice", backend="codex", trace=self.trace_name,
-                                  message=item.get("message"))
+                    message = str(item.get("message", ""))
+                    notice = message.startswith("Under-development features enabled:") or (
+                        completed is not None and (
+                            message.startswith(f"Model metadata for `{self.model}` not found. Defaulting to fallback metadata;")
+                            or message.startswith("Falling back from WebSockets to HTTPS transport.")
+                        ))
+                    if notice:
+                        log_event(self.run_id, "cli_notice", backend="codex", trace=self.trace_name, message=message)
                     else:
-                        return outcome("api_error", str(item.get("message", ""))[:2000])
+                        return outcome("api_error", message[:2000])
                 elif kind == "mcp_tool_call":
                     # CLI может сначала запросить перечень ресурсов у своих настроенных MCP.
                     # Это чтение каталога; произвольные методы и серверы по-прежнему запрещены.

@@ -105,7 +105,7 @@ def apply_user_developers(passport: ActPassport, names: list[str]) -> ActPasspor
     if not names:
         return passport
     developers = [Developer(name=n, scope="весь акт", basis="указан пользователем при загрузке") for n in names]
-    requisites = passport.requisites.model_copy(update={"developers": developers})
+    requisites = passport.requisites.model_copy(update={"developers": developers, "developers_absence_reason": None})
     return passport.model_copy(update={"requisites": requisites})
 
 

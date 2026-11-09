@@ -158,7 +158,7 @@ CLI_SETTINGS_FILE = Path.home() / ".claude" / "settings.json"
 # сопоставимый акт), а не пробел в практике применения. Узел [4б] для них
 # не вызывается: проверку закрывает аналитик по правовой базе, у органа спрашивать
 # нечего; в карту гипотез идёт строка «проверка не завершена» (ОС экспертов, Б1).
-NO_DATA_TEXT_FAMILY: frozenset[int] = frozenset({1, 2, 3, 4, 5, 6})
+NO_DATA_TEXT_FAMILY: frozenset[int] = frozenset({1, 2, 3, 4, 5, 6, 11})
 
 # 12 индикаторов эффективного регулирования — методика АНО «Мосстратегия»
 _INDICATORS: list[Indicator] = [
@@ -207,11 +207,12 @@ def web_indicators() -> list[Indicator]:
 # «нет данных» с реквизитами этого акта (Владимир: «рекомендации по смежным актам»).
 # 6 — Гарант не нужен. 10 — доклады органа и суды; 11 — федеральная норма о сроке.
 _G_FIND = ("garant_search", "garant_document_redactions")
+_G_WEB = "mcp__garantweb__garant_web"
 INDICATOR_GARANT_TOOLS: dict[int, tuple[str, ...]] = {
-    3: ("garant_find_hyperlinks", *_G_FIND),
-    4: (*_G_FIND, "garant_snippets", "garant_export_block_html"),
-    10: ("garant_search", "garant_sutyazhnik"),
-    11: _G_FIND,
+    3: ("garant_find_hyperlinks", *_G_FIND, "garant_snippets", _G_WEB),
+    4: (*_G_FIND, "garant_snippets", "garant_export_block_html", _G_WEB),
+    10: ("garant_search", "garant_sutyazhnik", _G_WEB),
+    11: (*_G_FIND, _G_WEB),
 }
 # Таймаут вызова агента индикатора, с, сверх общего (2.7): индикатор 3 проверяет статус
 # КАЖДОЙ ссылки акта отдельным вызовом правовой базы — у 152-ПП их десятки; живая проверка
@@ -262,6 +263,7 @@ PROMPT_MERGE = PROMPTS_DIR / "05_merge.md"
 # Промпт узла [6] (app/nodes/request.py) — сборка бланка запроса показателей
 # органу-разработчику по уже готовой карте гипотез.
 PROMPT_REQUEST = PROMPTS_DIR / "06_request.md"
+PROMPT_REQUEST_APPEND = PROMPTS_DIR / "06_request_append.md"
 
 # Оркестратор диалога с результатом прогона (план итерации 3, шаг 4): промпт и модель
 # (модель отдельной настройкой — сравнение на типовых запросах решает владелец)

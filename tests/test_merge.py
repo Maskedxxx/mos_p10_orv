@@ -130,8 +130,8 @@ def test_hypotheses_numbered_before_sending(run_id, tmp_prompt, monkeypatch):
     merge_map(hsets, "текст акта", run_id)
 
     doc = seen_document["doc"]
-    assert "## ПОЛНЫЙ ТЕКСТ АКТА" in doc
-    assert "текст акта" in doc
+    assert "## ПОЛНЫЙ ТЕКСТ АКТА" not in doc
+    assert "текст акта" not in doc
     assert "## ПРОНУМЕРОВАННЫЕ ГИПОТЕЗЫ (JSON)" in doc
     assert '"row_id": 1' in doc
     assert '"row_id": 2' in doc
@@ -347,3 +347,15 @@ def test_fallback_map_keeps_expert_briefs(valid_hypothesis):
     row = fallback_map([(1, 7, hyp)]).rows[0]
     assert row.hypothesis_brief == briefs["hypothesis_brief"] and row.grounds_brief == briefs["grounds_brief"]
     assert row.effects[0].how_to_calculate_brief == ["сумма за год"]
+
+
+def test_merge_sends_source_context_for_structural_validation(run_id, tmp_prompt, monkeypatch):
+    hsets = [_hset(1, ["A"]), _hset(5, ["B"])]
+    seen = {}
+    def capture(instruction, document, model_cls, **kwargs):
+        seen.update(kwargs)
+        return _ok_call_result(HypothesisMap(rows=_rows_from([(1, "A"), (5, "B")]), merges=[]))
+    monkeypatch.setattr(merge_module, "call", capture)
+    merge_map(hsets, "акт", run_id)
+    source = seen["validation_context"]["merge_inputs"]
+    assert [(r["row_id"], r["indicator"], r["hypothesis"]) for r in source] == [(1, 1, "A"), (2, 5, "B")]

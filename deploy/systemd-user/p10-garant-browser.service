@@ -1,0 +1,16 @@
+# Separate development browser for Garant; does not modify p10-web.
+[Unit]
+Description=P-10 production Garant browser
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStartPre=-/usr/bin/docker rm -f p10-garant-browser-dev
+ExecStart=/usr/bin/docker run --rm --init --name p10-garant-browser-dev --user 1000:1000 --cap-drop ALL --security-opt no-new-privileges --health-cmd "node /app/p10/garant_browser.cjs --healthcheck" --health-interval 30s --health-timeout 5s --health-retries 3 --health-start-period 20s --volume %h/.local/share/p10-garant-browser/profile:/home/node/garant-profile --volume %h/.local/share/p10-garant-browser/runtime:/run/p10-garant --volume %h/projects/p10-orv/scripts/garant_browser.cjs:/app/p10/garant_browser.cjs:ro --volume %h/projects/p10-orv/scripts/garant_web.cjs:/app/p10/garant_web.cjs:ro --entrypoint node ghcr.io/openclaw/openclaw:2026.9.9-browser /app/p10/garant_browser.cjs
+ExecStop=/usr/bin/docker stop --time 20 p10-garant-browser-dev
+TimeoutStopSec=30
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

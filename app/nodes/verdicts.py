@@ -47,7 +47,8 @@ from app.formatting import format_cost
 from app.logger import get_run_logger
 from app.runner import call
 from app.nodes.common import append_task_clarification, run_after
-from app.nodes.passport import passport_block
+from app.garant_proxy import indicator_mcp_config
+from app.input_contexts import INDICATOR_CONTEXTS, passport_context_block
 from app.trace import VERDICTS_DIR, add_cost, save_json
 
 # Длина, до которой обрезается текст ошибки в rationale вердикта "ошибка"
@@ -144,23 +145,25 @@ def _run_one_indicator(
         limit = (search_limits or SEARCH_LIMITS).get(n, SEARCH_LIMITS.get(n))
         prompt_text = fill_prompt_labels(prompt_path(n).read_text(encoding="utf-8"), regions, limit)
         instruction = append_task_clarification(prompt_text, extra_instruction)
-        # 2.6: акт и паспорт — общий для всех 12 агентов текст — уходят в системный промпт,
-        # чтобы агенты читали его из кэша друг у друга; в stdin ничего не идёт
+        # Полный акт остаётся общим префиксом; за ним справка данного индикатора.
+        # В stdin ничего не идёт; механизм кэширования провайдера не меняется.
         shared = _build_document(document_md, passport_block_text)
         allowed_tools, garant_tools = indicator_tools(n)
 
-        result = call(
-            instruction,
-            None,
-            INDICATOR_OUTPUT.get(n, VerdictOutput),   # 2.5: выжимка обязательна; 13.10: свой контракт индикатора
-            run_id=run_id,
-            trace_name=f"{trace_prefix}{VERDICTS_DIR}/{n:02d}.raw.json",
-            allowed_tools=allowed_tools,
-            timeout_s=max(timeout_s, INDICATOR_TIMEOUT_S.get(n, 0)),   # 2.7: индикатору 3 — больше
-            max_budget_usd=max_budget_usd,
-            shared_context=shared,
-            mcp_tools=garant_tools or None,
-        )
+        with indicator_mcp_config(n, run_id) as mcp_config:
+            result = call(
+                instruction,
+                None,
+                INDICATOR_OUTPUT.get(n, VerdictOutput),   # 2.5: выжимка обязательна; 13.10: свой контракт индикатора
+                run_id=run_id,
+                trace_name=f"{trace_prefix}{VERDICTS_DIR}/{n:02d}.raw.json",
+                allowed_tools=allowed_tools,
+                timeout_s=max(timeout_s, INDICATOR_TIMEOUT_S.get(n, 0)),   # 2.7: индикатору 3 — больше
+                max_budget_usd=max_budget_usd,
+                shared_context=shared,
+                mcp_tools=garant_tools or None,
+                mcp_config=mcp_config,
+            )
 
         if result.permission_denials:
             logger.warning(
@@ -258,13 +261,14 @@ def run_verdicts(
     verdicts_by_n: dict[int, Verdict] = {}
     cost_total = 0.0
 
-    # Блок паспорта собирается один раз на все 12 агентов
-    block = passport_block(passport)
+    # У каждого индикатора свой согласованный набор полей паспорта.
+    blocks = {n: passport_context_block(passport, INDICATOR_CONTEXTS[n])
+              for n in nums if n in INDICATOR_CONTEXTS}
     delays = _start_delays(nums)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [
             executor.submit(
-                run_after, delays[n], _run_one_indicator, n, document_md, block, run_id, timeout_s,
+                run_after, delays[n], _run_one_indicator, n, document_md, blocks.get(n, ""), run_id, timeout_s,
                 max_budget_usd, extra_instruction, trace_prefix, regions, search_limits,
             )
             for n in nums

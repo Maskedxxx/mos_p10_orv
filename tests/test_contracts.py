@@ -541,7 +541,7 @@ def test_effect_descriptions_iter4():
     how = Effect.model_fields["how_to_calculate"].description
     assert "прошивка (только если акт её требует)" in how and "бумага и печать" in how
     aff = Effect.model_fields["affected"].description
-    assert "Сочетание ставь, когда одна и та же цифра касается сразу нескольких групп" in aff
+    assert "одна измеряемая величина" in aff and "совместно" in aff
 
 
 def test_data_item_question_and_not_tracked_sources():
@@ -586,9 +586,10 @@ def test_request_new_units(unit):
 
 def test_request_unit_instruction_and_clause_instruction():
     metric = RequestItem.model_fields["metric"].description
-    assert "Долю или процент обычно не запрашивай" in metric and "Доли и проценты не запрашиваются" not in metric
+    assert "официально учитываемая доля/коэффициент" in metric
+    assert "Доли и проценты не запрашиваются" not in metric
     clause = RequestItem.model_fields["clause"].description
-    assert "Если у строки несколько пунктов, выбери тот, о котором именно этот показатель" in clause
+    assert "относящийся именно к этому измерению" in clause
 
 
 def test_open_question_item():
@@ -611,11 +612,12 @@ def test_fresh_numbering_orders_questions_last():
 
 
 def _doc(held: bool, requested: bool) -> dict:
-    return {"name": "документ", "clause": "п. 1", "held_by_state": held, "requested_by_body": requested}
+    return {"name": "документ", "clause": "п. 1", "held_by_state": held, "requested_by_body": requested,
+            "availability_basis": "Обоснование по тексту", "required_from_applicant": not requested}
 
 
 def _ind01(verdict: str, docs: list, **kw) -> dict:
-    extra = {"missing_data": "перечень в акте Б"} if verdict == "нет данных" else {}
+    extra = {"missing_data": "перечень в акте Б", "coverage_gaps": ["внешний перечень не прочитан"]} if verdict == "нет данных" else {}
     return {"indicator": 1, "name": "межведомственное взаимодействие", "checked_documents": docs,
             "rationale": "полный разбор", "verdict": verdict, "rationale_brief": _B, **extra, **kw}
 
@@ -762,8 +764,8 @@ def _ind04(verdict: str, rows: list) -> dict:
 
 
 @pytest.mark.parametrize("verdict, rows", [
-    ("нарушен", [_cmp("повтор"), _cmp("не сверено")]),
-    ("нарушен", [_cmp("требует и сам получает"), _cmp("ссылка")]),
+    ("нет данных", [_cmp("повтор"), _cmp("не сверено")]),
+    ("соблюдён", [_cmp("повтор")]),
     ("нет данных", [_cmp("не сверено"), _cmp("конкретизация")]),
     ("соблюдён", [_cmp("ссылка"), _cmp("конкретизация"), _cmp("воспроизведение по закону")]),
     ("соблюдён", []),          # двойников нет, но требования в акте есть
@@ -776,7 +778,7 @@ def test_indicator04_verdict_follows_compared(verdict, rows):
 
 @pytest.mark.parametrize("verdict, rows", [
     ("соблюдён", [_cmp("ссылка"), _cmp("не сверено")]),
-    ("нет данных", [_cmp("повтор")]),
+    ("нарушен", [_cmp("повтор")]),
     ("нарушен", [_cmp("конкретизация")]),
     ("не применимо", [_cmp("ссылка")]),
     ("нет данных", []),
@@ -1022,15 +1024,21 @@ def test_indicator09_reasoning_before_choice():
 
 
 def _f10(mark: str) -> dict:
-    return {"source": "https://example.ru/a", "fact": "отбор не состоялся", "about": "этот акт", "mark": mark}
+    return {"target_id": 1, "read_status": "прочитано", "period": "за отчётный год", "excerpt": "Текст отчёта",
+            "linkage": "Норма и орган совпадают", "source": "https://example.ru/a", "fact": "результат применения", "about": "этот акт", "mark": mark}
 
 
 def _ind10(verdict: str, rows: list, applicability: str = "применим") -> dict:
+    confirmed = any(row["mark"] in ("работает", "не работает") for row in rows)
+    targets = [{"target_id": 1, "clause": "п. 2", "subject": "Процедура", "actor": None, "expected_fact": "Результаты"}] if applicability == "применим" else []
+    coverage = [{"target_id": 1, "status": "подтверждено" if confirmed else "не установлено",
+                 "finding_indices": list(range(1, len(rows)+1)), "gap": None if confirmed else "Нет данных"}] if targets else []
     extra = ({"missing_data": "нет сведений о заявках",
-              "to_request": [{"metric": "число поданных заявок", "unit": "ед.", "clause": "п. 2"}]}
+              "to_request": [{"target_id": 1, "metric": "число поданных заявок", "unit": "ед.", "clause": "п. 2"}]}
              if verdict == "нет данных" else {})
     return {"indicator": 10, "name": "учёт практики применения", "applicability_basis": "акт действует",
-            "applicability": applicability, "searches": ["суды", "новости", "доклады"], "findings": rows,
+            "applicability": applicability, "targets": targets, "coverage": coverage,
+            "searches": ["суды", "новости", "доклады"], "findings": rows,
             "rationale": "полный разбор", "verdict": verdict, "rationale_brief": _B, **extra}
 
 
@@ -1040,7 +1048,7 @@ def _ind10(verdict: str, rows: list, applicability: str = "применим") ->
     ("нет данных", [_f10("не про этот акт")], "применим"),
     ("нет данных", [], "применим"),
     ("не применимо", [], "не вступил в силу"),
-    ("не применимо", [_f10("не работает")], "только органу"),
+    ("не применимо", [], "только органу"),
 ])
 def test_indicator10_verdict_follows_findings(verdict, rows, applicability):
     from app.contracts import Indicator10Output
@@ -1073,7 +1081,10 @@ def test_indicator10_reasoning_before_choice():
 
 def _d11(mark: str) -> dict:
     return {"whose": "орган", "what": "рассмотрение", "value": "42 рабочих дня", "clause": "п. 1",
-            "federal": "174-ФЗ, ст. 14, не более 42 рабочих дней, https://www.consultant.ru/x", "mark": mark}
+            "starts_at": "поступление заявления", "check_status": "норма прочитана",
+            "federal_source": "https://www.consultant.ru/x", "federal_quote": "Норма о предельном сроке",
+            "federal_limit": "42 рабочих дня с поступления", "comparison_basis": "То же действие и начало отсчёта",
+            "federal": "Прочитана сопоставимая норма", "mark": mark}
 
 
 def _ind11(verdict: str, rows: list, units_mixed: str | None = None) -> dict:
@@ -1084,7 +1095,7 @@ def _ind11(verdict: str, rows: list, units_mixed: str | None = None) -> dict:
 @pytest.mark.parametrize("verdict, rows, units_mixed", [
     ("нарушен", [_d11("длиннее федерального")], None),
     ("нарушен", [_d11("максимум при делении по сложности"), _d11("в пределах")], None),
-    ("нарушен", [_d11("в пределах")], "п. 1 — рабочие, п. 2 — календарные"),
+    ("соблюдён", [_d11("в пределах")], "п. 1 — рабочие, п. 2 — календарные"),
     ("соблюдён", [_d11("в пределах")], None),
     ("не применимо", [], None),
 ])
@@ -1095,7 +1106,7 @@ def test_indicator11_verdict_follows_deadlines(verdict, rows, units_mixed):
 
 @pytest.mark.parametrize("verdict, rows, units_mixed", [
     ("соблюдён", [_d11("длиннее федерального")], None),
-    ("соблюдён", [_d11("в пределах")], "п. 1 — рабочие, п. 2 — календарные"),
+    ("нарушен", [_d11("в пределах")], "п. 1 — рабочие, п. 2 — календарные"),
     ("нарушен", [_d11("в пределах")], None),
     ("соблюдён", [], None),
     ("нарушен", [], "п. 1 — рабочие"),
@@ -1121,9 +1132,15 @@ def test_indicator11_reasoning_before_choice():
     ("нет (статью 49 открыть не удалось)", True), ("Нет — глава 2.1 не открывалась", True),
 ])
 def test_indicator11_federal_norm_only_from_read_page(federal, ok):
-    """14.10: федеральная норма — только с адресом прочитанной страницы, иначе «нет» (15.10: можно с пояснением)."""
+    """Сводка свободным текстом не заменяет явных полей прочитанной нормы."""
     from app.contracts import DeadlineCheck
-    row = {**_d11("в пределах"), "federal": federal}
+    if federal.strip().lower().startswith("нет"):
+        row = {**_d11("не проверено"), "federal": federal, "check_status": "источник недоступен",
+               "federal_source": None, "federal_quote": None, "federal_limit": None}
+    else:
+        row = {**_d11("в пределах"), "federal": federal}
+        if not ok:
+            row["federal_source"] = None
     if ok:
         DeadlineCheck(**row)
     else:
@@ -1134,9 +1151,9 @@ def test_indicator11_federal_norm_only_from_read_page(federal, ok):
 def test_indicator11_person_deadline_never_violation():
     """14.10: длину сравниваем только у сроков органа — срок лица всегда «в пределах»."""
     from app.contracts import DeadlineCheck
-    DeadlineCheck(**{**_d11("в пределах"), "whose": "лицо"})
+    DeadlineCheck(**{**_d11("в пределах"), "whose": "лицо", "check_status": "не требуется"})
     with pytest.raises(ValidationError):
-        DeadlineCheck(**{**_d11("длиннее федерального"), "whose": "лицо"})
+        DeadlineCheck(**{**_d11("длиннее федерального"), "whose": "лицо", "check_status": "не требуется"})
 
 
 # ---- Индикатор 12: таблица условий допуска и назначений, рубрика вердикта (14.10, разбор узлов) ----
@@ -1254,7 +1271,6 @@ def test_hypothesis_proof_checked_against_act_only_with_context():
 
 
 def test_breakdown_without_values_in_act_becomes_question():
-    """14.10 (ошибка 3, 166-ПП): разрез из карты без значений в акте — не выкидывать, а открытый вопрос органу."""
-    from app.contracts import RequestItem
-    d = " ".join(RequestItem.model_fields["breakdown"].description.split())
-    assert "не выкидывай" in d and "открытый вопрос органу" in d
+    d = RequestItem.model_fields["breakdown"].description
+    assert "основную позицию сохрани" in d and "связанный вопрос" in d
+    assert "не добавляй произвольные категории" in d

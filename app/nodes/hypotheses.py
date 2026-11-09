@@ -40,7 +40,7 @@ trace.add_cost про границы применимости; 27.10 лок и �
 from __future__ import annotations
 
 import json
-import re
+import hashlib
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -52,12 +52,14 @@ from app.config import (
     PROMPT_HYPOTHESES_NO_DATA,
     PROMPT_HYPOTHESES_VIOLATED,
 )
-from app.contracts import ActPassport, Buckets, DataItem, HypothesisSet, HypothesisSetOutput, Verdict
+from app.contracts import ActPassport, Buckets, HypothesisSet, HypothesisSetOutput, NoDataHypothesisSetOutput, Verdict
 from app import config
 from app.formatting import format_cost
 from app.logger import get_run_logger
 from app.nodes.common import append_task_clarification, run_after
-from app.nodes.passport import passport_block
+from app.input_contexts import (
+    NoDataHypothesesPassportContext, ViolatedHypothesesPassportContext, passport_context_block,
+)
 from app.runner import call
 from app.trace import HYPOTHESES_DIR, VERDICTS_DIR, add_cost, run_dir, save_json
 
@@ -77,7 +79,7 @@ def _shared_context(document_md: str, passport_block_text: str) -> str:
     return "\n".join(parts)
 
 
-def _verdict_card(verdict: Verdict, to_request: list[dict] | None = None) -> str:
+def _verdict_card(verdict: Verdict, to_request: list[dict] | None = None, remarks: list[dict] | None = None) -> str:
     """
     Своё у каждого агента: карточка вердикта — в stdin, после общего текста акта
     и паспорта. Сериализуется читаемо (indent=2, кириллица без escape).
@@ -88,25 +90,45 @@ def _verdict_card(verdict: Verdict, to_request: list[dict] | None = None) -> str
     if to_request:
         requests_json = json.dumps(to_request, ensure_ascii=False, indent=2)
         card += "\n## ЧИСЛА ДЛЯ ОРГАНА (JSON)\n\n" f"```json\n{requests_json}\n```\n"
+    if remarks:
+        card += "\n## КОНКРЕТНЫЕ ЗАМЕЧАНИЯ ПРОВЕРКИ (JSON)\n\n```json\n" + json.dumps(remarks, ensure_ascii=False, indent=2) + "\n```\n"
     return card
 
 
+def _accepted_checks(run_id: str, indicator: int) -> dict:
+    """Только принятые артефакты в корне прогона, не кандидаты из dialog/."""
+    path = run_dir(run_id) / f"{VERDICTS_DIR}/{indicator:02d}.checks.json"
+    if not path.is_file():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
 def _to_request(run_id: str, verdict: Verdict) -> list[dict]:
-    """
-    Числа для органа, которые агент индикатора записал при «нет данных» (14.10, индикатор 10) — из таблицы
-    рядом с вердиктом (03_verdicts/NN.checks.json). Нет файла или поля — пусто.
-    15.10 (код-ревью): только из принятой версии — корня прогона (таблица отклонённой перепроверки лежит в папке
-    шага dialog/vN/ и сюда не попадает) и только для «нет данных»: при другом вердикте таблица — от прежнего.
+    """Сохраняем исходные поля, добавляем ID позиции в конкретном снимке списка.
+
+    Хеш не сравнивает смысл: изменение исходного списка создаёт другой набор ID.
+    Одинаковое название разных записей не приводит к их объединению.
     """
     if verdict.verdict != "нет данных":
         return []
-    path = run_dir(run_id) / f"{VERDICTS_DIR}/{verdict.indicator:02d}.checks.json"
-    if not path.is_file():
+    items = _accepted_checks(run_id, verdict.indicator).get("to_request") or []
+    if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+        raise ValueError("to_request: ожидается список исходных записей")
+    snapshot = hashlib.sha256(json.dumps(items, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:16]
+    return [dict(item, request_id=f"{run_id}:{verdict.indicator:02d}:{snapshot}:{i}")
+            for i, item in enumerate(items, 1)]
+
+
+def _verdict_remarks(run_id: str, verdict: Verdict) -> list[dict]:
+    """Явная отметка №9; без распознавания нарушения из текста или сопоставления названий."""
+    if verdict.indicator != 9 or verdict.verdict != "нарушен":
         return []
-    try:
-        return list(json.loads(path.read_text(encoding="utf-8")).get("to_request") or [])
-    except (OSError, ValueError, AttributeError):
-        return []
+    rows = _accepted_checks(run_id, 9).get("wordings") or []
+    return [dict(row) for row in rows if isinstance(row, dict) and row.get("mark") == "непонятно"]
 
 
 def _questions_to_data(value: HypothesisSetOutput) -> HypothesisSet:
@@ -124,36 +146,6 @@ def _questions_to_data(value: HypothesisSetOutput) -> HypothesisSet:
                 text = f"{text} ({clause})"
             h["data"].append({"metric": text, "source": "вопрос органу", "where": None})
     return HypothesisSet.model_validate(data)
-
-
-def _metric_key(text: str) -> str:
-    """Ключ сравнения показателей: без скобок (пункты, приложения), знаков и регистра — агент гипотез часто
-    вставляет пункт в середину названия («… (приложение 1, п. 2.1), ед.»), это то же число."""
-    no_brackets = re.sub(r"\([^)]*\)", " ", text.casefold())
-    return " ".join(re.findall(r"[0-9a-zа-яё]+", no_brackets))
-
-
-def _ensure_requests(hset: HypothesisSet, to_request: list[dict]) -> tuple[HypothesisSet, list[str]]:
-    """
-    14.10: каждое число из списка индикатора доходит до гипотез — результат предыдущего узла истина.
-    Число, которого агент не положил ни в одну гипотезу, код дописывает в данные первой гипотезы.
-    Возвращает набор и список дописанных чисел.
-    """
-    if not hset.hypotheses or not to_request:
-        return hset, []
-    present = [_metric_key(d.metric) for h in hset.hypotheses for d in h.data]
-    added: list[DataItem] = []
-    for item in to_request:
-        metric = str(item.get("metric", "")).strip()
-        if metric and not any(_metric_key(metric) in p for p in present):
-            unit, clause = str(item.get("unit", "")).strip(), str(item.get("clause", "")).strip()
-            text = metric + (f", {unit}" if unit else "") + (f" ({clause})" if clause else "")
-            added.append(DataItem(metric=text, source="запрос органу"))
-    if not added:
-        return hset, []
-    first = hset.hypotheses[0]
-    hypotheses = [first.model_copy(update={"data": [*first.data, *added]}), *hset.hypotheses[1:]]
-    return hset.model_copy(update={"hypotheses": hypotheses}), [d.metric for d in added]
 
 
 def _empty_set(verdict: Verdict, error_text: str) -> HypothesisSet:
@@ -192,15 +184,15 @@ def _run_one_hypothesis(
         to_request = _to_request(run_id, verdict)
         result = call(
             instruction,
-            _verdict_card(verdict, to_request),
-            HypothesisSetOutput,   # 2.5: выжимки для эксперта в ответе обязательны
+            _verdict_card(verdict, to_request, _verdict_remarks(run_id, verdict)),
+            NoDataHypothesisSetOutput if verdict.verdict == "нет данных" else HypothesisSetOutput,
             run_id=run_id,
             trace_name=f"{trace_prefix}{HYPOTHESES_DIR}/{n:02d}.raw.json",
             allowed_tools=ALLOWED_TOOLS_TEXT,
             timeout_s=timeout_s,
             max_budget_usd=max_budget_usd,
             shared_context=_shared_context(document_md, passport_block_text),
-            validation_context={"act_text": document_md},   # 14.10: цитата гипотезы сверяется с актом
+            validation_context={"act_text": document_md, "required_request_ids": [item["request_id"] for item in to_request]},
         )
 
         if not result.ok or result.value is None:
@@ -210,10 +202,6 @@ def _run_one_hypothesis(
         # не могла разъехаться с номером/именем индикатора, под которым сохраняется
         # артефакт NN.json — по аналогии с перезаписью attempts в узле [2]
         hset = _questions_to_data(result.value).model_copy(update={"indicator": n, "name": verdict.name})
-        hset, added = _ensure_requests(hset, to_request)
-        if added:
-            get_run_logger(run_id).getChild("05_hypotheses").info(
-                "индикатор %d: код дописал в данные числа из списка индикатора: %s", n, added)
         return n, hset, result.cost_usd, True
 
     except Exception as exc:  # исключение внутри потока не должно ронять весь прогон
@@ -310,7 +298,7 @@ def run_hypotheses_violated(
     trace.add_cost.
     """
     return _run_hypotheses(
-        buckets.violated, document_md, passport_block(passport), run_id, PROMPT_HYPOTHESES_VIOLATED, "violated",
+        buckets.violated, document_md, passport_context_block(passport, ViolatedHypothesesPassportContext), run_id, PROMPT_HYPOTHESES_VIOLATED, "violated",
         max_workers, timeout_s, max_budget_usd, extra_instruction, trace_prefix, save,
     )
 
@@ -335,7 +323,7 @@ def run_hypotheses_no_data(
     Механика идентична run_hypotheses_violated (см. её docstring и docstring
     модуля) — отличаются только куча вердиктов и промпт (04b вместо 04a).
 
-    Индикаторы из NO_DATA_TEXT_FAMILY (1-6) пропускаются: их «нет данных» —
+    Индикаторы из NO_DATA_TEXT_FAMILY (1-6 и 11) пропускаются: их «нет данных» —
     незавершённая проверка по тексту или правовой базе, а не пробел в практике;
     гипотезы по ним не строятся, в Excel такой вердикт идёт строкой «проверка
     не завершена» (ОС экспертов, Б1: МАДИ инд. 3 и «зелёные» инд. 4 дали ложные
@@ -349,6 +337,6 @@ def run_hypotheses_no_data(
             skipped,
         )
     return _run_hypotheses(
-        practice, document_md, passport_block(passport), run_id, PROMPT_HYPOTHESES_NO_DATA, "no_data",
+        practice, document_md, passport_context_block(passport, NoDataHypothesesPassportContext), run_id, PROMPT_HYPOTHESES_NO_DATA, "no_data",
         max_workers, timeout_s, max_budget_usd, extra_instruction, trace_prefix, save,
     )

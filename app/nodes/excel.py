@@ -227,8 +227,6 @@ def _render_basis_cell(
 
     if proof:
         body = f"«{proof}»"
-    elif sources:
-        body = "цитата не приведена — вывод построен на внешних источниках, а не на тексте акта"
     else:
         body = "цитата из акта не приведена"
 
@@ -633,11 +631,29 @@ def _render_howto_sheet(
             cb.border = _BORDER
 
 
+def _original_to_map_rows(hyp_map: HypothesisMap) -> dict[int, int] | None:
+    """Восстановить явные группы свежей карты; неоднозначную историю не угадывать."""
+    if [r.row_id for r in hyp_map.rows] != list(range(1, len(hyp_map.rows) + 1)):
+        return None
+    groups = [set(m.merged_row_ids) for m in hyp_map.merges]
+    source_count = len(hyp_map.rows) + sum(len(g) - 1 for g in groups)
+    known = set(range(1, source_count + 1))
+    merged = set().union(*groups) if groups else set()
+    if not merged <= known or any(not set(d.row_ids) <= known for d in hyp_map.decisions):
+        return None
+    groups.extend({n} for n in sorted(known - merged))
+    groups.sort(key=min)
+    if len(groups) != len(hyp_map.rows):
+        return None
+    return {original: row.row_id for group, row in zip(groups, hyp_map.rows) for original in group}
+
+
 def _render_map_sheet(
     wb: Workbook, hyp_map: HypothesisMap, row_to_nums: dict[int, list[str]],
     passport: ActPassport | None, buckets: Buckets, caption: str,
     unverified_ids: dict[int, int], marks: Marks | None = None,
     row_to_question_nums: dict[int, list[str]] | None = None,
+    fresh_snapshot: bool = True,
 ) -> None:
     """
     Лист «Карта гипотез»: опциональная шапка-реквизиты (одна строка) + 5 колонок.
@@ -650,6 +666,14 @@ def _render_map_sheet(
     header_line = _passport_header_line(passport)
     if header_line is not None:
         ws.append([header_line])          # реквизиты акта — самая первая строка
+    source_rows = _original_to_map_rows(hyp_map) if fresh_snapshot else None
+    if source_rows is None:
+        # В изменённой версии исходные ID уже не обязаны однозначно задавать текущие строки.
+        # Предупреждение сохраняем с явным обозначением исходных гипотез, без ложных ссылок.
+        notes = [f"Исходные гипотезы {', '.join(map(str, d.row_ids))}: {d.accounting_note}"
+                 for d in hyp_map.decisions if not d.merge and d.accounting_note]
+        if notes:
+            caption += "\n\nСохранённые предупреждения о пересечениях:\n" + "\n\n".join(notes)
     _render_caption(ws, caption)
 
     header_row = ws.max_row + 1
@@ -659,12 +683,23 @@ def _render_map_sheet(
     for row in hyp_map.rows:
         nums = row_to_nums.get(row.row_id, [])
         verdicts = _row_verdicts(row.indicators, by_indicator)
+        data_text = _render_map_data_cell(
+            row.data, nums, (row_to_question_nums or {}).get(row.row_id, []),
+        )
+        # Перенос готовых предупреждений по ID; содержание и суммы не пересчитываем.
+        for decision in hyp_map.decisions:
+            involved = ({source_rows[n] for n in decision.row_ids}
+                        if source_rows is not None else set())
+            if not decision.merge and decision.accounting_note and row.row_id in involved:
+                others = ", ".join(str(n) for n in sorted(involved) if n != row.row_id)
+                data_text += (f"\n\nПересечение со строками {others}:\n"
+                              f"{decision.accounting_note}")
         ws.append([
             row.row_id,          # адрес строки: на него ссылается лист запроса
             _indicators_label(row.indicators),
             points_text(row.hypothesis_brief, row.hypothesis),
             _render_effect_cell(row.effects),
-            _render_map_data_cell(row.data, nums, (row_to_question_nums or {}).get(row.row_id, [])),
+            data_text,
             _render_basis_cell(
                 row.proof or _first_verdict_proof(verdicts),
                 row.clause,                       # пункт карты вердиктом не подменяется
@@ -841,7 +876,7 @@ def _render_questions_sheet(
     wb: Workbook, request: DataRequest, hyp_map: HypothesisMap, caption: str, marks: Marks | None = None,
 ) -> None:
     """
-    Лист «Вопросы органу» (2.7, итерация 4, Ж2): № | Вопрос | Пункт акта | Строки карты.
+    Лист «Вопросы органу»: № | Вопрос | Пояснение | Пункт акта | Строки карты.
 
     Владимир (файл 4, правило 3.1): открытые вопросы — «отдельный бланк, если следует из
     гипотез и непонятно из текста акта / открытых данных». Лист создаётся всегда: эксперт
@@ -850,15 +885,15 @@ def _render_questions_sheet(
     ws = wb.create_sheet(SHEET_QUESTIONS)
     _render_caption(ws, caption)
     header_row = ws.max_row + 1
-    ws.append(["№", "Вопрос", "Пункт акта", "Строки карты"])
+    ws.append(["№", "Вопрос", "Пояснение", "Пункт акта", "Строки карты"])
     row_indicators = {row.row_id: row.indicators for row in hyp_map.rows}
     questions = [it for it in request.items if it.kind == _KIND_QUESTION]
     if not questions:
         ws.append(["", "вопросов нет", "", ""])
     for item in questions:
-        ws.append([item.num, item.metric, item.clause or "",
+        ws.append([item.num, item.metric, item.note or "", item.clause or "",
                    _render_source_rows_cell(item.for_rows, row_indicators)])
-    _format_listing_sheet(ws, {"A": 8, "B": 70, "C": 16, "D": 26}, header_row)
+    _format_listing_sheet(ws, {"A": 8, "B": 70, "C": 50, "D": 16, "E": 26}, header_row)
     for row in ws.iter_rows(min_row=header_row + 1, max_col=1):
         row[0].alignment = _CENTER_TOP
     if marks is not None:
@@ -1023,7 +1058,7 @@ def build_excel(
         f"{len(map_indicators)} из {total}. По каждому построена гипотеза: "
         f"что не так, чем мерить эффект, какие данные нужны — либо отмечено, "
         f"что нужна ручная проверка.",
-        unverified, marks, row_to_question_nums,
+        unverified, marks, row_to_question_nums, fresh_snapshot=not version,
     )
     # 2.7 (А): бланк адресован разработчику — называем его, если он определён
     developers = passport.requisites.developers if passport is not None else []
