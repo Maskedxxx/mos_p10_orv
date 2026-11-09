@@ -79,3 +79,12 @@ def test_codex_accepts_only_permitted_web_call_event(tmp_runs_dir, monkeypatch, 
             run_id='run', trace_name='03_verdicts/11.raw.json', allowed_tools=builtin,
             mcp_tools=methods, mcp_config=path, max_attempts=1)
     assert result.ok, result.error
+
+
+def test_production_browser_unit_matches_web_reader_and_production_sources():
+    unit = (config.PROJECT_ROOT / "deploy/systemd-user/p10-garant-browser.service").read_text()
+    assert "--name p10-garant-browser " in unit
+    assert "ExecStop=/usr/bin/docker stop --time 20 p10-garant-browser" in unit.splitlines()
+    assert "%h/projects/p10-orv/scripts/garant_web.cjs:" in unit
+    assert "%h/projects/p10-orv-quality-prompts/" not in unit
+    assert "p10-garant-browser-dev" not in unit
