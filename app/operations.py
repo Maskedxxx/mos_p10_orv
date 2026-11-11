@@ -21,16 +21,20 @@ Excel (код, секунды) → снимок версии, строка жу�
 from __future__ import annotations
 
 import datetime
+import base64
+import json
 import re
+from copy import deepcopy
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from typing import Literal
 
-from pydantic import ValidationError
+from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 
 from app import versions, config
 from app.config import NO_DATA_TEXT_FAMILY
 from app.contracts import (
-    ActPassport, AddMapRow, AppendRequest, BuildHypotheses, Buckets, DataRequest, DeleteMapRow, DeleteRequestItem,
+    ActPassport, AddMapRow, AppendRequest, BuildHypotheses, Buckets, CopyMapRow, DataRequest, DeleteMapRow, DeleteRequestItem,
     MarkNotTracked,
     EditText, HypothesisMap, HypothesisSet, JournalEntry, MapRow, MergeMapRows, Operation, RecheckIndicator,
     RequestItem, RunMeta, RunProgress, SetVerdict, SplitRequestItem, Verdict, VersionState,
@@ -41,9 +45,10 @@ from app.nodes.merge import clause_tokens, fallback_map, flatten_hypotheses
 from app.nodes.request import build_request
 from app.nodes.sort import sort_verdicts
 from app.nodes.verdicts import run_verdicts
+from app.runner import call
 from app.trace import (
     BUCKETS_FILE, DOCUMENT_FILE, HYPOTHESES_DIR, MAP_FILE, META_FILE, PASSPORT_FILE, PROGRESS_FILE, REQUEST_FILE,
-    VERDICTS_DIR, VERSIONS_DIR, load_json, run_dir, save_bytes, save_json,
+    VERDICTS_DIR, VERSIONS_DIR, add_cost, load_json, log_event, run_dir, save_bytes, save_json,
 )
 
 
@@ -72,6 +77,17 @@ class Candidate:
     cost_usd: float
     checks: bytes | None = None  # таблица перепроверки — в корень при «Принять»
     cost_known: bool = True
+    comparison: str | None = None
+    comparison_note: str = ""
+
+
+class RecheckComparison(BaseModel):
+    """Сравнение доказательств до и после перепроверки, без нового поиска."""
+
+    outcome: Literal["новые сведения", "существенных изменений нет", "неопределённо"] = Field(
+        description="Новые или изменившиеся факты, основания, источники, степень уверенности или вердикт — новые сведения. "
+                    "Только пересказ прежнего — существенных изменений нет. При сомнении — неопределённо.")
+    explanation: str = Field(min_length=1, description="Кратко: что проверено и чем отличается от прежнего результата. Не придумывай факты.")
 
 
 @dataclass
@@ -83,6 +99,7 @@ class StepResult:
     candidate: Candidate | None = None
     cost_usd: float = 0.0
     cost_known: bool = True
+    warning: str | None = None
 
 
 @dataclass
@@ -97,6 +114,7 @@ class _Ctx:
     passport: ActPassport | None
     document_md: str
     new_sets: dict[int, HypothesisSet] = field(default_factory=dict)
+    checks: dict[int, bytes] = field(default_factory=dict)
 
 
 def _load(run_id: str, state: VersionState) -> _Ctx:
@@ -132,7 +150,7 @@ def _item(ctx: _Ctx, num: str) -> RequestItem:
 
 
 def _set_rows(ctx: _Ctx, rows: list[MapRow]) -> None:
-    ctx.hyp_map = ctx.hyp_map.model_copy(update={"rows": sorted(rows, key=lambda r: r.row_id)})
+    ctx.hyp_map = ctx.hyp_map.model_copy(update={"rows": rows})
 
 
 def _set_items(ctx: _Ctx, items: list[RequestItem]) -> None:
@@ -293,30 +311,58 @@ def _add_map_row(ctx: _Ctx, op: AddMapRow) -> Change:
     return Change(f"Карта гипотез, стр. {row.row_id}", "строка добавлена по формулировке эксперта", None, row.hypothesis)
 
 
+def _copy_map_row(ctx: _Ctx, op: CopyMapRow) -> Change:
+    row = _row(ctx, op.row_id)
+    copy = row.model_copy(deep=True, update={"row_id": _new_row_id(ctx)})
+    rows = list(ctx.hyp_map.rows)
+    rows.insert(rows.index(row) + 1, copy)
+    _set_rows(ctx, rows)
+    _add_once(ctx.state.marks.edited_rows, copy.row_id)
+    if _needs_request(copy):
+        ctx.state.marks.stale_rows[copy.row_id] = "для копии нет отдельных позиций запроса"
+    return Change(f"Карта гипотез, стр. {copy.row_id}", f"копия строки {row.row_id} добавлена рядом", None, copy.hypothesis)
+
+
 def _merge_map_rows(ctx: _Ctx, op: MergeMapRows) -> Change:
     ids = sorted(set(op.row_ids))
+    if len(ids) < 2:
+        raise OperationError("для объединения нужны как минимум две разные строки")
     rows = [_row(ctx, r) for r in ids]
+    visible = [points_text(r.hypothesis_brief, r.hypothesis) for r in rows]
+    if op.mode == "без изменений":
+        hypothesis, brief = "\n\n".join(visible), None
+    else:
+        hypothesis = op.hypothesis or ""
+        brief = _split_points(hypothesis)
     keep, gone = ids[0], set(ids[1:])
-    effects, data = {}, {}
+    effects, data = [], {}
     for r in rows:
         for e in r.effects:
-            effects.setdefault(e.affected, e)          # один эффект на группу — первый
+            if e not in effects:
+                effects.append(e)
         for dp in r.data:
-            data.setdefault((dp.metric.strip().lower(), dp.source), dp)
+            key = (dp.metric, dp.source, dp.where)
+            if key in data:
+                origins = list(dict.fromkeys(data[key].origin_request_ids + dp.origin_request_ids))
+                data[key] = data[key].model_copy(update={"origin_request_ids": origins})
+            else:
+                data[key] = dp
     clauses = [r.clause for r in rows if r.clause]
+    proofs = list(dict.fromkeys(r.proof for r in rows if r.proof))
     merged = MapRow(
-        row_id=keep, indicators=sorted({n for r in rows for n in r.indicators}), hypothesis=op.hypothesis,
-        grounds=" | ".join(r.grounds for r in rows), effects=list(effects.values()), data=list(data.values()),
-        proof=next((r.proof for r in rows if r.proof), None), clause=", ".join(dict.fromkeys(clauses)) or None,
-        hypothesis_brief=_split_points(op.hypothesis),
+        row_id=keep, indicators=sorted({n for r in rows for n in r.indicators}), hypothesis=hypothesis,
+        grounds=" | ".join(r.grounds for r in rows), effects=effects, data=list(data.values()),
+        proof="\n\n".join(proofs) or None, clause=", ".join(dict.fromkeys(clauses)) or None,
+        hypothesis_brief=brief,
         grounds_brief=list(dict.fromkeys(p for r in rows for p in (r.grounds_brief or [r.grounds]))),
     )
-    _set_rows(ctx, [merged] + [r for r in ctx.hyp_map.rows if r.row_id not in ids])
+    _set_rows(ctx, [merged if r.row_id == keep else r for r in ctx.hyp_map.rows if r.row_id not in gone])
     _drop_row_from_request(ctx, gone, keep, "")
     _forget_row_marks(ctx, gone)
     _add_once(ctx.state.marks.edited_rows, keep)
     return Change(f"Карта гипотез, стр. {', '.join(map(str, ids))}", f"строки слиты в стр. {keep} по решению человека",
-                  " | ".join(r.hypothesis for r in rows), op.hypothesis)
+                  "\n\n".join(f"Строка {r.row_id}:\n{text}" for r, text in zip(rows, visible)),
+                  points_text(merged.hypothesis_brief, merged.hypothesis))
 
 
 def _norm(text: str) -> str:
@@ -339,7 +385,7 @@ def _mark_not_tracked(ctx: _Ctx, op: MarkNotTracked) -> Change:
     old = row.data[idx]
     data = [dp.model_dump() for dp in row.data]
     data[idx] = {**data[idx], "source": "нигде не ведётся", "where": None}
-    _set_rows(ctx, [r for r in ctx.hyp_map.rows if r.row_id != op.row_id] + [_valid(MapRow, row, data=data)])
+    _set_rows(ctx, [_valid(MapRow, row, data=data) if r.row_id == op.row_id else r for r in ctx.hyp_map.rows])
     items, dropped = [], []
     for it in ctx.request.items:
         sources = [s for s in it.sources if not (s.row_id == op.row_id and _norm(s.metric) == key)]
@@ -394,28 +440,101 @@ def _meta_cost(run_id: str) -> float:
     return load_json(run_id, META_FILE, RunMeta).cost_usd
 
 
+def _compare_recheck(ctx: _Ctx, old: Verdict, new: Verdict, checks: bytes | None, prefix: str) -> RecheckComparison | None:
+    old_checks_path = run_dir(ctx.run_id) / f"{VERDICTS_DIR}/{old.indicator:02d}.checks.json"
+    old_checks = (ctx.checks[old.indicator].decode("utf-8") if old.indicator in ctx.checks else
+                  old_checks_path.read_text(encoding="utf-8") if old_checks_path.is_file() else "нет таблицы проверки")
+    document = json.dumps({"прежний_вердикт": old.model_dump(mode="json"),
+                           "прежняя_проверка": old_checks,
+                           "новый_вердикт": new.model_dump(mode="json"),
+                           "новая_проверка": checks.decode("utf-8") if checks else "нет таблицы проверки"},
+                          ensure_ascii=False)
+    try:
+        result = call(
+            "Сравни прежнюю проверку и перепроверку одного индикатора. Отдели новые подтверждённые факты, источники "
+            "и изменения полноты проверки от простой перефразировки. Не считай совпадение вердикта доказательством "
+            "отсутствия новых данных. Если нельзя уверенно сравнить — неопределённо. Объясни вывод кратко.",
+            document, RecheckComparison, run_id=ctx.run_id, trace_name=f"{prefix}сравнение.raw.json",
+            allowed_tools=[], max_attempts=1, timeout_s=120,
+        )
+    except Exception as error:
+        log_event(ctx.run_id, "recheck_comparison_failed", error=str(error)[:300])
+        return None
+    add_cost(ctx.run_id, result.cost_usd)
+    return result.value if result.ok else None
+
+
+def _previous_evidence(ctx: _Ctx, indicator: int) -> dict:
+    """Прежний результат именно этого индикатора, без потери таблицы проверки."""
+    old = ctx.verdicts.get(indicator)
+    if old is None:
+        raise OperationError(f"индикатора {indicator} нет")
+    path = run_dir(ctx.run_id) / f"{VERDICTS_DIR}/{indicator:02d}.checks.json"
+    try:
+        raw = ctx.checks.get(indicator)
+        if raw is None and path.exists():
+            raw = path.read_bytes()
+        checks = json.loads(raw) if raw is not None else None
+        if checks is not None and not isinstance(checks, (dict, list)):
+            raise ValueError("таблица проверки не является объектом или списком")
+    except (OSError, ValueError, UnicodeDecodeError) as error:
+        raise OperationError(f"не удалось прочитать предыдущую таблицу проверки индикатора {indicator}") from error
+    return {"verdict": old.model_dump(mode="json"), "checks": checks}
+
+
 def _prepare_recheck(ctx: _Ctx, op: RecheckIndicator, prefix: str) -> Candidate:
+    previous = _previous_evidence(ctx, op.indicator)
+    old = ctx.verdicts[op.indicator]
     start = _meta_cost(ctx.run_id)
     meta = load_json(ctx.run_id, META_FILE, RunMeta)   # настройки прогона — те же, что при разборе (2.7)
     new = run_verdicts(ctx.document_md, ctx.run_id, passport=ctx.passport, indicators=[op.indicator],
                        extra_instruction=op.clarification, trace_prefix=prefix, save=False,
-                       regions=meta.comparison_regions, search_limits=meta.search_limits)[0]
-    cost = _meta_cost(ctx.run_id) - start
+                       regions=meta.comparison_regions, search_limits=meta.search_limits,
+                       previous_evidence={op.indicator: previous})[0]
     if new.verdict == "ошибка":
         raise OperationError(f"перепроверка не удалась: {new.rationale[:300]}")
-    old = ctx.verdicts[op.indicator]
     checks_path = run_dir(ctx.run_id) / f"{prefix}{VERDICTS_DIR}/{op.indicator:02d}.checks.json"
-    return Candidate(op, new, f"{old.verdict}\n{points_text(old.rationale_brief, old.rationale)}",
-                     f"{new.verdict}\n{points_text(new.rationale_brief, new.rationale)}", cost,
-                     checks=checks_path.read_bytes() if checks_path.is_file() else None, cost_known=config.LLM_BACKEND == "claude")
+    checks = checks_path.read_bytes() if checks_path.is_file() else None
+    same_verdict = old.verdict == new.verdict
+    comparison = _compare_recheck(ctx, old, new, checks, prefix)
+    cost = _meta_cost(ctx.run_id) - start
+    note = comparison.explanation if comparison else "Не удалось автоматически сопоставить сведения. Проверьте результат вручную."
+    comparison_outcome = comparison.outcome if comparison else "неопределённо"
+    if not same_verdict:
+        note = f"Вердикт изменился: «{old.verdict}» → «{new.verdict}». {note}"
+        if comparison_outcome == "существенных изменений нет":
+            comparison_outcome = "неопределённо"
+    return Candidate(op, new, _journal_verdict(old), _journal_verdict(new), cost,
+                     checks=checks, cost_known=config.LLM_BACKEND == "claude",
+                     comparison=comparison_outcome,
+                     comparison_note=note)
+
+
+def _journal_verdict(verdict: Verdict) -> str:
+    """Обоснование и источники для текущего Excel; статус проверки не переоцениваем."""
+    parts = [f"Вердикт: {verdict.verdict}",
+             f"Обоснование в отчёте:\n{points_text(verdict.rationale_brief, verdict.rationale)}",
+             f"Полное обоснование:\n{verdict.rationale}"]
+    if verdict.missing_data:
+        parts.append(f"Не хватило данных:\n{verdict.missing_data}")
+    if verdict.clause:
+        parts.append(f"Пункт акта: {verdict.clause}")
+    if verdict.proof:
+        parts.append(f"Цитата:\n{verdict.proof}")
+    if verdict.sources:
+        parts.append("Источники:\n" + "\n".join(verdict.sources))
+    return "\n\n".join(parts)
 
 
 def _accept_recheck(ctx: _Ctx, cand: Candidate) -> Change:
     new: Verdict = cand.payload
-    before = _apply_verdict(ctx, new)
+    old = ctx.verdicts[new.indicator]
+    before = _journal_verdict(old)
+    _apply_verdict(ctx, new)
     if cand.checks is not None:   # таблица проверки — та, на которой стоит новый вердикт
-        save_bytes(ctx.run_id, f"{VERDICTS_DIR}/{new.indicator:02d}.checks.json", cand.checks)
-    return Change(f"Вердикты, инд. {new.indicator}", "вердикт перепроверен агентом индикатора", before, new.verdict)
+        ctx.checks[new.indicator] = cand.checks
+    return Change(f"Вердикты, инд. {new.indicator}", "вердикт перепроверен агентом индикатора",
+                  "Предыдущая проверка:\n" + before, "Новая проверка:\n" + _journal_verdict(new))
 
 
 # Цель записи журнала «гипотезы построены» — её читает и _run_gaps
@@ -492,6 +611,7 @@ _CODE_OPS: dict[str, Callable[[_Ctx, object], Change]] = {
     "смена вердикта": _set_verdict,
     "удалить строку карты": _delete_map_row,
     "добавить строку карты": _add_map_row,
+    "копировать строку карты": _copy_map_row,
     "слить строки карты": _merge_map_rows,
     "пометить: нигде не ведётся": _mark_not_tracked,
     "удалить позицию запроса": _delete_request_item,
@@ -529,6 +649,27 @@ def run_step(run_id: str, op: Operation) -> StepResult:
     return _commit(ctx, op, change, 0.0)
 
 
+def preview_plan(run_id: str, plan: list[Operation]) -> list[Change | None]:
+    """Показать последовательные правки в памяти, не меняя файлы прогона."""
+    state = versions.load_state(run_id)
+    if state is None:
+        return [None] * len(plan)
+    ctx = _load(run_id, state)
+    previews: list[Change | None] = []
+    known = True
+    for op in plan:
+        if not known or op.kind not in _CODE_OPS:
+            known = False
+            previews.append(None)
+            continue
+        try:
+            previews.append(_CODE_OPS[op.kind](ctx, op))
+        except (OperationError, ValueError):
+            known = False
+            previews.append(None)
+    return previews
+
+
 def accept(run_id: str, cand: Candidate) -> StepResult:
     """«Принять» кандидата операции с моделью — записать его и зафиксировать версию."""
     ctx = _load(run_id, versions.ensure_v0(run_id))
@@ -551,23 +692,39 @@ def rollback(run_id: str, n: int) -> StepResult:
     old = versions.version_state(run_id, n)
     if old is not None:
         ctx.state.marks = old.marks.model_copy(deep=True)
-    change = Change("Весь файл", f"возврат к версии {n}", f"версия {current}", f"как в версии {n}")
+    change = Change("Весь файл", f"возврат из версии {current} к содержимому версии {n}",
+                    f"версия {current}", f"как в версии {n}")
     return _commit(ctx, _Rollback(reason=f"возврат к версии {n}"), change, 0.0)
 
 
 def _commit(ctx: _Ctx, op: Operation, change: Change, cost: float, cost_known: bool = True) -> StepResult:
+    return _commit_plan(ctx, [(op, change, cost, cost_known)])
+
+
+def _commit_plan(ctx: _Ctx, changes: list[tuple[Operation, Change, float, bool]]) -> StepResult:
     run_id, state = ctx.run_id, ctx.state
     n = state.current + 1
-    entry = JournalEntry(version=n, at=datetime.datetime.now().isoformat(timespec="seconds"),
-                         kind=_JOURNAL_KIND.get(op.kind, "решение эксперта"), target=change.target,
-                         action=change.action, before=_short(change.before), after=_short(change.after),
-                         reason=op.reason, cost_usd=round(cost, 4), cost_known=cost_known)
+    entries = [JournalEntry(version=n, at=datetime.datetime.now().isoformat(timespec="seconds"),
+                            kind=_JOURNAL_KIND.get(op.kind, "решение эксперта"), target=change.target,
+                            action=change.action, before=change.before, after=change.after,
+                            reason=op.reason, cost_usd=round(cost, 4), cost_known=known)
+               for op, change, cost, known in changes]
     try:
+        existing = versions.read_journal(run_id)
+        incomplete = [e for e in existing if e.version == n]
+        if any(e.version > n for e in existing):
+            raise OperationError("журнал опережает текущую версию")
+        if incomplete:
+            if [e.model_dump(exclude={"at"}) for e in incomplete] != [e.model_dump(exclude={"at"}) for e in entries]:
+                raise OperationError("журнал незавершённой версии не совпадает с планом")
+            entries = incomplete
         for v in ctx.verdicts.values():
             save_json(run_id, f"{VERDICTS_DIR}/{v.indicator:02d}.json", v)
         buckets = sort_verdicts(list(ctx.verdicts.values()), run_id)
         for n_ind, hset in ctx.new_sets.items():
             save_json(run_id, f"{HYPOTHESES_DIR}/{n_ind:02d}.json", hset)
+        for n_ind, checks in ctx.checks.items():
+            save_bytes(run_id, f"{VERDICTS_DIR}/{n_ind:02d}.checks.json", checks)
         save_json(run_id, MAP_FILE, ctx.hyp_map)
         save_json(run_id, REQUEST_FILE, ctx.request)
         # Новая строка «проверка не завершена» получает номер из того же счётчика, что
@@ -577,17 +734,100 @@ def _commit(ctx: _Ctx, op: Operation, change: Change, cost: float, cost_known: b
                 state.unverified_ids[v.indicator] = _new_row_id(ctx)
         meta = load_json(run_id, META_FILE, RunMeta)
         analyzed = datetime.datetime.fromisoformat(meta.finished_at) if meta.finished_at else None
-        journal = versions.read_journal(run_id) + [entry]
+        journal = existing if incomplete else existing + entries
         excel = build_excel(ctx.hyp_map, ctx.request, buckets, ctx.passport, run_id, version=n,
                             journal=journal, marks=state.marks,
                             unverified_ids=state.unverified_ids, analyzed_at=analyzed,
                             act_types=meta.act_types, run_gaps=_run_gaps(run_id, journal))
-        versions.commit(run_id, state, [entry])
-        _refresh_progress(run_id, ctx, excel)
+        versions.commit(run_id, state, [] if incomplete else entries)
     except Exception:
         versions.restore(run_id, state.current)
         raise
-    return StepResult(version=n, change=change, cost_usd=cost, cost_known=cost_known)
+    warning = None
+    try:
+        _refresh_progress(run_id, ctx, excel)
+    except Exception as error:
+        log_event(run_id, "version_summary_refresh_failed", version=n, error=str(error)[:300])
+        warning = "Версия сохранена, но сводку на странице обновить не удалось. Проверьте скачанный файл."
+    return StepResult(version=n, change=changes[-1][1], cost_usd=sum(c for _, _, c, _ in changes),
+                      cost_known=all(known for _, _, _, known in changes), warning=warning)
+
+
+class PlanWork:
+    """Собрать принятые шаги в памяти и записать их одной версией."""
+
+    def __init__(self, run_id: str):
+        versions.recover(run_id)
+        self.ctx = _load(run_id, versions.ensure_v0(run_id))
+        self.changes: list[tuple[Operation, Change, float, bool]] = []
+
+    def _checkpoint(self) -> None:
+        data = {
+            "state": self.ctx.state.model_dump(mode="json"),
+            "verdicts": [v.model_dump(mode="json") for v in self.ctx.verdicts.values()],
+            "map": self.ctx.hyp_map.model_dump(mode="json"),
+            "request": self.ctx.request.model_dump(mode="json"),
+            "new_sets": {str(n): h.model_dump(mode="json") for n, h in self.ctx.new_sets.items()},
+            "checks": {str(n): base64.b64encode(data).decode("ascii") for n, data in self.ctx.checks.items()},
+            "changes": [{"operation": op.model_dump(mode="json"), "change": asdict(change),
+                         "cost": cost, "cost_known": known} for op, change, cost, known in self.changes],
+        }
+        save_json(self.ctx.run_id, "dialog/pending_plan.json", data)
+
+    def step(self, op: Operation) -> StepResult:
+        ctx = deepcopy(self.ctx)
+        if op.kind in _MODEL_OPS:
+            prefix = f"dialog/v{ctx.state.current + 1}-step{len(self.changes) + 1}/"
+            cand = _MODEL_OPS[op.kind][0](ctx, op, prefix)
+            return StepResult(version=None, candidate=cand, cost_usd=cand.cost_usd, cost_known=cand.cost_known)
+        change = _CODE_OPS[op.kind](ctx, op)
+        self.ctx = ctx
+        self.changes.append((op, change, 0.0, True))
+        self._checkpoint()
+        return StepResult(version=None, change=change)
+
+    def accept(self, cand: Candidate) -> StepResult:
+        ctx = deepcopy(self.ctx)
+        change = _MODEL_OPS[cand.op.kind][1](ctx, cand)
+        self.ctx = ctx
+        self.changes.append((cand.op, change, cand.cost_usd, cand.cost_known))
+        self._checkpoint()
+        return StepResult(version=None, change=change, cost_usd=cand.cost_usd, cost_known=cand.cost_known)
+
+    def commit(self) -> StepResult | None:
+        if not self.changes:
+            return None
+        result = _commit_plan(self.ctx, self.changes)
+        (run_dir(self.ctx.run_id) / "dialog/pending_plan.json").unlink(missing_ok=True)
+        return result
+
+
+def recover_pending_plan(run_id: str) -> int | None:
+    """После прерывания сохранить принятые шаги одной версией, без повторных вызовов модели."""
+    path = run_dir(run_id) / "dialog/pending_plan.json"
+    if not path.is_file():
+        return None
+    data = json.loads(path.read_text(encoding="utf-8"))
+    state = VersionState.model_validate(data["state"])
+    current = versions.load_state(run_id)
+    if current is None or current.current < state.current:
+        raise OperationError("не удалось восстановить версию прерванного плана")
+    if current.current > state.current:
+        path.unlink()
+        return current.current
+    versions.recover(run_id)
+    ctx = _load(run_id, state)
+    ctx.verdicts = {v.indicator: v for v in (Verdict.model_validate(item) for item in data["verdicts"])}
+    ctx.hyp_map = HypothesisMap.model_validate(data["map"])
+    ctx.request = DataRequest.model_validate(data["request"])
+    ctx.new_sets = {int(n): HypothesisSet.model_validate(h) for n, h in data["new_sets"].items()}
+    ctx.checks = {int(n): base64.b64decode(value) for n, value in data["checks"].items()}
+    adapter = TypeAdapter(Operation)
+    changes = [(adapter.validate_python(item["operation"]), Change(**item["change"]),
+                item["cost"], item["cost_known"]) for item in data["changes"]]
+    result = _commit_plan(ctx, changes)
+    path.unlink()
+    return result.version
 
 
 def _run_gaps(run_id: str, journal: list[JournalEntry]) -> set[int] | None:
@@ -605,10 +845,6 @@ def _run_gaps(run_id: str, journal: list[JournalEntry]) -> set[int] | None:
         return None
     built = {int(m.group(1)) for e in journal if (m := _BUILT_TARGET.fullmatch(e.target))}
     return gaps - built
-
-
-def _short(text: str | None, limit: int = 1500) -> str | None:
-    return text if text is None or len(text) <= limit else text[:limit] + "…"
 
 
 def _refresh_progress(run_id: str, ctx: _Ctx, excel) -> None:

@@ -189,7 +189,7 @@ class Verdict(BaseModel):
     missing_data: str | None = Field(
         default=None,
         description=(
-            "Только при вердикте «нет данных»: каких сведений не хватило для вывода. "
+            "Только при вердикте «нет данных»: каких сведений не хватило, что проверить и где, если источник известен; если не известен — укажи это. "
             "При других вердиктах — null."
         ),
     )
@@ -337,7 +337,7 @@ class Indicator01Output(BaseModel):
     missing_data: str | None = Field(
         default=None,
         description=(
-            "Только при вердикте «нет данных»: каких сведений не хватило для вывода. "
+            "Только при вердикте «нет данных»: каких сведений не хватило, что проверить и где, если источник известен; если не известен — укажи это. "
             "При других вердиктах — null."
         ),
     )
@@ -496,7 +496,7 @@ class Indicator02Output(BaseModel):
     missing_data: str | None = Field(
         default=None,
         description=(
-            "Только при вердикте «нет данных»: каких сведений не хватило для вывода. "
+            "Только при вердикте «нет данных»: каких сведений не хватило, что проверить и где, если источник известен; если не известен — укажи это. "
             "При других вердиктах — null."
         ),
     )
@@ -655,7 +655,7 @@ class Indicator03Output(BaseModel):
     missing_data: str | None = Field(
         default=None,
         description=(
-            "Только при вердикте «нет данных»: каких сведений не хватило для вывода. "
+            "Только при вердикте «нет данных»: каких сведений не хватило, что проверить и где, если источник известен; если не известен — укажи это. "
             "При других вердиктах — null."
         ),
     )
@@ -800,7 +800,7 @@ class Indicator04Output(BaseModel):
     missing_data: str | None = Field(
         default=None,
         description=(
-            "Только при вердикте «нет данных»: каких сведений не хватило для вывода. "
+            "Только при вердикте «нет данных»: каких сведений не хватило, что проверить и где, если источник известен; если не известен — укажи это. "
             "При других вердиктах — null."
         ),
     )
@@ -927,7 +927,7 @@ class Indicator05Output(BaseModel):
     missing_data: str | None = Field(
         default=None,
         description=(
-            "Только при вердикте «нет данных»: каких сведений не хватило для вывода. "
+            "Только при вердикте «нет данных»: каких сведений не хватило, что проверить и где, если источник известен; если не известен — укажи это. "
             "При других вердиктах — null."
         ),
     )
@@ -1854,7 +1854,8 @@ class Indicator11Output(BaseModel):
         default=None,
         description=(
             "При «нет данных» — какая правовая норма или необходимая часть сравнения не проверена и "
-            "почему. Это незавершённая правовая проверка, не отсутствие статистики практики. При "
+            "почему; что проверить и где, если источник известен, иначе укажи, что он неизвестен. "
+            "Это незавершённая правовая проверка, не отсутствие статистики практики. При "
             "других вердиктах — null."
         ),
     )
@@ -2473,7 +2474,7 @@ class MapRow(_Base):
     row_id: int = Field(
         ge=1,
         description=(
-            "Сквозной номер строки итоговой карты, с единицы, без пропусков. "
+            "Постоянный номер строки итоговой карты; после правок возможны пропуски и другой порядок. "
             "На него ссылается лист запроса показателей. Это НЕ номер исходной "
             "гипотезы из входа — те номера идут в merges и decisions."
         ),
@@ -2605,7 +2606,7 @@ class HypothesisMap(_Base):
     rows: list[MapRow] = Field(
         default_factory=list,
         description=(
-            "Строки карты по порядку row_id. Каждая исходная гипотеза либо стала "
+            "Строки карты в порядке отображения; номера строк уникальны. Каждая исходная гипотеза либо стала "
             "своей строкой дословно, либо вошла в слитую строку — третьего нет."
         ),
     )
@@ -2625,10 +2626,10 @@ class HypothesisMap(_Base):
 
     @model_validator(mode="after")
     def _check_consistency(self) -> "HypothesisMap":
-        """row_id уникальны и по возрастанию; слияния не пересекаются; решения «слить» ↔ слияния."""
+        """row_id уникальны; слияния не пересекаются; решения «слить» ↔ слияния."""
         ids = [r.row_id for r in self.rows]
-        if ids != sorted(set(ids)):
-            raise ValueError("row_id должны быть уникальны и идти по возрастанию")
+        if len(ids) != len(set(ids)):
+            raise ValueError("row_id должны быть уникальны")
         seen: set[int] = set()
         for m in self.merges:
             overlap = seen & set(m.merged_row_ids)
@@ -4032,13 +4033,33 @@ class AddMapRow(_Base):
     reason: str = _REASON
 
 
+class CopyMapRow(_Base):
+    """Копировать существующую строку сразу после оригинала по просьбе эксперта."""
+
+    kind: Literal["копировать строку карты"] = Field(description="Вид операции.")
+    row_id: int = Field(ge=1, description="Номер исходной строки. Копия получит новый номер.")
+    reason: str = _REASON
+
+
 class MergeMapRows(_Base):
     """Склейка строк карты по решению человека: одна проблема — одна строка."""
 
     kind: Literal["слить строки карты"] = Field(description="Вид операции.")
     row_ids: list[int] = Field(min_length=2, description="Номера сливаемых строк; остаётся строка с меньшим номером.")
-    hypothesis: str = Field(min_length=1, description="Одна формулировка, покрывающая все сливаемые строки.")
+    mode: Literal["без изменений", "новый текст"] = Field(
+        default="новый текст",
+        description="«без изменений» — сохранить видимые тексты строк; «новый текст» — применить предложенную формулировку.",
+    )
+    hypothesis: str | None = Field(
+        default=None, description="Новая формулировка только для режима «новый текст»; для «без изменений» — null.",
+    )
     reason: str = _REASON
+
+    @model_validator(mode="after")
+    def _merge_text(self) -> "MergeMapRows":
+        if self.mode == "новый текст" and not (self.hypothesis and self.hypothesis.strip()):
+            raise ValueError("для объединения с новой формулировкой нужен текст гипотезы")
+        return self
 
 
 class MarkNotTracked(_Base):
@@ -4110,7 +4131,7 @@ class AppendRequest(_Base):
 
 
 Operation = Union[
-    EditText, SetVerdict, DeleteMapRow, AddMapRow, MergeMapRows, MarkNotTracked,
+    EditText, SetVerdict, DeleteMapRow, AddMapRow, CopyMapRow, MergeMapRows, MarkNotTracked,
     DeleteRequestItem, SplitRequestItem, RecheckIndicator, BuildHypotheses, AppendRequest,
 ]
 
@@ -4337,6 +4358,7 @@ class CliSession(BaseModel):
 
     backend: Literal["claude", "codex"] = Field(default="claude", description="Движок сессии; старый файл относится к Claude.")
     model: str | None = Field(default=None, description="Модель, с которой начата сессия.")
+    context_revision: str | None = Field(default=None, description="Версия инструкции чата по результату.")
     token_reported: dict[str, int] | None = Field(default=None, description="Последние накопленные счётчики Codex для расчёта расхода следующего продолжения.")
     session_id: str = Field(description="Номер сессии CLI.")
     started: str = Field(description="Когда начата, время в ISO-формате.")
@@ -4383,6 +4405,7 @@ class GarantChatInfo(BaseModel):
     created_at: str = Field(description="Когда создана, время в ISO-формате.")
     created_by: str | None = Field(description="Метка сессии браузера создателя.")
     documents: list[GarantDocument] = Field(default_factory=list, description="Приложенные документы по порядку.")
+    next_document_number: int = Field(default=1, description="Следующий номер вложения; удалённые номера не переиспользуются.")
 
 
 class RunMeta(BaseModel):

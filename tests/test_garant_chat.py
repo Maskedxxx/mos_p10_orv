@@ -145,6 +145,72 @@ def test_unreadable_document_explained(chat, monkeypatch):
     assert garant_chat.chat_info(chat).documents == []
 
 
+def test_delete_one_document_preserves_other_and_starts_new_session(chat, monkeypatch):
+    monkeypatch.setattr(garant_chat, "convert_to_markdown", lambda path, rid: path.read_bytes().decode())
+    calls = _fake_calls(monkeypatch, _ok(GarantTurn(reply="Ответ до удаления")), _ok(GarantTurn(reply="После удаления")))
+    garant_chat.add_document(chat, "первый.docx", b"FIRST TEXT")
+    garant_chat.add_document(chat, "второй.pdf", b"SECOND TEXT")
+    garant_chat.turn(chat, "Сохранить историю")
+    root = garant_chat.run_dir(garant_chat.chat_run_id(chat))
+    assert (root / garant_chat.SESSION).exists()
+    garant_chat.remove_document(chat, 1)
+    assert [(d.n, d.name) for d in garant_chat.chat_info(chat).documents] == [(2, "второй.pdf")]
+    assert not (root / "docs/01.docx").exists() and not (root / "docs/01.md").exists()
+    assert (root / "docs/02.pdf").exists() and (root / "docs/02.md").exists()
+    assert not (root / garant_chat.SESSION).exists()
+    assert "FIRST TEXT" not in garant_chat.shared_context(chat)
+    assert "SECOND TEXT" in garant_chat.shared_context(chat)
+    garant_chat.turn(chat, "Следующий вопрос")
+    assert "resume_session_id" not in calls[-1]
+    assert "FIRST TEXT" not in calls[-1]["shared_context"]
+    assert "SECOND TEXT" in calls[-1]["shared_context"]
+    assert "Сохранить историю" in calls[-1]["document"]
+    garant_chat.add_document(chat, "третий.docx", b"THIRD TEXT")
+    assert [d.n for d in garant_chat.chat_info(chat).documents] == [2, 3]
+    garant_chat.remove_document(chat, 2)
+    garant_chat.remove_document(chat, 3)
+    garant_chat.add_document(chat, "четвёртый.docx", b"FOURTH TEXT")
+    assert [d.n for d in garant_chat.chat_info(chat).documents] == [4]
+
+
+def test_busy_or_missing_document_does_not_remove_other_files(chat, monkeypatch):
+    monkeypatch.setattr(garant_chat, "convert_to_markdown", lambda path, rid: path.read_bytes().decode())
+    garant_chat.add_document(chat, "первый.docx", b"first")
+    garant_chat.add_document(chat, "второй.docx", b"second")
+    root = garant_chat.run_dir(garant_chat.chat_run_id(chat))
+    garant_chat._set_busy(chat, "ищет")
+    try:
+        with pytest.raises(ValueError, match="уже выполняется"):
+            garant_chat.remove_document(chat, 1)
+    finally:
+        garant_chat._set_busy(chat, None)
+    with pytest.raises(ValueError, match="не найден"):
+        garant_chat.remove_document(chat, 99)
+    assert [d.n for d in garant_chat.chat_info(chat).documents] == [1, 2]
+    assert (root / "docs/01.md").read_text() == "first"
+    assert (root / "docs/02.md").read_text() == "second"
+
+
+def test_delete_failure_restores_selected_and_leaves_other(chat, monkeypatch):
+    from pathlib import Path
+    monkeypatch.setattr(garant_chat, "convert_to_markdown", lambda path, rid: path.read_bytes().decode())
+    garant_chat.add_document(chat, "первый.docx", b"first")
+    garant_chat.add_document(chat, "второй.docx", b"second")
+    root = garant_chat.run_dir(garant_chat.chat_run_id(chat))
+    original_unlink = Path.unlink
+    def fail_selected_text(path, *args, **kwargs):
+        if path == root / "docs/01.md":
+            raise OSError("test failure")
+        return original_unlink(path, *args, **kwargs)
+    monkeypatch.setattr(Path, "unlink", fail_selected_text)
+    with pytest.raises(ValueError, match="Не удалось удалить"):
+        garant_chat.remove_document(chat, 1)
+    assert [d.n for d in garant_chat.chat_info(chat).documents] == [1, 2]
+    assert (root / "docs/01.docx").read_bytes() == b"first"
+    assert (root / "docs/02.docx").read_bytes() == b"second"
+    assert "first" in garant_chat.shared_context(chat) and "second" in garant_chat.shared_context(chat)
+
+
 def test_file_contract_requires_matching_content():
     with pytest.raises(ValidationError):
         GarantFile(purpose="таблица", name="Т", format="xlsx", text="| a |")

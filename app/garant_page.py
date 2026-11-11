@@ -108,6 +108,7 @@ class _ChatView:
         self._rid = garant_chat.chat_run_id(chat_id)
         self._who = who
         self._shown = -1
+        self._shown_docs = None
         self._sending = False
         self._reading = False
         with ui.column().classes("w-full items-center p-6"):
@@ -115,15 +116,18 @@ class _ChatView:
                 with ui.row().classes("w-full items-baseline justify-between"):
                     self._title = ui.label("").classes("text-xl font-bold")
                     ui.link("Все беседы", "/garant").classes("text-sm text-primary")
-                self._docs = ui.label("").classes("text-sm text-gray-700")
+                self._docs = ui.column().classes("w-full gap-1")
                 with ui.row().classes("w-full items-center gap-3"):
                     # Сам загрузчик спрятан — файл выбирается кнопкой
                     self._upload = (
                         ui.upload(on_upload=self._on_upload, auto_upload=True, max_files=1,
+                                  on_begin_upload=lambda _: self._begin_upload(),
+                                  on_rejected=lambda _: self._upload_failed(),
                                   max_file_size=MAX_UPLOAD_BYTES)
                         .props(f'accept="{",".join(ACCEPTED_EXTENSIONS)}"')
                         .classes("hidden")
                     )
+                    self._upload.on("failed", lambda: self._upload_failed())
                     self._upload_button = ui.button("Приложить документ", icon="upload_file",
                                                     on_click=lambda: self._upload.run_method("pickFiles")).props(
                         "outline")
@@ -147,15 +151,15 @@ class _ChatView:
         info = garant_chat.chat_info(self._chat_id)
         self._title.set_text(info.title or "Новая беседа")
         docs = info.documents
-        self._docs.set_text("Документы: " + "; ".join(f"«{d.name}»" for d in docs) if docs
-                            else "Документ не приложен — можно спрашивать и без него.")
         chat = garant_chat.read_chat(self._chat_id)
         if len(chat) != self._shown:
             self._shown = len(chat)
             self._render_chat(chat)
         state = garant_chat.busy_state(self._chat_id)
-        if self._reading:
+        if self._reading or state == "читает документ":
             self._status.set_text("Читаю документ…")
+        elif state == "удаляет документ":
+            self._status.set_text("Удаляю документ…")
         elif state == "в очереди":
             self._status.set_text("Помощник ждёт очереди: сейчас отвечают в других беседах…")
         elif state == "ищет" or self._sending:
@@ -163,6 +167,19 @@ class _ChatView:
         else:
             self._status.set_text("")
         free = state is None and not self._sending and not self._reading
+        docs_key = (tuple((d.n, d.name) for d in docs), free)
+        if docs_key != self._shown_docs:
+            self._shown_docs = docs_key
+            self._docs.clear()
+            with self._docs:
+                if not docs:
+                    ui.label("Документ не приложен — можно спрашивать и без него.").classes("text-sm text-gray-700")
+                for document in docs:
+                    with ui.row().classes("w-full items-center gap-2"):
+                        ui.label(f"Документ «{document.name}»").classes("text-sm text-gray-700")
+                        button = ui.button("Удалить", icon="delete_outline",
+                                           on_click=lambda d=document: self._confirm_remove(d)).props("flat dense")
+                        button.set_enabled(free)
         for element in (self._send, self._upload_button):
             element.set_enabled(free)
 
@@ -170,6 +187,15 @@ class _ChatView:
         left = (await nicegui_run.io_bound(garant_limits.limits) or {}).get(garant_limits.EXPORT)
         self._limits.set_text(f"Выгрузок полного текста из Гаранта осталось в этом месяце: {left} (на всех)"
                               if left is not None else "Остаток выгрузок Гаранта узнать не удалось")
+
+    def _begin_upload(self) -> None:
+        self._reading = True
+        self._tick()
+
+    def _upload_failed(self) -> None:
+        self._reading = False
+        self._tick()
+        ui.notify("Не удалось загрузить документ. Проверьте формат и размер файла.", type="negative")
 
     def _render_chat(self, chat: list[dict]) -> None:
         self._chat.clear()
@@ -208,11 +234,12 @@ class _ChatView:
         if not text:
             ui.notify("Напишите сообщение", type="warning")
             return
-        if self._sending or garant_chat.busy_state(self._chat_id) is not None:
+        if self._sending or self._reading or garant_chat.busy_state(self._chat_id) is not None:
             ui.notify("Помощник ещё отвечает — дождитесь ответа", type="warning")
             return
         self._sending = True
         self._input.set_value("")
+        self._tick()
         log_action(self._who, "Гарант-помощник: сообщение", self._rid, chars=len(text))
         try:
             await nicegui_run.io_bound(garant_chat.turn, self._chat_id, text, session=self._who.session)
@@ -229,9 +256,12 @@ class _ChatView:
         if error is not None:
             ui.notify(error, type="negative")
             self._upload.reset()
+            self._reading = False
+            self._tick()
             return
         data = await event.file.read()
         self._reading = True
+        self._tick()
         log_action(self._who, "Гарант-помощник: документ", self._rid, file=name, size=len(data))
         try:
             chars = await nicegui_run.io_bound(garant_chat.add_document, self._chat_id, name, data,
@@ -242,6 +272,32 @@ class _ChatView:
         finally:
             self._reading = False
             self._upload.reset()
+
+    def _confirm_remove(self, document) -> None:
+        if self._reading or self._sending or garant_chat.busy_state(self._chat_id) is not None:
+            ui.notify("Дождитесь завершения текущего действия.", type="warning")
+            return
+        with ui.dialog() as box, ui.card():
+            ui.label(f"Удалить документ «{document.name}»?").classes("text-lg font-medium")
+            ui.label("Документ и его текст будут убраны из вложений. История сообщений останется и может содержать цитаты.")\
+                .classes("text-sm text-gray-700")
+            with ui.row().classes("justify-end gap-2"):
+                ui.button("Отмена", on_click=box.close).props("flat")
+                ui.button("Удалить", on_click=lambda: self._remove_document(document.n, box)).props("unelevated")
+        box.open()
+
+    def _remove_document(self, number: int, box: ui.dialog) -> None:
+        box.close()
+        if self._reading or self._sending:
+            ui.notify("Дождитесь завершения текущего действия.", type="warning")
+            return
+        try:
+            garant_chat.remove_document(self._chat_id, number, self._who.session)
+        except ValueError as error:
+            ui.notify(str(error), type="warning")
+            return
+        log_action(self._who, "Гарант-помощник: удалён документ", self._rid, number=number)
+        self._tick()
 
     def _download(self, name: str) -> None:
         path = garant_chat.file_path(self._chat_id, name)

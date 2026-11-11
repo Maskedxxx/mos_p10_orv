@@ -67,6 +67,7 @@ import time
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
 from typing import Literal
 
@@ -395,7 +396,7 @@ def panel_state(chat: list[ChatEntry], status: DialogStatus | None, editable: bo
                           "примените или отмените план ниже; новое сообщение отменит план")
     if chat and chat[-1].mark in ("сбой", "частично"):
         return PanelState("сбой", shorten(chat[-1].text.splitlines()[0], 160), f"файл — {version_label(version)}")
-    return PanelState("готово", "Готово", f"Файл — {version_label(version)}. Можно спрашивать или давать правки")
+    return PanelState("готово", "Готово", f"Файл — {version_label(version)}")
 
 
 # ======================================================================
@@ -458,6 +459,39 @@ def _layout(who: Who) -> None:
     раздел «Гарант-помощник» — беседы с агентом по Гаранту (app/garant_page.py); выход — в шапке.
     """
     ui.page_title("Платформа ОРВ · П-10")
+    ui.add_head_html("""
+    <style>
+      #p10-navigation-progress { position: fixed; top: 0; left: 0; width: 100%; padding: 8px;
+        color: white; text-align: center; background: #1f4e78; z-index: 99999; }
+    </style>
+    <script>
+      if (!window.p10NavigationProgress) {
+        window.p10NavigationProgress = true;
+        const showProgress = () => {
+          if (document.getElementById('p10-navigation-progress')) return;
+          const bar = document.createElement('div');
+          bar.id = 'p10-navigation-progress';
+          bar.textContent = 'Открываем страницу…';
+          document.body.appendChild(bar);
+        };
+        document.addEventListener('click', event => {
+          const link = event.target.closest('a[href]');
+          if (!link || event.defaultPrevented || event.button !== 0 || event.ctrlKey || event.metaKey ||
+              event.shiftKey || event.altKey || link.hasAttribute('download') ||
+              (link.target && link.target !== '_self')) return;
+          const url = new URL(link.href, location.href);
+          if (url.origin !== location.origin || url.href === location.href ||
+              (url.pathname === location.pathname && url.search === location.search)) return;
+          event.preventDefault();
+          event.stopPropagation();
+          showProgress();
+          requestAnimationFrame(() => setTimeout(() => location.assign(url.href), 0));
+        }, true);
+        window.addEventListener('beforeunload', showProgress);
+        window.addEventListener('pageshow', () => document.getElementById('p10-navigation-progress')?.remove());
+      }
+    </script>
+    """)
     # Адрес страницы — для замечания о проблеме (23.10) и для выделения текущего раздела в меню (27.10)
     path = ui.context.client.request.url.path if ui.context.client.request is not None else ""
     # Шапка по «типовой странице» брендбука (27.10): слева эмблемы Комплекса и ДЭПиР, справа название
@@ -563,6 +597,9 @@ class _RunView:
     def __init__(self, run_id: str, who: Who) -> None:
         self._run_id = run_id
         self._who = who
+        self._client_id = ui.context.client.id
+        self._requires_edit_lock = False
+        self._close_button = None
         self._built = False
         self._finished = False
         self._shown: dict[str, NodeStatus] = {}  # последнее отрисованное состояние
@@ -654,7 +691,7 @@ class _RunView:
         """Две ветки гипотез отдельно — видно, что считаются одновременно."""
         with self._sub_block():
             with ui.row().classes("flex-nowrap gap-6"):
-                for branch, title in (("violated", "ветка нарушений"), ("no_data", "ветка пробелов")):
+                for branch, title in (("violated", "по нарушениям"), ("no_data", "при недостатке данных")):
                     with ui.row().classes("items-center flex-nowrap gap-2"):
                         self._icons[f"br:{branch}"] = ui.element("div").classes("w-4 flex justify-center")
                         ui.label(title).classes("text-sm text-gray-700")
@@ -728,13 +765,16 @@ class _RunView:
             self._graph.move(steps)
         with self._result:
             self._card_box = ui.column().classes("w-full")
-        self._draw_result(progress)
         reason = dialog_unavailable(self._run_id, progress)
+        self._requires_edit_lock = reason is None
+        self._draw_result(progress)
         with self._result:
             if reason is None:
                 _DialogView(self._run_id, on_version=self._refresh_result, who=self._who)
             elif progress.status == "готов":
                 ui.label(reason).classes("text-sm text-gray-600")
+        self._update_close_access()
+        ui.timer(DIALOG_POLL_S, self._update_close_access)
 
     def _refresh_result(self) -> None:
         """Новая версия файла: сводка и кнопка скачивания — по текущей версии."""
@@ -751,6 +791,7 @@ class _RunView:
         act = read_act_filename(self._run_id, progress)
         is_ok = progress.status == "готов"
 
+        self._close_button = None
         self._card_box.clear()
         with self._card_box, ui.card().classes("w-full p-0"):
             with ui.row().classes("w-full items-center flex-nowrap gap-3 p-5"):
@@ -772,6 +813,7 @@ class _RunView:
 
                 summary = progress.summary
                 if summary is not None:
+                    ui.label("Индикаторы").classes("text-sm font-medium")
                     with ui.row().classes("gap-10"):
                         for field, caption in _SUMMARY_COUNTERS:
                             with ui.column().classes("items-center gap-0"):
@@ -801,10 +843,21 @@ class _RunView:
                 # Конец сессии (2.7): открыта — кнопка с подтверждением; закрыта — как продолжить, сказано
                 # над чатом (27.10: одна строка вместо двух одинаковых)
                 if not sessions.is_closed(self._run_id):
-                    ui.button("Завершить работу", icon="task_alt", on_click=self._confirm_close).props("outline")
+                    self._close_button = ui.button("Завершить работу", icon="task_alt", on_click=self._confirm_close).props("outline")
+                    self._update_close_access()
+
+    def _can_close(self) -> bool:
+        return not self._requires_edit_lock or DIALOG_LOCK.owned_by(self._run_id, self._client_id, time.monotonic())
+
+    def _update_close_access(self) -> None:
+        if self._close_button is not None:
+            self._close_button.enable() if self._can_close() else self._close_button.disable()
 
     def _confirm_close(self) -> None:
         """Подтверждение конца сессии: закрытие нельзя отменить — поэтому спрашиваем."""
+        if not self._can_close():
+            ui.notify(DIALOG_READ_ONLY, type="warning")
+            return
         with ui.dialog() as box, ui.card():
             ui.label("Завершить работу с актом?").classes("text-lg font-medium")
             ui.label("Сессия закроется. Продолжить можно в любой момент: откройте прогон из истории и напишите "
@@ -817,6 +870,9 @@ class _RunView:
 
     def _close(self, box: ui.dialog) -> None:
         box.close()
+        if not self._can_close():
+            ui.notify(DIALOG_READ_ONLY, type="warning")
+            return
         error = close_by_user(self._who, self._run_id)
         if error is not None:
             ui.notify(error, type="warning")
@@ -855,6 +911,10 @@ class _DialogView:
     _STATE_ROW = "w-full items-center flex-nowrap gap-3 px-4 py-3 rounded"
 
     def __init__(self, run_id: str, on_version: Callable[[], None], who: Who) -> None:
+        recovered = operations.recover_pending_plan(run_id) if not DIALOG_JOBS.busy(run_id) else None
+        if recovered is not None:
+            dialog.clear_status(run_id)
+            dialog.append_chat(run_id, "сервис", f"Прерванный план восстановлен: принятые шаги сохранены в версии {recovered}.", mark="частично")
         self._run_id = run_id
         self._on_version = on_version
         self._who = who                              # сессия браузера — в журнал действий и строки чата
@@ -862,6 +922,7 @@ class _DialogView:
         self._client_id = self._client.id
         self._editable: bool | None = None
         self._disconnected = False                  # окно было подключено и отключилось (закрыто, перезагружается)
+        self._uploading = False
         self._shown_chat = -1                       # сколько реплик отрисовано
         self._shown_tone: tuple | None = None       # (тон, заголовок) строки состояния
         self._shown_pending: tuple | None = None    # от чего зависит карточка плана или решения
@@ -877,9 +938,8 @@ class _DialogView:
             ui.separator()
             with ui.column().classes("w-full p-5 gap-3"):
                 ui.label(
-                    "Спросите, почему такой вердикт или откуда гипотеза; попросите поправить текст; "
-                    "передайте решение эксперта или загрузите его заполненный файл. Каждое изменение — "
-                    "новая версия Excel, исходная остаётся."
+                    "Задайте вопрос о результате или попросите изменить его. Помощник покажет план; "
+                    "после применения появится новая версия Excel. К предыдущей версии можно вернуться."
                 ).classes("text-sm text-gray-700")
                 # Строка состояния — всегда одна: что происходит и что делать
                 with ui.row().classes(self._STATE_ROW) as self._state_row:
@@ -907,10 +967,13 @@ class _DialogView:
                     # Сам загрузчик спрятан — файл выбирается кнопкой, так панель не распухает
                     self._upload = (
                         ui.upload(on_upload=self._on_expert_file, auto_upload=True, max_files=1,
+                                  on_begin_upload=lambda _: self._begin_expert_upload(),
+                                  on_rejected=lambda _: self._end_expert_upload(),
                                   max_file_size=MAX_UPLOAD_BYTES)
                         .props('accept=".xlsx"')
                         .classes("hidden")
                     )
+                    self._upload.on("failed", lambda: self._end_expert_upload())
                     self._upload_button = ui.button(
                         "Загрузить файл эксперта", icon="upload_file",
                         on_click=lambda: self._upload.run_method("pickFiles"),
@@ -946,7 +1009,7 @@ class _DialogView:
         self._editable = DIALOG_LOCK.acquire(rid, self._client_id, time.monotonic())
         _RunView._set_text(self._lock_note, closed if closed is not None and self._editable else DIALOG_READ_ONLY)
         chat = dialog.read_chat(rid)
-        busy = DIALOG_JOBS.busy(rid)
+        busy = DIALOG_JOBS.busy(rid) or self._uploading
         waiting = DIALOG_JOBS.waiting(rid)
         current = current_version(rid)
 
@@ -1002,7 +1065,7 @@ class _DialogView:
         left = progress is not None and progress[0] < progress[1]
         self._next.set_visibility(left)
         if left:
-            _RunView._set_text(self._next, f"Следующее замечание эксперта ({progress[0] + 1} из {progress[1]})")
+            _RunView._set_text(self._next, f"Разобрать следующее замечание ({progress[0] + 1} из {progress[1]})")
 
     def _render_chat(self, chat: list[ChatEntry]) -> None:
         # 27.10 (удобство): пустой чат — низкое поле, с перепиской — прежняя высота
@@ -1010,7 +1073,7 @@ class _DialogView:
         self._chat.clear()
         with self._chat:
             if not chat:
-                ui.label("Здесь будет переписка с помощником.").classes("text-sm text-gray-500 p-2")
+                ui.label("Переписка появится здесь. Введите вопрос в поле ниже.").classes("text-sm text-gray-500 p-2")
             for message in chat:
                 if message.role == "сервис":
                     icon, color = self._MARKS.get(message.mark, ("info", "grey-6"))
@@ -1044,12 +1107,20 @@ class _DialogView:
         plan = [] if busy else pending_plan(chat)
         if not plan:
             return
+        previews = operations.preview_plan(self._run_id, plan)
         with self._pending, ui.card().classes("w-full p-4 gap-2 border-l-4 border-amber-400"):
             ui.label(f"План: {len(plan)} {plural(len(plan), 'шаг', 'шага', 'шагов')}").classes("font-medium")
             for number, op in enumerate(plan, 1):
-                with ui.row().classes("w-full flex-nowrap items-start gap-3"):
-                    ui.label(f"{number}. {op_title(op)}").classes("text-sm flex-grow whitespace-pre-line")
-                    ui.label(agent_note(op)).classes("text-xs text-gray-600 whitespace-nowrap")
+                with ui.column().classes("w-full gap-1 py-2 border-b"):
+                    ui.label(f"{number}. {op_title(op)}").classes("text-sm whitespace-pre-line")
+                    if op.kind in ("правка текста", "слить строки карты"):
+                        change = previews[number - 1]
+                        if change is not None:
+                            ui.label(f"Было: {change.before or '—'}").classes("text-sm whitespace-pre-line")
+                            ui.label(f"Станет: {change.after or '—'}").classes("text-sm whitespace-pre-line")
+                        else:
+                            ui.label("Исходный текст появится после выполнения предыдущего шага плана.").classes("text-xs text-gray-600")
+                    ui.label(agent_note(op)).classes("text-xs text-gray-600")
             if any(operations.is_model_op(op) for op in plan):
                 ui.label("По шагам агента «было — стало» покажу до записи.").classes("text-xs text-gray-600")
             if self._editable:
@@ -1063,9 +1134,11 @@ class _DialogView:
             ui.label(
                 "Агент отработал. В файл запишется только после «Принять»."
             ).classes("text-xs text-gray-600")
-            with ui.row().classes("w-full flex-nowrap gap-4 items-start"):
+            if candidate.comparison_note:
+                ui.label(f"Сравнение проверки: {candidate.comparison_note}").classes("text-sm whitespace-pre-line")
+            with ui.column().classes("w-full gap-3"):
                 for caption, text in (("Было", candidate.before), ("Стало", candidate.after)):
-                    with ui.column().classes("w-1/2 gap-1"):
+                    with ui.column().classes("w-full gap-1 p-3 bg-gray-50 rounded"):
                         ui.label(caption).classes("text-xs uppercase text-gray-500")
                         ui.label(text).classes("text-sm whitespace-pre-line")
             if self._editable:
@@ -1105,6 +1178,8 @@ class _DialogView:
                 ui.notify("Уже идёт другое действие — дождитесь его конца", type="warning")
             else:
                 job.close()
+        else:
+            dialog.set_status(self._run_id, "шаг", "Выполняю действие…", "Пожалуйста, подождите")
         self._tick()
 
     def _decide(self, accepted: bool) -> None:
@@ -1152,7 +1227,27 @@ class _DialogView:
             DIALOG_JOBS.cancel_plan(self._run_id, self._who.session)
         self._tick()
 
+    def _begin_expert_upload(self) -> None:
+        if not self._editable or DIALOG_JOBS.busy(self._run_id):
+            return
+        self._uploading = True
+        dialog.set_status(self._run_id, "шаг", "Загружаю файл эксперта…", "Пожалуйста, подождите")
+        self._tick()
+
+    def _end_expert_upload(self) -> None:
+        if not self._uploading:
+            return
+        self._uploading = False
+        dialog.clear_status(self._run_id)
+        self._tick()
+
     async def _on_expert_file(self, event: UploadEventArguments) -> None:
+        try:
+            await self._handle_expert_file(event)
+        finally:
+            self._end_expert_upload()
+
+    async def _handle_expert_file(self, event: UploadEventArguments) -> None:
         """Файл эксперта: замечания — в очередь, согласия и оценки без текста — сводкой в чат."""
         name = Path(event.file.name).name
         data = await event.file.read()
@@ -1162,19 +1257,19 @@ class _DialogView:
         if not name.lower().endswith(".xlsx"):
             ui.notify("Нужен заполненный экспертом Excel этого прогона (.xlsx)", type="warning")
             return
-        relname = f"dialog/expert/{name}"
-        trace.save_bytes(self._run_id, relname, data)
         try:
-            remarks = feedback.read_remarks(trace.run_dir(self._run_id) / relname)
+            remarks = feedback.read_remarks(BytesIO(data))
         except Exception as error:
             ui.notify(f"Файл не разобран: {error}", type="negative")
             return
+        relname = f"dialog/expert/{name}"
+        trace.save_bytes(self._run_id, relname, data)
         queued = [r for r in remarks if feedback.is_queued(r)]
         dialog.save_remarks(self._run_id, name, queued)
         n = len(queued)
         log_action(self._who, "файл эксперта", self._run_id, file=name, queued=n)
         text = (f"Загружен файл эксперта «{name}»: в очереди {n} {plural(n, 'замечание', 'замечания', 'замечаний')} "
-                "(несогласия и замечания с текстом). Разбор по одному — кнопка «Следующее замечание эксперта».")
+                "(несогласия, предложенные вердикты и замечания). Разбор по одному — кнопка «Разобрать следующее замечание».")
         summary = feedback.summary(remarks)
         dialog.append_chat(self._run_id, "сервис", text + (f"\n{summary}" if summary else ""), session=self._who.session)
         self._tick()
@@ -1325,7 +1420,7 @@ def page_index(request: Request) -> None:
                 "через двенадцать индикаторов эффективного регулирования и соберёт Excel "
                 "с картой гипотез и запросом показателей в орган-разработчик."
             ).classes("text-sm text-gray-700")
-            ui.label("Прогон занимает около семи минут.").classes("text-sm text-gray-600")
+            ui.label("Время разбора зависит от документа и нагрузки сервиса.").classes("text-sm text-gray-600")
 
             upload = (
                 ui.upload(

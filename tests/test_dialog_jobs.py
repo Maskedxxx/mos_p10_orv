@@ -39,7 +39,7 @@ def test_op_title_is_human_readable():
     assert t == "Сменить вердикт индикатора 7 на «нарушен»: 15 форм"
     t = dialog_jobs.op_title(EditText(kind="правка текста", sheet="строка карты", key="3", field="гипотеза",
                               new_text="коротко", reason="вода"))
-    assert t == "Поправить текст — строка карты 3, поле «гипотеза»: «коротко»"
+    assert t == "Поправить текст — строка карты 3, колонка «Гипотеза»: «коротко»"
     assert dialog_jobs.op_title(DeleteMapRow(kind="удалить строку карты", row_id=4, reason="x")) == "Удалить строку карты 4"
     assert "агентом запроса" in dialog_jobs.op_title(AppendRequest(kind="дополнить запрос", row_ids=[8, 9], reason="x"))
 
@@ -48,7 +48,7 @@ def test_op_title_for_every_operation_kind():
     """15.10 (код-ревью): у каждого вида операции диалога есть подпись — иначе карточка плана падает и шаг из
     интерфейса не применить (так было с «пометить: нигде не ведётся»). Новый вид без образца здесь — тест красный."""
     import typing
-    from app.contracts import (AddMapRow, DataItemOutput, DeleteRequestItem, Effect, MarkNotTracked, MergeMapRows,
+    from app.contracts import (AddMapRow, CopyMapRow, DataItemOutput, DeleteRequestItem, Effect, MarkNotTracked, MergeMapRows,
                                Operation, SplitPart, SplitRequestItem)
     effect = Effect(affected="бизнес", metric="издержки, руб.", how_to_calculate="сумма", expected_trend="рост")
     samples = [
@@ -65,6 +65,7 @@ def test_op_title_for_every_operation_kind():
         RecheckIndicator(kind="перепроверить индикатор", indicator=3, clarification="проверь приказы", reason="x"),
         BuildHypotheses(kind="построить гипотезы", indicator=7, reason="x"),
         AppendRequest(kind="дополнить запрос", row_ids=[8, 9], reason="x"),
+        CopyMapRow(kind="копировать строку карты", row_id=2, reason="x"),
     ]
     kinds = {typing.get_args(m.model_fields["kind"].annotation)[0] for m in typing.get_args(Operation)}
     assert {op.kind for op in samples} == kinds
@@ -127,14 +128,14 @@ def test_dialog_jobs_plan_waits_for_decision_on_server(tmp_runs_dir, monkeypatch
     from test_versions import _write_run
     rid = "20260925_130000_ffffff"
     _write_run(rid)
+    trace.save_json(rid, "meta.json", RunMeta(run_id=rid, act_filename="a.docx", started_at="2026-09-25T13:00:00", status="finished"))
     edit = EditText(kind="правка текста", sheet="строка карты", key="1", field="гипотеза", new_text="к", reason="в")
     recheck = RecheckIndicator(kind="перепроверить индикатор", indicator=3, clarification="c", reason="r")
     cand = Candidate(recheck, None, "соблюдён — старое", "нарушен — новое", 1.5)
-    monkeypatch.setattr(web.operations, "run_step", lambda run_id, op: (
-        StepResult(version=None, candidate=cand, cost_usd=1.5) if op is recheck
-        else StepResult(version=1, change=Change("Карта гипотез, стр. 1", "переформулировано", "а", "к"))))
-    monkeypatch.setattr(web.operations, "accept", lambda run_id, c: StepResult(
-        version=2, change=Change("Вердикты, инд. 3", "перепроверен", "соблюдён", "нарушен"), cost_usd=1.5))
+    monkeypatch.setitem(web.operations._MODEL_OPS, "перепроверить индикатор", (
+        lambda ctx, op, prefix: cand,
+        lambda ctx, candidate: Change("Вердикты, инд. 3", "перепроверен", "соблюдён", "нарушен"),
+    ))
 
     async def scenario():
         jobs = dialog_jobs.DialogJobs()
@@ -154,6 +155,8 @@ def test_dialog_jobs_plan_waits_for_decision_on_server(tmp_runs_dir, monkeypatch
     assert chat[-1].text.startswith("Готово: план применён (2 из 2 шагов)")
     assert sum(m.cost_usd or 0.0 for m in chat) == pytest.approx(1.5)   # стоимость записана (на экран не идёт)
     assert dialog.read_status(rid) is None
+    assert web.versions.load_state(rid).current == 1
+    assert [e.version for e in web.versions.read_journal(rid)] == [1, 1]
 
 
 def test_dialog_jobs_failure_stops_plan_with_reason(tmp_runs_dir, monkeypatch):
@@ -163,11 +166,6 @@ def test_dialog_jobs_failure_stops_plan_with_reason(tmp_runs_dir, monkeypatch):
     _write_run(rid)
     edit = EditText(kind="правка текста", sheet="строка карты", key="9", field="гипотеза", new_text="к", reason="в")
 
-    def boom(run_id, op):
-        raise web.operations.OperationError("строки 9 нет")
-
-    monkeypatch.setattr(web.operations, "run_step", boom)
-
     async def scenario():
         jobs = dialog_jobs.DialogJobs()
         jobs.start(rid, jobs.apply_plan(rid, [edit, edit]))
@@ -176,8 +174,54 @@ def test_dialog_jobs_failure_stops_plan_with_reason(tmp_runs_dir, monkeypatch):
     asyncio.run(scenario())
     chat = dialog.read_chat(rid)
     assert [m.mark for m in chat] == [None, "сбой"]
-    assert chat[-1].text == "План не применён: шаг 1 не выполнен — строки 9 нет. Файл не изменён (версия 0)."
+    assert chat[-1].text == "План не применён: шаг 1 не выполнен — строки карты 9 нет. Файл не изменён (версия 0)."
     assert dialog.read_status(rid) is None
+
+
+def test_partial_plan_saves_accepted_steps_in_one_version(tmp_runs_dir):
+    from app import dialog
+    from test_versions import _write_run
+    rid = "20260925_130000_hhhhhh"
+    _write_run(rid)
+    trace.save_json(rid, "meta.json", RunMeta(run_id=rid, act_filename="a.docx", started_at="2026-09-25T13:00:00", status="finished"))
+    edits = [EditText(kind="правка текста", sheet="строка карты", key="1", field="гипотеза", new_text=t, reason="в") for t in ("первое", "второе")]
+    edits.append(EditText(kind="правка текста", sheet="строка карты", key="9", field="гипотеза", new_text="нет", reason="в"))
+
+    async def scenario():
+        jobs = dialog_jobs.DialogJobs()
+        jobs.start(rid, jobs.apply_plan(rid, edits))
+        await _wait(lambda: not jobs.busy(rid))
+
+    asyncio.run(scenario())
+    assert web.versions.load_state(rid).current == 1
+    assert [e.version for e in web.versions.read_journal(rid)] == [1, 1]
+    assert trace.load_json(rid, "06_map.json", web.operations.HypothesisMap).rows[0].hypothesis_brief == ["второе"]
+    assert "План применён частично" in dialog.read_chat(rid)[-1].text
+
+
+def test_recheck_without_new_information_does_not_offer_change(tmp_runs_dir, monkeypatch):
+    from app import dialog
+    from app.operations import Candidate
+    from test_versions import _write_run
+    rid = "20260925_130000_iiiiii"
+    _write_run(rid)
+    op = RecheckIndicator(kind="перепроверить индикатор", indicator=3, clarification="источник", reason="эксперт")
+    cand = Candidate(op, None, "нет данных", "нет данных", 0.0,
+                     comparison="существенных изменений нет", comparison_note="Новых фактов в источнике нет.")
+    monkeypatch.setitem(web.operations._MODEL_OPS, "перепроверить индикатор", (
+        lambda ctx, request, prefix: cand, lambda ctx, candidate: None,
+    ))
+
+    async def scenario():
+        jobs = dialog_jobs.DialogJobs()
+        jobs.start(rid, jobs.apply_plan(rid, [op]))
+        await _wait(lambda: not jobs.busy(rid))
+        assert jobs.waiting(rid) is None
+
+    asyncio.run(scenario())
+    assert web.versions.load_state(rid).current == 0
+    assert any("Новых фактов в источнике нет" in x.text for x in dialog.read_chat(rid))
+    assert "без изменений" in dialog.read_chat(rid)[-1].text
 
 
 def _ready_run(rid: str, status: str = "готов") -> RunProgress:

@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import re
+from io import BytesIO
 from pathlib import Path
 
 from openpyxl import load_workbook
@@ -68,7 +69,7 @@ def _text(value) -> str:
     return "" if value is None else str(value).strip()
 
 
-def read_remarks(path: Path) -> list[Remark]:
+def read_remarks(path: Path | BytesIO) -> list[Remark]:
     """Все строки трёх листов, где эксперт что-то заполнил, — по порядку листов и строк."""
     wb = load_workbook(path)
     remarks = []
@@ -84,23 +85,31 @@ def read_remarks(path: Path) -> list[Remark]:
             get = lambda name: _text(ws.cell(r, cols[name]).value) if name in cols else ""   # noqa: E731
             agree, correct, score, text = get(_AGREE), get(_CORRECT), get(_SCORE), get(_TEXT)
             where = get(_WHERE)
+            key, title = get(key_col), get(title_col)
+            location = f"лист «{sheet}», строка {r}" + (f", индикатор «{key}»" if sheet == SHEET_VERDICTS and key else "")
+            agree = agree.casefold()
+            if agree and agree not in ("да", "нет"):
+                cell = ws.cell(r, cols[_AGREE]).coordinate
+                raise ValueError(f"{location}, ячейка {cell}, колонка «{_AGREE}»: выберите «да» или «нет» либо оставьте пустой")
+            if score and score not in ("1", "2", "3", "4", "5"):
+                cell = ws.cell(r, cols[_SCORE]).coordinate
+                raise ValueError(f"{location}, ячейка {cell}, колонка «{_SCORE}»: укажите целое число от 1 до 5 либо оставьте пустой")
             if not (agree or correct or score or text or where):
                 continue
-            key, title = get(key_col), get(title_col)
             if sheet == SHEET_VERDICTS:   # «1. межведомственное взаимодействие»
                 m = re.match(r"(\d+)\.\s*(.*)", key, re.S)
                 key, title = (m.group(1), m.group(2)) if m else (key, key)
             if len(title) > _TITLE_LEN:
                 title = title[:_TITLE_LEN].rstrip() + "…"
             remarks.append(Remark(sheet=sheet, key=key, title=title, agree=agree or None, correct=correct or None,
-                                  score=int(score) if score.isdigit() else None, text=text,
+                                  score=int(score) if score else None, text=text,
                                   where_to_search=where or None))
     return remarks
 
 
 def is_queued(r: Remark) -> bool:
-    """В очередь диалога: «Согласны? = нет», заполненное «Замечание» или (2.7) «Где искать»."""
-    return r.agree == "нет" or bool(r.text) or bool(r.where_to_search)
+    """В очередь: несогласие, предложенный вердикт, замечание или подсказка поиска."""
+    return r.agree == "нет" or bool(r.correct) or bool(r.text) or bool(r.where_to_search)
 
 
 def summary(remarks: list[Remark]) -> str:
@@ -141,4 +150,4 @@ def remark_message(r: Remark) -> str:
     if r.where_to_search:
         # 2.7 (В): подсказка эксперта — повод перепроверить индикатор с ней (промпт диалога)
         parts.append(f"Индикатор {r.key}: эксперт подсказал, где искать: {r.where_to_search}")
-    return " ".join(parts)
+    return "\n".join(parts)

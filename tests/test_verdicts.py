@@ -319,6 +319,22 @@ def test_extra_instruction_appended_as_block(run_id, tmp_prompts_dir, monkeypatc
     assert extended.rstrip().endswith("</уточнение_задачи>")
 
 
+def test_previous_check_is_given_only_to_the_rechecked_indicator(run_id, tmp_prompts_dir, monkeypatch):
+    """Прошлые сведения относятся к одному индикатору и не попадают соседнему агенту."""
+    mock_call = Mock(side_effect=_default_side_effect)
+    monkeypatch.setattr(verdicts_module, "call", mock_call)
+    old = {3: {"verdict": {"indicator": 3, "rationale": "ранее найдено 37 обращений"},
+               "checks": {"references": [{"source": "https://example.org/previous", "status": "прочитано"}]}}}
+
+    run_verdicts("текст", run_id, indicators=[3, 4], max_workers=1, previous_evidence=old)
+
+    calls = {_n_from_trace_name(c.kwargs["trace_name"]): c for c in mock_call.call_args_list}
+    assert "37 обращений" in calls[3].kwargs["shared_context"]
+    assert "https://example.org/previous" in calls[3].kwargs["shared_context"]
+    assert "37 обращений" not in calls[4].kwargs["shared_context"]
+    assert "предыдущ" in calls[3].args[0].lower()
+
+
 def test_trace_prefix_moves_raw_trace(run_id, tmp_prompts_dir, monkeypatch):
     """Сырые ответы перезапуска уходят под префикс, а не рядом с сырыми прогона."""
     mock_call = Mock(side_effect=_default_side_effect)

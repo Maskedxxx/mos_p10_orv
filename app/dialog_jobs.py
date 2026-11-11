@@ -56,6 +56,11 @@ class DialogLock:
         if self._held.get(run_id, ("", 0.0))[0] == client_id:
             del self._held[run_id]
 
+    def owned_by(self, run_id: str, client_id: str, now: float) -> bool:
+        """Проверить владельца без передачи права другому окну."""
+        holder = self._held.get(run_id)
+        return bool(holder and holder[0] == client_id and now - holder[1] <= self._ttl_s)
+
 
 DIALOG_LOCK = DialogLock()
 
@@ -66,27 +71,34 @@ def op_title(op: Operation) -> str:
     if kind == "правка текста":
         where = {"вердикт": f"Вердикты, индикатор {op.key}", "строка карты": f"строка карты {op.key}",
                  "позиция запроса": f"позиция запроса {op.key}"}[op.sheet]
+        fields = {"гипотеза": "Гипотеза", "основание": "На чём основано — основание из вердикта",
+                  "показатель эффекта": "Эффект — показатель", "как считать": "Эффект — как считать",
+                  "что подтвердит": "Эффект — что подтвердит", "показатель": "Показатель",
+                  "пояснение": "Пояснение", "пункт": "Пункт акта", "обоснование": "Обоснование"}
         effect = f", эффект {op.effect_index}" if op.effect_index else ""
-        return f"Поправить текст — {where}, поле «{op.field}»{effect}: «{shorten(op.new_text, 400)}»"
+        return f"Поправить текст — {where}, колонка «{fields.get(op.field, op.field)}»{effect}: «{op.new_text}»"
     if kind == "смена вердикта":
-        return f"Сменить вердикт индикатора {op.indicator} на «{op.verdict}»: {shorten(op.rationale, 300)}"
+        return f"Сменить вердикт индикатора {op.indicator} на «{op.verdict}»: {op.rationale}"
     if kind == "удалить строку карты":
         return f"Удалить строку карты {op.row_id}"
     if kind == "добавить строку карты":
         indicators = ", ".join(map(str, op.indicators))
-        return f"Добавить строку карты (индикаторы {indicators}): «{shorten(op.hypothesis, 300)}»"
+        return f"Добавить строку карты (индикаторы {indicators}): «{op.hypothesis}»"
+    if kind == "копировать строку карты":
+        return f"Копировать строку карты {op.row_id} и поставить копию рядом"
     if kind == "слить строки карты":
         rows = ", ".join(map(str, op.row_ids))
-        return f"Слить строки карты {rows} в одну: «{shorten(op.hypothesis, 300)}»"
+        text = "без изменения видимого текста" if op.mode == "без изменений" else f"новый текст: «{op.hypothesis}»"
+        return f"Слить строки карты {rows} в одну, {text}"
     if kind == "пометить: нигде не ведётся":
-        return f"Пометить: нигде не ведётся — строка карты {op.row_id}, цифра «{shorten(op.metric, 200)}»"
+        return f"Пометить: нигде не ведётся — строка карты {op.row_id}, цифра «{op.metric}»"
     if kind == "удалить позицию запроса":
         return f"Удалить позицию запроса {op.num}"
     if kind == "разделить позицию запроса":
         parts = "; ".join(f"«{part.metric}», {part.unit}" for part in op.parts)
         return f"Разделить позицию запроса {op.num} на {len(op.parts)}: {parts}"
     if kind == "перепроверить индикатор":
-        return f"Перепроверить индикатор {op.indicator} его агентом. Уточнение задачи: {shorten(op.clarification, 300)}"
+        return f"Перепроверить индикатор {op.indicator} его агентом. Уточнение задачи: {op.clarification or '—'}"
     if kind == "построить гипотезы":
         return f"Построить гипотезы по индикатору {op.indicator} агентом гипотез"
     return f"Дополнить запрос под строки карты {', '.join(map(str, op.row_ids))} агентом запроса"
@@ -112,13 +124,14 @@ def stale_notes(before: Marks, after: Marks) -> list[str]:
 def step_text(result: operations.StepResult) -> str:
     """Итог шага для чата: версия, что изменилось, «было — стало»."""
     change = result.change
-    head = f"Версия {result.version}. {change.target} — {change.action}"
+    prefix = f"Версия {result.version}. " if result.version is not None else "Подготовлено: "
+    head = f"{prefix}{change.target} — {change.action}"
     if change.before is None and change.after is None:
         return head
     before, after = change.before or "—", change.after or "—"
     if len(before) + len(after) <= 80:
         return f"{head}: «{before}» → «{after}»"
-    return f"{head}\nБыло: {shorten(before, 800)}\nСтало: {shorten(after, 1500)}"
+    return f"{head}\nБыло: {before}\nСтало: {after}"
 
 
 def plan_summary(total: int, applied: int, rejected: int, failed: int | None, why: str | None,
@@ -201,34 +214,54 @@ class DialogJobs:
         why: str | None = None
         dialog.append_chat(run_id, "сервис", f"Применяю план: {total} {plural(total, 'шаг', 'шага', 'шагов')}.",
                            session=session)
+        batch = None
         try:
+            batch = await nicegui_run.io_bound(operations.PlanWork, run_id)
             for number, op in enumerate(plan, 1):
                 title = f"Шаг {number} из {total}: {op_title(op)}"
                 slow = operations.is_model_op(op)
                 dialog.set_status(run_id, "шаг", shorten(f"Выполняю шаг {number} из {total}: {op_title(op)}", 160),
                                   "агент работает, обычно 1–5 мин" if slow else "обычно несколько секунд")
-                before = versions.load_state(run_id)
+                before = batch.ctx.state.marks.model_copy(deep=True)
                 try:
-                    result = await nicegui_run.io_bound(operations.run_step, run_id, op)
+                    result = await nicegui_run.io_bound(batch.step, op)
                     if result.candidate is not None:
+                        if result.candidate.comparison == "существенных изменений нет":
+                            rejected += 1
+                            dialog.append_chat(
+                                run_id, "сервис",
+                                f"Перепроверка завершена. {result.candidate.comparison_note}\n"
+                                "Новых существенных сведений не обнаружено; изменение не предлагается.",
+                                mark="готово", cost_usd=round(result.cost_usd, 4) if result.cost_known else None,
+                                cost_known=result.cost_known, session=session,
+                            )
+                            continue
                         if not await self._decision(run_id, title, result.candidate):
                             rejected += 1
                             dialog.append_chat(run_id, "сервис", f"Шаг {number} отклонён — файл не изменён.",
                                                mark="отменено", cost_usd=round(result.cost_usd, 4) if result.cost_known else None, cost_known=result.cost_known, session=session)
                             continue
                         dialog.set_status(run_id, "шаг", f"Записываю шаг {number} из {total}", "обычно несколько секунд")
-                        result = await nicegui_run.io_bound(operations.accept, run_id, result.candidate)
+                        result = await nicegui_run.io_bound(batch.accept, result.candidate)
                 except Exception as error:   # OperationError — понятная причина; остальное — сбой, корень уже откатан
                     failed, why = number, (str(error) if isinstance(error, operations.OperationError) else f"сбой: {error}")
                     break
                 applied += 1
-                after = versions.load_state(run_id)
-                notes = stale_notes(before.marks if before is not None else Marks(),
-                                    after.marks if after is not None else Marks())
+                notes = stale_notes(before, batch.ctx.state.marks)
                 text = step_text(result) + ("\nУстарело: " + "; ".join(notes) if notes else "")
                 dialog.append_chat(run_id, "сервис", text, mark="шаг", version=result.version,
                                    cost_usd=round(result.cost_usd, 4) if result.cost_known else None, cost_known=result.cost_known, session=session)
+        except Exception as error:
+            failed, why = failed or 1, f"сбой: {error}"
         finally:
+            if batch is not None and batch.changes:
+                try:
+                    dialog.set_status(run_id, "шаг", "Сохраняю принятую часть плана", "создаю одну версию файла")
+                    saved = await nicegui_run.io_bound(batch.commit)
+                    if saved and saved.warning:
+                        dialog.append_chat(run_id, "сервис", saved.warning, mark="частично", session=session)
+                except Exception as error:
+                    applied, failed, why = 0, failed or 1, f"не удалось сохранить изменения: {error}"
             dialog.clear_status(run_id)
         text, mark = plan_summary(total, applied, rejected, failed, why, current_version(run_id))
         dialog.append_chat(run_id, "сервис", text, mark=mark, session=session)

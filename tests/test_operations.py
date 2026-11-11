@@ -16,7 +16,7 @@ from openpyxl import load_workbook
 import app.operations as ops_module
 from app import versions
 from app.contracts import (
-    AddMapRow, AppendRequest, BuildHypotheses, Buckets, DataItem, DataItemOutput, DataRequest, DeleteMapRow,
+    AddMapRow, AppendRequest, BuildHypotheses, Buckets, CopyMapRow, DataItem, DataItemOutput, DataRequest, DeleteMapRow,
     DeleteRequestItem,
     EditText, Effect, Hypothesis, HypothesisMap, HypothesisSet, MarkNotTracked, MergeMapRows, RecheckIndicator,
     RequestItem, RunMeta,
@@ -104,6 +104,131 @@ def test_merge_rows_rewires_request(rid):
     assert _req(rid).items[0].for_rows == [1]
 
 
+def test_merge_keeps_distinct_effects_quotes_and_data_origins(rid):
+    source = _map(rid)
+    first, second = source.rows
+    first = first.model_copy(update={
+        "proof": "цитата первая",
+        "data": [DataItem(metric="статистика", source="открытый", where="источник А", origin_request_ids=["1"])],
+    })
+    other_effect = _EFFECT.model_copy(update={"metric": "повторные обращения, ед."})
+    second = second.model_copy(update={
+        "proof": "цитата вторая",
+        "effects": [other_effect],
+        "data": [DataItem(metric="статистика", source="открытый", where="источник Б"),
+                 DataItem(metric="статистика", source="открытый", where="источник А", origin_request_ids=["2"])],
+    })
+    save_json(rid, "06_map.json", source.model_copy(update={"rows": [first, second]}))
+
+    run_step(rid, MergeMapRows(kind="слить строки карты", row_ids=[1, 2], hypothesis="оба текста", reason="решение"))
+    row = _map(rid).rows[0]
+    assert [e.metric for e in row.effects] == [_EFFECT.metric, other_effect.metric]
+    assert row.proof == "цитата первая\n\nцитата вторая"
+    assert [d.where for d in row.data] == ["источник А", "источник Б"]
+    assert row.data[0].origin_request_ids == ["1", "2"]
+
+
+def test_merge_without_rewriting_matches_excel_preview_and_keeps_original_version(rid):
+    from app.nodes.excel import build_excel
+    original = _map(rid)
+    first = original.rows[0].model_copy(update={"hypothesis": "Полный разбор первой гипотезы", "hypothesis_brief": ["Видимый пункт А", "Видимый пункт Б"]})
+    second = original.rows[1].model_copy(update={"hypothesis": "Дословная вторая\nгипотеза", "hypothesis_brief": None})
+    save_json(rid, "06_map.json", original.model_copy(update={"rows": [first, second]}))
+    build_excel(_map(rid), _req(rid), load_json(rid, "04_buckets.json", Buckets), None, rid)
+    sheet = load_workbook(run_dir(rid) / "08_result.xlsx")["Карта гипотез"]
+    old_cells = [sheet.cell(r, 3).value for r in range(3, sheet.max_row + 1) if sheet.cell(r, 1).value in (1, 2)]
+    assert len(old_cells) == 2
+    versions.ensure_v0(rid)
+    op = MergeMapRows(kind="слить строки карты", row_ids=[1, 2], mode="без изменений", reason="не менять текст")
+    preview = ops_module.preview_plan(rid, [op])[0]
+    assert preview is not None
+    assert preview.before == f"Строка 1:\n{old_cells[0]}\n\nСтрока 2:\n{old_cells[1]}"
+    assert preview.after == "\n\n".join(old_cells)
+    run_step(rid, op)
+    sheet = load_workbook(run_dir(rid) / "08_result.xlsx")["Карта гипотез"]
+    new_cell = next(sheet.cell(r, 3).value for r in range(3, sheet.max_row + 1) if sheet.cell(r, 1).value == 1)
+    assert new_cell == preview.after
+    saved = load_json(rid, "versions/v0/06_map.json", HypothesisMap)
+    assert saved.rows[0].hypothesis == "Полный разбор первой гипотезы"
+    assert saved.rows[1].hypothesis == "Дословная вторая\nгипотеза"
+    rollback(rid, 0)
+    assert _map(rid).rows == saved.rows
+
+
+def test_merge_new_text_preview_matches_written_cell(rid):
+    versions.ensure_v0(rid)
+    op = MergeMapRows(kind="слить строки карты", row_ids=[1, 2], mode="новый текст",
+                      hypothesis="Новый первый пункт\nНовый второй пункт", reason="согласовано")
+    preview = ops_module.preview_plan(rid, [op])[0]
+    run_step(rid, op)
+    sheet = load_workbook(run_dir(rid) / "08_result.xlsx")["Карта гипотез"]
+    new_cell = next(sheet.cell(r, 3).value for r in range(3, sheet.max_row + 1) if sheet.cell(r, 1).value == 1)
+    assert preview.after == new_cell == "• Новый первый пункт\n• Новый второй пункт"
+
+
+def test_merge_requires_two_distinct_rows(rid):
+    op = MergeMapRows(kind="слить строки карты", row_ids=[1, 1], mode="без изменений", reason="проверка")
+    with pytest.raises(OperationError, match="две разные строки"):
+        run_step(rid, op)
+
+
+def test_copy_next_to_original_preserves_ids_and_data(rid):
+    original = _map(rid).rows[0]
+    run_step(rid, CopyMapRow(kind="копировать строку карты", row_id=1, reason="решение эксперта"))
+    rows = _map(rid).rows
+    assert [r.row_id for r in rows] == [1, 4, 2]
+    assert rows[0] == original
+    assert rows[1].model_dump(exclude={"row_id"}) == original.model_dump(exclude={"row_id"})
+    assert _req(rid).items[0].for_rows == [1]
+    assert 4 in versions.load_state(rid).marks.stale_rows
+    run_step(rid, EditText(kind="правка текста", sheet="строка карты", key="4", field="гипотеза", new_text="копия", reason="редакция"))
+    assert [r.row_id for r in _map(rid).rows] == [1, 4, 2]
+
+
+def test_preview_copy_and_edit_shows_before_without_changing_file(rid):
+    versions.ensure_v0(rid)
+    before = (run_dir(rid) / "06_map.json").read_bytes()
+    plan = [CopyMapRow(kind="копировать строку карты", row_id=1, reason="копия"),
+            EditText(kind="правка текста", sheet="строка карты", key="4", field="гипотеза", new_text="новый текст", reason="редакция")]
+    previews = ops_module.preview_plan(rid, plan)
+    assert previews[1].before == "г1" and previews[1].after == "• новый текст"
+    assert (run_dir(rid) / "06_map.json").read_bytes() == before
+    assert versions.load_state(rid).current == 0
+
+
+def test_interrupted_plan_recovers_accepted_steps_as_one_version(rid):
+    batch = ops_module.PlanWork(rid)
+    for text in ("первое", "второе"):
+        batch.step(EditText(kind="правка текста", sheet="строка карты", key="1", field="гипотеза",
+                            new_text=text, reason="правка"))
+    assert versions.load_state(rid).current == 0
+    assert ops_module.recover_pending_plan(rid) == 1
+    assert versions.load_state(rid).current == 1
+    assert _map(rid).rows[0].hypothesis_brief == ["второе"]
+    assert [entry.version for entry in versions.read_journal(rid)] == [1, 1]
+    assert ops_module.recover_pending_plan(rid) is None
+
+
+def test_recovery_does_not_duplicate_journal_if_commit_stopped_after_write(rid, monkeypatch):
+    batch = ops_module.PlanWork(rid)
+    batch.step(EditText(kind="правка текста", sheet="строка карты", key="1", field="гипотеза",
+                        new_text="новый текст", reason="правка"))
+    original_commit = versions.commit
+
+    def interrupted(run_id, state, entries):
+        path = run_dir(run_id) / "versions/journal.jsonl"
+        path.write_text("".join(e.model_dump_json() + "\n" for e in entries), encoding="utf-8")
+        raise OSError("сбой после записи журнала")
+
+    monkeypatch.setattr(versions, "commit", interrupted)
+    with pytest.raises(OSError):
+        batch.commit()
+    monkeypatch.setattr(versions, "commit", original_commit)
+    assert ops_module.recover_pending_plan(rid) == 1
+    assert len(versions.read_journal(rid)) == 1
+    assert _map(rid).rows[0].hypothesis_brief == ["новый текст"]
+
+
 def test_split_item_takes_next_free_numbers(rid):
     run_step(rid, SplitRequestItem(kind="разделить позицию запроса", num="1", reason="две величины", parts=[
         SplitPart(metric="сумма (п. 1)", unit="тыс. руб."), SplitPart(metric="количество (п. 1)", unit="ед.")]))
@@ -121,6 +246,7 @@ def test_recheck_shows_candidate_and_writes_only_on_accept(rid, monkeypatch):
         return [new]
 
     monkeypatch.setattr(ops_module, "run_verdicts", _fake)
+    monkeypatch.setattr(ops_module, "_compare_recheck", lambda *args: None)
     res = run_step(rid, RecheckIndicator(kind="перепроверить индикатор", indicator=3,
                                          clarification="проверь приказы Минтранса", reason="эксперт"))
     assert res.version is None and res.candidate is not None
@@ -130,6 +256,66 @@ def test_recheck_shows_candidate_and_writes_only_on_accept(rid, monkeypatch):
     res = accept(rid, res.candidate)
     assert res.version == 1 and load_json(rid, "03_verdicts/03.json", Verdict).verdict == "соблюдён"
     assert versions.read_journal(rid)[0].cost_usd == pytest.approx(0.5)
+
+
+def test_recheck_receives_previous_facts_and_keeps_them_in_current_excel(rid, monkeypatch):
+    old = Verdict(indicator=3, name="индикатор 3", verdict="нет данных",
+                  rationale="Ранее найдено 37 обращений по отчёту за прошлый период.",
+                  rationale_brief=["37 обращений по опубликованному отчёту."],
+                  missing_data="неизвестно число отказов", sources=["https://example.org/previous"])
+    save_json(rid, "03_verdicts/03.json", old)
+    checks = {"references": [{"name": "Проверенный отчёт", "source": "https://example.org/previous"}]}
+    (run_dir(rid) / "03_verdicts/03.checks.json").write_text(json.dumps(checks, ensure_ascii=False), encoding="utf-8")
+    new = Verdict(indicator=3, name="индикатор 3", verdict="нет данных", rationale="Найден новый источник.",
+                  missing_data="неизвестно число отказов")
+
+    def recheck(document_md, run_id, **kwargs):
+        assert kwargs["extra_instruction"] == "проверь новый источник"
+        previous = kwargs["previous_evidence"][3]
+        assert previous["verdict"]["rationale"] == old.rationale
+        assert previous["checks"] == checks
+        return [new]
+
+    monkeypatch.setattr(ops_module, "run_verdicts", recheck)
+    monkeypatch.setattr(ops_module, "_compare_recheck", lambda *args: None)
+    candidate = run_step(rid, RecheckIndicator(kind="перепроверить индикатор", indicator=3,
+                                              clarification="проверь новый источник", reason="эксперт")).candidate
+    assert old.rationale in candidate.before and old.sources[0] in candidate.before
+    assert new.rationale in candidate.after
+    assert load_json(rid, "03_verdicts/03.json", Verdict).rationale == old.rationale
+    result = accept(rid, candidate)
+    assert result.version == 1
+
+    journal = versions.read_journal(rid)[0]
+    assert old.rationale in journal.before and old.rationale_brief[0] in journal.before
+    assert old.sources[0] in journal.before and new.rationale in journal.after
+    sheet = load_workbook(run_dir(rid) / "08_result.xlsx")["Журнал изменений"]
+    assert any(old.rationale in str(cell.value) for row in sheet for cell in row)
+    assert json.loads((run_dir(rid) / "versions/v0/03_verdicts/03.checks.json").read_text()) == checks
+    rollback(rid, 0)
+    assert load_json(rid, "03_verdicts/03.json", Verdict).rationale == old.rationale
+
+
+def test_recheck_stops_if_previous_check_file_is_corrupt(rid, monkeypatch):
+    path = run_dir(rid) / "03_verdicts/03.checks.json"
+    path.write_text("{broken", encoding="utf-8")
+    mocked = Mock()
+    monkeypatch.setattr(ops_module, "run_verdicts", mocked)
+    with pytest.raises(OperationError, match="предыдущ.*проверк"):
+        run_step(rid, RecheckIndicator(kind="перепроверить индикатор", indicator=3,
+                                       clarification="проверить", reason="эксперт"))
+    mocked.assert_not_called()
+    assert versions.load_state(rid).current == 0
+
+
+def test_changed_verdict_is_not_hidden_if_comparison_says_no_change(rid, monkeypatch):
+    new = Verdict(indicator=3, name="индикатор 3", verdict="соблюдён", rationale="всё действует")
+    monkeypatch.setattr(ops_module, "run_verdicts", lambda *args, **kw: [new])
+    monkeypatch.setattr(ops_module, "_compare_recheck", lambda *args: ops_module.RecheckComparison(
+        outcome="существенных изменений нет", explanation="Сведения похожи."))
+    candidate = run_step(rid, RecheckIndicator(kind="перепроверить индикатор", indicator=3, clarification="проверить", reason="эксперт")).candidate
+    assert candidate.comparison == "неопределённо"
+    assert "Вердикт изменился" in candidate.comparison_note
 
 
 def test_build_hypotheses_appends_rows_with_next_ids(rid, monkeypatch):
@@ -337,6 +523,7 @@ def test_recheck_accept_puts_new_checks_table_to_root(rid, monkeypatch):
         return [new]
 
     monkeypatch.setattr(ops_module, "run_verdicts", _fake)
+    monkeypatch.setattr(ops_module, "_compare_recheck", lambda *args: None)
     res = run_step(rid, RecheckIndicator(kind="перепроверить индикатор", indicator=3, clarification="по таблице",
                                          reason="эксперт"))
     assert '"старая"' in (run_dir(rid) / "03_verdicts" / "03.checks.json").read_text(encoding="utf-8")   # до «Принять»

@@ -51,8 +51,10 @@ RequestItem.for_rows ссылается на MapRow.row_id, а не на кон�
 from __future__ import annotations
 
 import datetime
+import json
 import re
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -65,7 +67,7 @@ from app.contracts import (
 )
 from app.logger import get_run_logger
 from app.nodes.common import compute_years
-from app.trace import EXCEL_FILE, run_dir
+from app.trace import EXCEL_FILE, VERDICTS_DIR, run_dir
 
 # --- единые стили оформления (перенесены из build_excel.py фазы 2 как есть) ---
 _HEADER_FILL = PatternFill("solid", fgColor="1F4E78")          # тёмно-синяя шапка
@@ -98,6 +100,8 @@ SHEET_VERDICTS = "Вердикты"   # пул 3 (письмо заказчик�
                                # ВСЕ индикаторы, не только соблюдённые; имя — из письма.
                                # История: «Проверенные индикаторы» → «Нарушений не найдено» (7.1)
 _SHEET_FAILED = "Ошибки прогона"
+_SHEET_SOURCES = "Источники"
+_SHEET_WARNINGS = "Предупреждения"
 _SHEET_JOURNAL = "Журнал изменений"   # только в версиях диалогового режима (план итерации 3, шаг 1.5)
 _MARKS_HEADER = "Изменения"           # колонка пометок строк — тоже только в версиях
 
@@ -232,7 +236,7 @@ def _render_basis_cell(
 
     blocks = [f"{head}:\n{body}"]
     if sources:
-        blocks.append("\n".join(["Внешние источники:"] + [f"— {s}" for s in sources]))
+        blocks.append("Внешние источники: лист «Источники»; связь с отдельным выводом может требовать проверки.")
     if grounds:
         # контракт v2: на чём стоит гипотеза — дословно из карточки вердикта
         blocks.append(f"Основание из вердикта:\n{grounds}")
@@ -412,6 +416,11 @@ def _append_expert_columns(ws: Worksheet, header_row: int, names: list[str], wid
             c.alignment = _WRAP_TOP
         if name in _EXPERT_LISTS and ws.max_row > header_row:
             dv = DataValidation(type="list", formula1=_EXPERT_LISTS[name], allow_blank=True)
+            dv.showErrorMessage = True
+            dv.errorStyle = "stop"
+            dv.errorTitle = "Проверьте значение"
+            dv.error = ("Выберите «да» или «нет» либо оставьте поле пустым." if name == "Согласны?"
+                        else "Выберите оценку от 1 до 5 либо оставьте поле пустым.")
             dv.add(f"{head.column_letter}{header_row + 1}:{head.column_letter}{ws.max_row}")
             ws.add_data_validation(dv)
 
@@ -553,14 +562,17 @@ def _append_unverified_rows(
     """
     for v in unverified_verdicts(hyp_map, buckets):
         details = points_text(v.rationale_brief, f"Не удалось проверить: {v.missing_data or 'не указано'}")
+        missing = v.missing_data or "не указано; смотрите обоснование на листе «Вердикты»"
         ws.append([
             row_ids[v.indicator],
             _indicators_label([v.indicator]),
             f"Нужна ручная проверка.\n\n{details}",
             "—",
-            "Дочитать самостоятельно по правовой базе. В запрос органу не идёт.",
+            f"Не хватает: {missing}\nЧто проверить: указанные недостающие сведения. Источник для проверки указан выше; если он не назван — не установлен. Если знаете, где искать, укажите это на листе «Вердикты» в колонке «Где искать». В запрос органу эта строка не входит.",
             _render_basis_cell(v.proof, v.clause, v.sources),
         ])
+        if v.sources:
+            ws.cell(ws.max_row, 6).hyperlink = f"#'{_SHEET_SOURCES}'!A1"
 
 
 _MONTHS_RU = ("января", "февраля", "марта", "апреля", "мая", "июня",
@@ -631,29 +643,11 @@ def _render_howto_sheet(
             cb.border = _BORDER
 
 
-def _original_to_map_rows(hyp_map: HypothesisMap) -> dict[int, int] | None:
-    """Восстановить явные группы свежей карты; неоднозначную историю не угадывать."""
-    if [r.row_id for r in hyp_map.rows] != list(range(1, len(hyp_map.rows) + 1)):
-        return None
-    groups = [set(m.merged_row_ids) for m in hyp_map.merges]
-    source_count = len(hyp_map.rows) + sum(len(g) - 1 for g in groups)
-    known = set(range(1, source_count + 1))
-    merged = set().union(*groups) if groups else set()
-    if not merged <= known or any(not set(d.row_ids) <= known for d in hyp_map.decisions):
-        return None
-    groups.extend({n} for n in sorted(known - merged))
-    groups.sort(key=min)
-    if len(groups) != len(hyp_map.rows):
-        return None
-    return {original: row.row_id for group, row in zip(groups, hyp_map.rows) for original in group}
-
-
 def _render_map_sheet(
     wb: Workbook, hyp_map: HypothesisMap, row_to_nums: dict[int, list[str]],
     passport: ActPassport | None, buckets: Buckets, caption: str,
     unverified_ids: dict[int, int], marks: Marks | None = None,
     row_to_question_nums: dict[int, list[str]] | None = None,
-    fresh_snapshot: bool = True,
 ) -> None:
     """
     Лист «Карта гипотез»: опциональная шапка-реквизиты (одна строка) + 5 колонок.
@@ -666,15 +660,12 @@ def _render_map_sheet(
     header_line = _passport_header_line(passport)
     if header_line is not None:
         ws.append([header_line])          # реквизиты акта — самая первая строка
-    source_rows = _original_to_map_rows(hyp_map) if fresh_snapshot else None
-    if source_rows is None:
-        # В изменённой версии исходные ID уже не обязаны однозначно задавать текущие строки.
-        # Предупреждение сохраняем с явным обозначением исходных гипотез, без ложных ссылок.
-        notes = [f"Исходные гипотезы {', '.join(map(str, d.row_ids))}: {d.accounting_note}"
-                 for d in hyp_map.decisions if not d.merge and d.accounting_note]
-        if notes:
-            caption += "\n\nСохранённые предупреждения о пересечениях:\n" + "\n\n".join(notes)
+    has_warnings = any(not d.merge and d.accounting_note for d in hyp_map.decisions)
+    if has_warnings:
+        caption += " Пересечения — на листе «Предупреждения»."
     _render_caption(ws, caption)
+    if has_warnings:
+        ws.cell(ws.max_row, 1).hyperlink = f"#'{_SHEET_WARNINGS}'!A1"
 
     header_row = ws.max_row + 1
     ws.append(["№", "Индикаторы", "Гипотеза", "Эффект", "Данные", "На чём основано"])
@@ -686,14 +677,6 @@ def _render_map_sheet(
         data_text = _render_map_data_cell(
             row.data, nums, (row_to_question_nums or {}).get(row.row_id, []),
         )
-        # Перенос готовых предупреждений по ID; содержание и суммы не пересчитываем.
-        for decision in hyp_map.decisions:
-            involved = ({source_rows[n] for n in decision.row_ids}
-                        if source_rows is not None else set())
-            if not decision.merge and decision.accounting_note and row.row_id in involved:
-                others = ", ".join(str(n) for n in sorted(involved) if n != row.row_id)
-                data_text += (f"\n\nПересечение со строками {others}:\n"
-                              f"{decision.accounting_note}")
         ws.append([
             row.row_id,          # адрес строки: на него ссылается лист запроса
             _indicators_label(row.indicators),
@@ -707,6 +690,8 @@ def _render_map_sheet(
                 points_text(row.grounds_brief, row.grounds),
             ),
         ])
+        if _dedup_sources(verdicts):
+            ws.cell(ws.max_row, 6).hyperlink = f"#'{_SHEET_SOURCES}'!A1"
 
     _append_unverified_rows(ws, hyp_map, buckets, unverified_ids)   # «нет данных» без гипотез — тоже в карту
     _format_map_sheet(ws, header_row)
@@ -754,7 +739,8 @@ def _render_source_rows_cell(
         nums = row_indicators.get(row_id)
         if nums is None:
             continue                          # ссылка в никуда — узел [6] её уже залогировал
-        lines.append(f"стр. {row_id} — инд. {', '.join(str(n) for n in nums)}")
+        labels = "; ".join(f"{n} — {get_indicator(n).name}" for n in nums)
+        lines.append(f"Карта гипотез, строка {row_id}; индикатор {labels}")
     return "\n".join(lines)
 
 
@@ -962,6 +948,8 @@ def _render_verdicts_sheet(
             _render_basis_cell(v.proof, v.clause, list(v.sources)),
             _where_details(v, hyp_map, unverified_ids),
         ])
+        if v.sources:
+            ws.cell(ws.max_row, 4).hyperlink = f"#'{_SHEET_SOURCES}'!A1"
     _format_listing_sheet(ws, {"A": 34, "B": 16, "C": 60, "D": 52, "E": 30}, header_row)
     # 2.7 (итерация 4, В): «нет данных» — заливкой по всей строке вердикта (без колонок эксперта)
     for row in ws.iter_rows(min_row=header_row + 1, max_col=5):
@@ -971,6 +959,85 @@ def _render_verdicts_sheet(
     if marks is not None:
         _append_marks_column(ws, header_row, _indicator_key, marks.edited_verdicts, marks.stale_verdicts)
     _append_expert_columns(ws, header_row, *EXPERT_VERDICT_COLUMNS)
+
+
+def _checked_sources(run_id: str, indicator: int) -> list[tuple[str, str, str, str, str]]:
+    """По одной строке на запись проверки, включая записи без адреса."""
+    path = run_dir(run_id) / VERDICTS_DIR / f"{indicator:02d}.checks.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return [("Таблица проверки недоступна", "", "Не удалось прочитать таблицу проверки",
+                 "Статус неизвестен", "Проверка индикатора")] if path.exists() else []
+    if not isinstance(data, dict):
+        return [("Таблица проверки недоступна", "", "Неверный формат таблицы проверки",
+                 "Статус неизвестен", "Проверка индикатора")]
+
+    target_records = data.get("targets") if isinstance(data.get("targets"), list) else []
+    targets = {str(t.get("target_id")): t.get("subject", "") for t in target_records
+               if isinstance(t, dict)}
+    rows = []
+    for key in ("references", "compared", "findings", "deadlines"):
+        records = data.get(key)
+        if not isinstance(records, list):
+            continue
+        for item in records:
+            if not isinstance(item, dict):
+                continue
+            if key == "references":
+                label, address, result = item.get("name"), item.get("source"), item.get("found")
+                status, checked = item.get("status"), item.get("clause")
+            elif key == "compared":
+                label, address, result = item.get("counterpart"), item.get("counterpart_source"), item.get("comparison")
+                status = item.get("relation")
+                checked = "\n".join(str(x) for x in (item.get("clause"), item.get("requirement")) if x)
+            elif key == "findings":
+                address, result = item.get("source"), item.get("fact")
+                label = urlsplit(address).netloc if isinstance(address, str) else ""
+                status = "; ".join(str(x) for x in (item.get("read_status"), item.get("mark")) if x)
+                target_id = item.get("target_id")
+                checked = "\n".join(str(x) for x in (
+                    f"Цель {target_id}" if target_id is not None else None,
+                    targets.get(str(target_id)), item.get("about"),
+                ) if x)
+            else:
+                label, address = item.get("federal"), item.get("federal_source")
+                result = item.get("comparison_basis") or item.get("federal")
+                status = "; ".join(str(x) for x in (item.get("check_status"), item.get("mark")) if x)
+                checked = "\n".join(str(x) for x in (item.get("clause"), item.get("what")) if x)
+            rows.append((label or "Источник не указан", address or "", result or "Результат не указан",
+                         status or "Статус не указан", checked or "Что проверяли, не указано"))
+    return rows
+
+
+def _render_sources_sheet(wb: Workbook, buckets: Buckets, hyp_map: HypothesisMap, run_id: str) -> None:
+    ws = wb.create_sheet(_SHEET_SOURCES)
+    _render_caption(ws, "Источники и записи проверки привязаны к индикатору. Непроверенные позиции отмечены отдельно; доступ к ГАРАНТу зависит от авторизации и комплекта пользователя.")
+    header_row = ws.max_row + 1
+    ws.append(["Индикатор", "Строки карты", "Источник", "Что отметил агент", "Открыть", "Статус", "Что проверяли", "Запись из"])
+    verdicts = buckets.violated + buckets.no_data + buckets.checked + buckets.failed
+    for v in sorted(verdicts, key=lambda v: v.indicator):
+        row_ids = [str(row.row_id) for row in hyp_map.rows if v.indicator in row.indicators]
+        checks = _checked_sources(run_id, v.indicator)
+        entries = [(label, address, result, status, checked, "Таблица проверки")
+                   for label, address, result, status, checked in checks]
+        for address in dict.fromkeys(v.sources):
+            parsed = urlsplit(address)
+            entries.append((parsed.netloc or "Название источника не указано", address,
+                            "Связь с отдельным выводом не указана", "Статус в вердикте не указан",
+                            "Что проверяли, не указано", "Вердикт"))
+        for label, address, found, status, checked, origin in entries:
+            parsed = urlsplit(address)
+            ws.append([_indicator_label(v), ", ".join(row_ids) or "—", label, found,
+                       address or "Адрес не указан", status, checked, origin])
+            if parsed.scheme in ("http", "https") and parsed.netloc:
+                cell = ws.cell(ws.max_row, 5)
+                cell.hyperlink = address
+                cell.style = "Hyperlink"
+    _format_listing_sheet(ws, {"A": 34, "B": 20, "C": 45, "D": 55, "E": 80, "F": 28, "G": 55, "H": 22}, header_row)
+    for cells in ws.iter_rows(min_row=header_row + 1, min_col=5, max_col=5):
+        if cells[0].hyperlink:
+            cells[0].font = Font(color="0563C1", underline="single")
 
 
 def _render_failed_sheet(wb: Workbook, failed: list[Verdict], caption: str) -> None:
@@ -990,18 +1057,46 @@ def _render_failed_sheet(wb: Workbook, failed: list[Verdict], caption: str) -> N
     _format_listing_sheet(ws, {"A": 34, "B": 60, "C": 10}, header_row)
 
 
+def _render_warnings_sheet(wb: Workbook, hyp_map: HypothesisMap) -> None:
+    decisions = [d for d in hyp_map.decisions if not d.merge and d.accounting_note]
+    if not decisions:
+        return
+    ws = wb.create_sheet(_SHEET_WARNINGS)
+    _render_caption(ws, "Номера относятся к исходным гипотезам и после правок могут отличаться от номеров строк карты.")
+    header_row = ws.max_row + 1
+    ws.append(["Исходные гипотезы", "Предупреждение"])
+    for decision in decisions:
+        ws.append([", ".join(map(str, decision.row_ids)), decision.accounting_note])
+    _format_listing_sheet(ws, {"A": 25, "B": 100}, header_row)
+
+
 def _render_journal_sheet(wb: Workbook, journal: list[JournalEntry]) -> None:
     """Лист «Журнал изменений» — последний; по строке на применённое изменение (план итерации 3, шаг 1.5)."""
     ws = wb.create_sheet(_SHEET_JOURNAL)
-    _render_caption(ws, "Изменения после исходного разбора сервиса (версия 0) — по строке на каждое применённое изменение.")
+    _render_caption(ws, "Полная история действий. После возврата прежние изменения остаются в истории, но могут не входить в текущую версию файла.")
     header_row = ws.max_row + 1
     ws.append(["Версия", "Когда", "Что сделано", "Где", "Было", "Стало", "Почему", "Как", "Стоимость, $"])
     for e in journal:
-        ws.append([e.version, e.at, e.action, e.target, e.before or "—", e.after or "—",
-                   e.reason or "—", e.kind, round(e.cost_usd, 2) if e.cost_known else "не определена"])
+        before, after = e.before or "—", e.after or "—"
+        limit = 32767  # больше Excel в одну ячейку не сохраняет
+        parts = max((len(before) + limit - 1) // limit, (len(after) + limit - 1) // limit)
+        for i in range(parts):
+            action = e.action if i == 0 else f"{e.action} — продолжение {i + 1}/{parts}"
+            ws.append([e.version, e.at, action, e.target,
+                       before[i * limit:(i + 1) * limit] or None,
+                       after[i * limit:(i + 1) * limit] or None,
+                       e.reason or "—", e.kind, round(e.cost_usd, 2) if e.cost_known else "не определена"])
     _format_listing_sheet(
         ws, {"A": 9, "B": 18, "C": 36, "D": 26, "E": 40, "F": 40, "G": 40, "H": 18, "I": 12}, header_row,
     )
+    last_version, alternate = None, False
+    for cells in ws.iter_rows(min_row=header_row + 1, max_col=9):
+        if cells[0].value != last_version:
+            alternate = not alternate
+            last_version = cells[0].value
+        if alternate:
+            for cell in cells:
+                cell.fill = PatternFill("solid", fgColor="EDF3F8")
 
 
 def build_excel(
@@ -1058,7 +1153,7 @@ def build_excel(
         f"{len(map_indicators)} из {total}. По каждому построена гипотеза: "
         f"что не так, чем мерить эффект, какие данные нужны — либо отмечено, "
         f"что нужна ручная проверка.",
-        unverified, marks, row_to_question_nums, fresh_snapshot=not version,
+        unverified, marks, row_to_question_nums,
     )
     # 2.7 (А): бланк адресован разработчику — называем его, если он определён
     developers = passport.requisites.developers if passport is not None else []
@@ -1093,6 +1188,8 @@ def build_excel(
         f"Индикаторы, проверка которых не завершилась. "
         f"Пусто — значит все {total} отработали.",
     )
+    _render_sources_sheet(wb, buckets, hypothesis_map, run_id)
+    _render_warnings_sheet(wb, hypothesis_map)
     if journal is not None:
         _render_journal_sheet(wb, journal)
 

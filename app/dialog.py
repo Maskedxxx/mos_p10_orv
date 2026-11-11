@@ -7,7 +7,7 @@
 
 Сессия с памятью (14.10). Один разговор CLI на прогон, номер — в dialog/session.json:
   - первый ход (или сессии нет / продолжить не удалось) — новая сессия: системный промпт = промпт 07 + карта
-    прогона (app/run_map.py) + акт + паспорт; вход = служебная строка о версии + последние HISTORY_MESSAGES реплик
+    прогона (app/run_map.py); вход = служебная строка о версии + последние HISTORY_MESSAGES реплик
     чата + сообщение;
   - следующие ходы — --resume той же сессии: вход = служебная строка + сообщение. Служебная строка говорит, какая
     версия сейчас и что изменилось с прошлого хода (из versions/journal.jsonl): модель помнит прочитанное раньше,
@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import os
 import sys
@@ -27,7 +28,7 @@ from dataclasses import dataclass, field
 
 from app import versions, config
 from app.chat_common import (
-    CHAT_WHO, GARANT_OFF_NOTE, GARANT_TOOLS, NEW_SESSION_INSTRUCTION, SESSION_GONE, append_chat_file, read_chat_file,
+    CHAT_WHO, GARANT_TOOLS, NEW_SESSION_INSTRUCTION, SESSION_GONE, append_chat_file, read_chat_file,
     tool_step_text, turn_tools,
 )
 from app.config import (
@@ -37,7 +38,7 @@ from app.chat_common import ChatUsage, archive_cli_session, cli_result_fields, r
 from app.contracts import ChatEntry, CliSession, DialogStatus, DialogTurn, Operation, Remark
 from app.run_map import build_run_map
 from app.runner import call, garant_available
-from app.trace import DIALOG_STATUS_FILE, DOCUMENT_FILE, PASSPORT_FILE, add_cost, log_event, run_dir, save_bytes
+from app.trace import DIALOG_STATUS_FILE, add_cost, log_event, run_dir, save_bytes
 
 CHAT = "dialog/chat.jsonl"
 REMARKS = "dialog/remarks.json"   # очередь замечаний из файла эксперта
@@ -49,6 +50,7 @@ SESSION = "dialog/session.json"
 MCP_CONFIG = "dialog/mcp.json"    # серверы MCP помощника: Гарант + чтение артефактов прогона
 # Инструменты чтения артефактов прогона (app/mcp_run.py, сервер p10run в dialog/mcp.json)
 RUN_TOOLS = ["mcp__p10run__list_artifacts", "mcp__p10run__read_artifact"]
+WEB_TOOL = "mcp__garantweb__garant_web"
 # Гарант в чате — все инструменты всегда (chat_common.GARANT_TOOLS). Сколько выгрузок потрачено — в журнал прогона
 # (_log_exports). 27.10: строку об этом в чат эксперту больше не пишем — лимиты Гаранта эксперту не показываем;
 # остаток виден на странице Гаранта-помощника
@@ -78,22 +80,16 @@ def append_chat(run_id: str, role: str, text: str, **extra) -> ChatEntry:
     return entry
 
 
-def _json_block(title: str, raw: str) -> str:
-    return f"## {title}\n\n```json\n{raw.strip()}\n```\n"
-
-
 def shared_context(run_id: str) -> str:
     """
-    Системный промпт сессии помощника (кроме короткого служебного — его добавляет runner): промпт 07, карта
-    прогона, акт, паспорт. За жизнь прогона не меняется — каждый ход читает его из кэша (2.6), при --resume
-    CLI берёт записанный в сессии.
+    Инструкция и карта артефактов. Акт, паспорт и результаты читаются инструментом по мере необходимости.
+    При --resume CLI берёт записанный контекст сессии.
     """
-    root = run_dir(run_id)
-    parts = [PROMPT_DIALOG.read_text(encoding="utf-8").rstrip() + "\n", build_run_map(),
-             f"## ПОЛНЫЙ ТЕКСТ АКТА\n\n{(root / DOCUMENT_FILE).read_text(encoding='utf-8')}\n"]
-    if (root / PASSPORT_FILE).is_file():
-        parts.append(_json_block("ПАСПОРТ АКТА (JSON)", (root / PASSPORT_FILE).read_text(encoding="utf-8")))
-    return "\n".join(parts)
+    return "\n".join([PROMPT_DIALOG.read_text(encoding="utf-8").rstrip() + "\n", build_run_map()])
+
+
+def context_revision(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def mcp_config(run_id: str, with_garant: bool = True) -> str:
@@ -106,6 +102,9 @@ def mcp_config(run_id: str, with_garant: bool = True) -> str:
     servers["p10run"] = {"type": "stdio", "command": sys.executable,
                          "args": [str(PROJECT_ROOT / "app" / "mcp_run.py")],
                          "env": {"P10_RUN_DIR": str(run_dir(run_id).resolve())}}
+    servers["garantweb"] = {"type": "stdio", "command": sys.executable,
+                            "args": [str(PROJECT_ROOT / "app" / "mcp_garant_web.py")],
+                            "env": {"GARANT_TOKEN": ""}}
     data = json.dumps({"mcpServers": servers}, ensure_ascii=False, indent=2).encode("utf-8")
     return str(save_bytes(run_id, MCP_CONFIG, data))
 
@@ -142,7 +141,7 @@ def _service(run_id: str, version_seen: int | None, note: str) -> str:
 
 def build_document(run_id: str, message: str, history: list[ChatEntry], note: str = "") -> str:
     """Вход первого хода новой сессии (stdin): служебная строка, история чата, сообщение пользователя — последним.
-    Акт, паспорт, карта прогона — в системном промпте; вердикты, карту, бланк помощник читает инструментом."""
+    Карта прогона — в инструкции; акт, паспорт и результаты помощник читает инструментом."""
     lines = [f"{m.role}: {m.text}" for m in history] or ["(начало диалога)"]
     return "\n".join([
         _service(run_id, None, note),
@@ -162,6 +161,10 @@ def turn(run_id: str, message: str, *, session: str | None = None, timeout_s: in
     (сессия браузера). Есть сессия CLI — продолжаем её; у CLI её больше нет — новая сессия с историей чата;
     временный сбой продолжения — ход «не получилось», сессия сохраняется (15.10).
     """
+    from app.operations import recover_pending_plan
+    recovered = recover_pending_plan(run_id)
+    if recovered is not None:
+        append_chat(run_id, "сервис", f"Прерванный план восстановлен: принятые шаги сохранены в версии {recovered}.", mark="частично")
     versions.recover(run_id)
     versions.ensure_v0(run_id)
     history = read_chat(run_id)[-HISTORY_MESSAGES:]
@@ -171,17 +174,21 @@ def turn(run_id: str, message: str, *, session: str | None = None, timeout_s: in
     # Гаранта, а не сбой; пометка — в служебной строке входа (не репликой чата: та сбивает номер хода для живых
     # шагов и засоряет историю разговора), помощник скажет сам
     garant = garant_available()
-    note = "" if garant else GARANT_OFF_NOTE
+    note = ("" if garant else "API Гаранта недоступен: нет токена. Интернет-версия может быть доступна через garant_web; "
+                               "при ошибке инструмента сообщи об этом пользователю.")
     if not garant:
         log_event(run_id, "garant_unavailable", who="помощник", reason="нет рабочего файла токена Гаранта")
-    mcp_tools = GARANT_TOOLS + RUN_TOOLS if garant else list(RUN_TOOLS)
+    mcp_tools = (GARANT_TOOLS if garant else []) + RUN_TOOLS + [WEB_TOOL]
+    context = shared_context(run_id)
+    revision = context_revision(context)
     common = dict(run_id=run_id, allowed_tools=ALLOWED_TOOLS_WEB, timeout_s=timeout_s, model=DIALOG_MODEL,
-                  shared_context=shared_context(run_id), mcp_tools=mcp_tools, mcp_config=mcp_config(run_id, garant),
+                  shared_context=context, mcp_tools=mcp_tools, mcp_config=mcp_config(run_id, garant),
                   short_cache_ttl=False)   # срок кэша 1 час: человек думает между сообщениями дольше 5 минут
     cli = load_session(run_id)
-    if cli is not None and session_reset_reason(cli):
+    reset_reason = (session_reset_reason(cli) or ("новая инструкция чата" if cli.context_revision != revision else None)) if cli else None
+    if cli is not None and reset_reason:
         archive_cli_session(run_dir(run_id) / SESSION)
-        log_event(run_id, "cli_session_reset", previous=cli.backend, backend=config.LLM_BACKEND, reason=session_reset_reason(cli))
+        log_event(run_id, "cli_session_reset", previous=cli.backend, backend=config.LLM_BACKEND, reason=reset_reason)
         cli = None
     cost = 0.0
     usage = ChatUsage()
@@ -222,7 +229,8 @@ def turn(run_id: str, message: str, *, session: str | None = None, timeout_s: in
         cost += result.cost_usd
         usage.add(result)
         if result.ok and result.value is not None and result.session_id:
-            cli = CliSession(session_id=result.session_id, started=_now(), **cli_result_fields(result))
+            cli = CliSession(session_id=result.session_id, started=_now(), context_revision=revision,
+                             **cli_result_fields(result))
             log_event(run_id, "dialog_session_started", session_id=result.session_id)
     add_cost(run_id, cost)
     state = versions.load_state(run_id)

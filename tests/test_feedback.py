@@ -12,6 +12,7 @@ from openpyxl import load_workbook
 
 from app.feedback import _col, _find_header_row, is_queued, read_remarks, remark_message, summary
 from app.nodes.excel import build_excel
+from app.trace import run_dir
 from test_excel import _buckets, _map, _passport, _request
 
 
@@ -84,6 +85,89 @@ def test_not_a_result_workbook(tmp_path):
     Workbook().save(p)
     with pytest.raises(ValueError, match="нет листа"):
         read_remarks(p)
+
+
+def test_invalid_agreement_reports_exact_location(filled, tmp_path):
+    wb = load_workbook(filled)
+    ws = wb["Вердикты"]
+    hdr = _find_header_row(ws, "Индикатор")
+    row = hdr + 1
+    col = _col(ws, hdr, "Согласны?")
+    ws.cell(row, col).value = "ТЕСТ: прошу объяснить основание"
+    out = tmp_path / "некорректный.xlsx"
+    wb.save(out)
+    with pytest.raises(ValueError) as exc:
+        read_remarks(out)
+    message = str(exc.value)
+    assert "Вердикты" in message and f"строка {row}" in message
+    assert ws.cell(row, col).coordinate in message and "Согласны?" in message
+    assert "индикатор" in message and "да» или «нет" in message
+
+
+@pytest.mark.parametrize("value", [0, 6, 2.5, "плохо", "3 балла"])
+def test_invalid_score_reports_location(filled, tmp_path, value):
+    wb = load_workbook(filled)
+    ws = wb["Карта гипотез"]
+    row, col = _find_header_row(ws) + 1, _col(ws, _find_header_row(ws), "Оценка (1–5)")
+    ws.cell(row, col).value = value
+    out = tmp_path / "ошибка.xlsx"
+    wb.save(out)
+    with pytest.raises(ValueError) as exc:
+        read_remarks(out)
+    assert "Карта гипотез" in str(exc.value) and ws.cell(row, col).coordinate in str(exc.value)
+    assert "от 1 до 5" in str(exc.value)
+
+
+def test_normalized_agreement_and_correct_alone_are_not_lost(filled, tmp_path):
+    wb = load_workbook(filled)
+    ws = wb["Вердикты"]
+    hdr = _find_header_row(ws, "Индикатор")
+    ws.cell(hdr + 1, _col(ws, hdr, "Согласны?")).value = "  НЕТ  "
+    ws.cell(hdr + 2, _col(ws, hdr, "Согласны?")).value = "  ДА  "
+    ws.cell(hdr + 3, _col(ws, hdr, "Если нет — какой верный")).value = "соблюдён"
+    out = tmp_path / "допустимый.xlsx"
+    wb.save(out)
+    remarks = read_remarks(out)
+    assert next(r for r in remarks if r.sheet == "Вердикты" and r.key == "1").agree == "нет"
+    assert next(r for r in remarks if r.sheet == "Вердикты" and r.key == "2").agree == "да"
+    assert is_queued(next(r for r in remarks if r.sheet == "Вердикты" and r.key == "3"))
+
+
+def test_bad_upload_preserves_existing_queue_and_file(filled, tmp_runs_dir, monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+    from app import dialog, trace, web
+
+    run_id = "run_upload"
+    existing = read_remarks(filled)
+    dialog.save_remarks(run_id, "эксперт.xlsx", existing)
+    relname = "dialog/expert/эксперт.xlsx"
+    trace.save_bytes(run_id, relname, filled.read_bytes())
+    queue_before = (run_dir(run_id) / dialog.REMARKS).read_bytes()
+    file_before = (run_dir(run_id) / relname).read_bytes()
+    wb = load_workbook(filled)
+    ws = wb["Вердикты"]
+    hdr = _find_header_row(ws, "Индикатор")
+    ws.cell(hdr + 1, _col(ws, hdr, "Согласны?")).value = "текст вместо ответа"
+    from io import BytesIO
+    bad = BytesIO()
+    wb.save(bad)
+
+    class Upload:
+        name = "эксперт.xlsx"
+        async def read(self):
+            return bad.getvalue()
+
+    notices = []
+    monkeypatch.setattr(web.ui, "notify", lambda message, **kwargs: notices.append(message))
+    monkeypatch.setattr(web.DIALOG_JOBS, "busy", lambda _: False)
+    view = web._DialogView.__new__(web._DialogView)
+    view._run_id, view._editable = run_id, True
+    view._upload = SimpleNamespace(reset=lambda: None)
+    asyncio.run(view._handle_expert_file(SimpleNamespace(file=Upload())))
+    assert (run_dir(run_id) / dialog.REMARKS).read_bytes() == queue_before
+    assert (run_dir(run_id) / relname).read_bytes() == file_before
+    assert notices and "Согласны?" in notices[0] and "Вердикты" in notices[0]
 
 
 # ---- 2.7 (итерация 4): «Где искать» и лист «Вопросы органу» ----

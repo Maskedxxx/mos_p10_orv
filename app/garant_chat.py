@@ -168,6 +168,13 @@ def _set_busy(chat_id: str, state: str | None) -> None:
             _BUSY[chat_id] = state
 
 
+def _start_busy(chat_id: str, state: str) -> None:
+    with _BUSY_LOCK:
+        if chat_id in _BUSY:
+            raise ValueError("В беседе уже выполняется действие. Дождитесь его завершения.")
+        _BUSY[chat_id] = state
+
+
 # ---- Документы беседы ----
 
 def add_document(chat_id: str, filename: str, data: bytes, session: str | None = None) -> int:
@@ -176,10 +183,19 @@ def add_document(chat_id: str, filename: str, data: bytes, session: str | None =
     Следующий ход начинает новую сессию CLI: текст документов — в её системном промпте. Выход: число знаков.
     Не прочитался — ValueError с понятной причиной (страница покажет её пользователю).
     """
+    _start_busy(chat_id, "читает документ")
+    try:
+        return _add_document(chat_id, filename, data, session)
+    finally:
+        _set_busy(chat_id, None)
+
+
+def _add_document(chat_id: str, filename: str, data: bytes, session: str | None) -> int:
     rid = chat_run_id(chat_id)
     root = run_dir(rid)
-    docs = list(chat_info(chat_id).documents)
-    n = len(docs) + 1
+    info = chat_info(chat_id)
+    docs = list(info.documents)
+    n = max(info.next_document_number, max((d.n for d in docs), default=0) + 1)
     suffix = Path(filename).suffix.lower()
     src = root / DOCS / f"{n:02d}{suffix}"
     src.parent.mkdir(parents=True, exist_ok=True)
@@ -194,14 +210,46 @@ def add_document(chat_id: str, filename: str, data: bytes, session: str | None =
     (root / DOCS / f"{n:02d}.md").write_text(text, encoding="utf-8")
     (root / DOCUMENT_FILE).unlink(missing_ok=True)   # шаг чтения пишет его по привычке прогона — здесь не нужен
     docs.append(GarantDocument(n=n, name=filename, chars=len(text), at=_now()))
-    info = chat_info(chat_id)
-    _update_info(chat_id, documents=docs, title=info.title or Path(filename).stem)
+    _update_info(chat_id, documents=docs, title=info.title or Path(filename).stem, next_document_number=n + 1)
     # Новый документ — в системном промпте новой сессии: старую больше не продолжаем
     archive_cli_session(root / SESSION)
     append_chat(chat_id, "сервис", f"Документ «{filename}» приложен: {len(text):,} знаков текста.".replace(",", " "),
                 mark="документ", session=session)
     log_event(rid, "garant_document_added", file=filename, chars=len(text))
     return len(text)
+
+
+def remove_document(chat_id: str, number: int, session: str | None = None) -> None:
+    """Убрать одно вложение и его текст; сообщения беседы сохраняются."""
+    _start_busy(chat_id, "удаляет документ")
+    try:
+        rid = chat_run_id(chat_id)
+        root = run_dir(rid)
+        info = chat_info(chat_id)
+        document = next((d for d in info.documents if d.n == number), None)
+        if document is None:
+            raise ValueError("Документ уже удалён или не найден.")
+        files = [root / DOCS / f"{number:02d}{Path(document.name).suffix.lower()}",
+                 root / DOCS / f"{number:02d}.md"]
+        saved = []
+        try:
+            saved = [(path, path.read_bytes()) for path in files]
+            archive_cli_session(root / SESSION)
+            _update_info(chat_id, documents=[d for d in info.documents if d.n != number],
+                         next_document_number=max(info.next_document_number, max(d.n for d in info.documents) + 1))
+            for path in files:
+                path.unlink()
+        except OSError as error:
+            for path, data in saved:
+                if not path.exists():
+                    path.write_bytes(data)
+            _update_info(chat_id, documents=info.documents, next_document_number=info.next_document_number)
+            raise ValueError("Не удалось удалить документ. Попробуйте ещё раз.") from error
+        append_chat(chat_id, "сервис", f"Документ «{document.name}» удалён из вложений; история беседы сохранена.",
+                    mark="документ", session=session)
+        log_event(rid, "garant_document_removed", file=document.name, number=number)
+    finally:
+        _set_busy(chat_id, None)
 
 
 def shared_context(chat_id: str) -> str:
@@ -261,14 +309,14 @@ def turn(chat_id: str, message: str, *, session: str | None = None, timeout_s: i
     не продолжилась (её нет у CLI или сбой) — новая сессия с историей беседы в этом же ходе.
     Ходов на весь сервис не больше GARANT_MAX_PARALLEL_TURNS — остальные ждут, беседа помечена «в очереди».
     """
-    rid = chat_run_id(chat_id)
-    history = read_chat(chat_id)[-HISTORY_MESSAGES:]
-    n = sum(1 for m in read_chat(chat_id) if m.role == "пользователь") + 1
-    append_chat(chat_id, "пользователь", message, session=session)
-    if not chat_info(chat_id).title.strip():
-        _update_info(chat_id, title=message.strip().splitlines()[0][:80])
-    _set_busy(chat_id, "в очереди")
+    _start_busy(chat_id, "в очереди")
     try:
+        rid = chat_run_id(chat_id)
+        history = read_chat(chat_id)[-HISTORY_MESSAGES:]
+        n = sum(1 for m in read_chat(chat_id) if m.role == "пользователь") + 1
+        append_chat(chat_id, "пользователь", message, session=session)
+        if not chat_info(chat_id).title.strip():
+            _update_info(chat_id, title=message.strip().splitlines()[0][:80])
         with _SLOTS:
             _set_busy(chat_id, "ищет")
             return _turn(chat_id, rid, message, history, n, session, timeout_s)

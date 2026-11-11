@@ -259,7 +259,7 @@ def test_all_field_names_across_all_models_are_latin():
     # Защита от того, что рекурсия случайно не дошла до части моделей
     # (13: + PairDecision — решение по кандидату на слияние, узел [5], ОС 2026-09-04;
     #  14: + SourceRef — происхождение позиции запроса, узел [6], ОС 2026-09-04)
-    assert len(all_models) == 62   # v2: + ActPassport с 24 вложенными, + PairDecision, + SourceRef;
+    assert len(all_models) == 63   # дополнительно CopyMapRow для копирования строки диалогом
     # итерация 3: + DialogTurn, 10 операций диалога и SplitPart;
     # 2.5: + строгие ответы с выжимкой — VerdictOutput, HypothesisSetOutput, HypothesisOutput,
     # EffectOutput, MergeOutput, MapRowOutput;
@@ -342,7 +342,6 @@ def _row(i: int, ind: list[int]) -> dict:
 
 
 @pytest.mark.parametrize("payload", [
-    {"rows": [_row(2, [1]), _row(1, [2])]},                                                  # row_id не по возрастанию
     {"rows": [_row(1, [1]), _row(1, [2])]},                                                  # row_id повторяется
     {"rows": [_row(1, [1])], "decisions": [{"row_ids": [1, 2], "merge": True, "reason": "r"}]},  # «слить» без слияния
     {"rows": [_row(1, [1, 2])], "merges": [{"merged_row_ids": [1, 2], "reason": "r"}],
@@ -354,6 +353,11 @@ def _row(i: int, ind: list[int]) -> dict:
 def test_hypothesis_map_inconsistency_rejected(payload):
     with pytest.raises(ValidationError):
         HypothesisMap(**payload)
+
+
+def test_stored_map_keeps_display_order_with_stable_ids():
+    result = HypothesisMap(rows=[_row(1, [1]), _row(7, [1]), _row(2, [2])])
+    assert [row.row_id for row in result.rows] == [1, 7, 2]
 
 
 def _item(**kw) -> dict:

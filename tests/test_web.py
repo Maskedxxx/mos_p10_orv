@@ -419,5 +419,46 @@ def test_menu_section(path: str, section: str | None):
 
 def test_version_zero_reads_as_original():
     """27.10: «версия 0» эксперту непонятна — на панели «исходная версия»."""
-    assert web.panel_state([], None, True, 0, _now()).detail == "Файл — исходная версия. Можно спрашивать или давать правки"
+    assert web.panel_state([], None, True, 0, _now()).detail == "Файл — исходная версия"
     assert web.version_label(2) == "версия 2"
+
+
+def test_read_only_window_cannot_close_session_even_from_handler(monkeypatch):
+    from types import SimpleNamespace
+    from app.dialog_jobs import DialogLock
+
+    lock = DialogLock(ttl_s=60)
+    assert lock.acquire("run", "owner", web.time.monotonic())
+    monkeypatch.setattr(web, "DIALOG_LOCK", lock)
+    calls, notices = [], []
+    monkeypatch.setattr(web, "close_by_user", lambda who, rid: calls.append(rid))
+    monkeypatch.setattr(web.ui, "notify", lambda text, **kwargs: notices.append(text))
+    monkeypatch.setattr(web.ui.navigate, "reload", lambda: None)
+
+    view = web._RunView.__new__(web._RunView)
+    view._run_id, view._who, view._requires_edit_lock = "run", None, True
+    view._client_id = "viewer"
+    box = SimpleNamespace(close=lambda: None)
+    view._close(box)
+    assert calls == [] and notices == [web.DIALOG_READ_ONLY]
+    view._client_id = "owner"
+    view._close(box)
+    assert calls == ["run"]
+
+
+def test_close_button_reflects_editing_lock(monkeypatch):
+    from types import SimpleNamespace
+    from app.dialog_jobs import DialogLock
+
+    lock = DialogLock(ttl_s=60)
+    lock.acquire("run", "first", web.time.monotonic())
+    monkeypatch.setattr(web, "DIALOG_LOCK", lock)
+    enabled = []
+    view = web._RunView.__new__(web._RunView)
+    view._run_id, view._requires_edit_lock = "run", True
+    view._close_button = SimpleNamespace(enable=lambda: enabled.append(True), disable=lambda: enabled.append(False))
+    view._client_id = "second"
+    view._update_close_access()
+    view._client_id = "first"
+    view._update_close_access()
+    assert enabled == [False, True]

@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import datetime
+import json
 
 from openpyxl import load_workbook
 
@@ -147,7 +148,7 @@ def test_opens_with_openpyxl_and_five_sheets(tmp_runs_dir):
     path = build_excel(_map(), _request(), _buckets(with_failed=True), _passport(), "run_a")
     wb = load_workbook(path)
     assert wb.sheetnames == [
-        "Как заполнять", "Карта гипотез", "Запрос показателей", "Вопросы органу", "Вердикты", "Ошибки прогона",
+        "Как заполнять", "Карта гипотез", "Запрос показателей", "Вопросы органу", "Вердикты", "Ошибки прогона", "Источники",
     ]
 
 
@@ -568,9 +569,78 @@ def test_basis_cell_carries_web_sources(tmp_runs_dir):
     path = build_excel(_map(), _request(), _buckets(with_failed=False), None, "run_basis_src")
     cell = _basis_cell(path)
     assert "Внешние источники:" in cell
-    assert "— https://practice.example/1" in cell
-    assert "— https://practice.example/2" in cell
-    assert cell.count("https://practice.example/1") == 1   # индикаторы 1 и 8 дали дубль
+    assert "лист «Источники»" in cell
+    wb = load_workbook(path)
+    sources = wb["Источники"]
+    urls = [row[4] for row in sources.iter_rows(min_row=3)]
+    assert any(c.value == "https://practice.example/1" and c.hyperlink.target == c.value for c in urls)
+    assert any(c.value == "https://practice.example/2" and c.hyperlink.target == c.value for c in urls)
+
+
+def test_source_details_are_taken_only_from_matching_check(tmp_runs_dir):
+    from app.trace import run_dir
+    root = run_dir("run_source_details")
+    (root / "03_verdicts").mkdir(parents=True)
+    (root / "03_verdicts/01.checks.json").write_text(json.dumps({
+        "references": [{"source": "https://practice.example/1", "name": "Проверенный документ", "found": "Точная запись проверки"}]
+    }, ensure_ascii=False), encoding="utf-8")
+    wb = load_workbook(build_excel(_map(), _request(), _buckets(with_failed=False), None, "run_source_details"))
+    rows = list(wb["Источники"].iter_rows(min_row=3, values_only=True))
+    known = next(row for row in rows if row[0].startswith("1.") and row[4] == "https://practice.example/1")
+    assert known[2:4] == ("Проверенный документ", "Точная запись проверки")
+    other = next(row for row in rows if row[4] == "https://practice.example/2")
+    assert other[3] == "Связь с отдельным выводом не указана"
+
+
+def test_sources_keep_each_check_with_its_status_and_link(tmp_runs_dir):
+    """Разные записи одного адреса и позиция без адреса остаются видны эксперту."""
+    root = run_dir("run_all_sources")
+    checks = root / "03_verdicts"
+    checks.mkdir(parents=True)
+    samples = {
+        3: {"references": [
+            {"name": "Акт А", "clause": "п. 1", "found": "действует", "status": "актуально", "source": "https://example.org/a"},
+            {"name": "Акт Б", "clause": "п. 2", "found": "отменён", "status": "устарело", "source": "https://example.org/a"},
+            {"name": "Орган В", "clause": "п. 3", "found": "текст не получен", "status": "не проверено", "source": None},
+        ]},
+        4: {"compared": [{"requirement": "условие", "clause": "п. 4", "counterpart": "другой акт",
+                           "counterpart_source": "https://example.org/b", "comparison": "есть ссылка", "relation": "ссылка"}]},
+        10: {"targets": [{"target_id": 2, "subject": "исполнение"}], "findings": [
+            {"target_id": 2, "source": "https://example.org/c", "fact": "найден факт", "about": "практика",
+             "read_status": "не прочитано", "mark": "недостаточно для вывода"}]},
+        11: {"deadlines": [{"what": "выдача", "clause": "п. 5", "federal": "норма не найдена",
+                            "federal_source": None, "check_status": "не найдена", "mark": "не проверено"}]},
+    }
+    for number, value in samples.items():
+        (checks / f"{number:02d}.checks.json").write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
+    verdicts = [Verdict(indicator=n, name=f"индикатор {n}", verdict="нет данных", rationale="не хватает сведений", missing_data="нужны данные",
+                        sources=["https://example.org/final"] if n == 3 else []) for n in samples]
+    path = build_excel(_map(), _request(), Buckets(no_data=verdicts), None, "run_all_sources")
+    ws = load_workbook(path)["Источники"]
+    rows = list(ws.iter_rows(min_row=3))
+    records = [row for row in rows if row[7].value == "Таблица проверки"]
+    assert len(records) == 6
+    by_name = {row[2].value: row for row in records}
+    assert by_name["Акт А"][5].value == "актуально"
+    assert by_name["Акт Б"][5].value == "устарело"
+    assert by_name["Акт А"][4].hyperlink.target == by_name["Акт Б"][4].hyperlink.target == "https://example.org/a"
+    assert by_name["Орган В"][4].value == "Адрес не указан"
+    assert by_name["Орган В"][4].hyperlink is None
+    assert by_name["Орган В"][5].value == "не проверено"
+    assert by_name["другой акт"][5].value == "ссылка"
+    assert by_name["example.org"][5].value == "не прочитано; недостаточно для вывода"
+    assert "Цель 2\nисполнение" in by_name["example.org"][6].value
+    assert by_name["норма не найдена"][5].value == "не найдена; не проверено"
+    assert any(row[4].value == "https://example.org/final" and row[7].value == "Вердикт" for row in rows)
+
+
+def test_broken_check_table_is_not_silently_omitted(tmp_runs_dir):
+    checks = run_dir("broken_sources") / "03_verdicts"
+    checks.mkdir(parents=True)
+    (checks / "03.checks.json").write_text("{broken", encoding="utf-8")
+    ws = load_workbook(build_excel(_map(), _request(), _buckets(with_failed=False), None, "broken_sources"))["Источники"]
+    assert any(row[2].value == "Таблица проверки недоступна" and row[5].value == "Статус неизвестен"
+               for row in ws.iter_rows(min_row=3))
 
 
 def test_basis_cell_falls_back_to_verdict_proof(tmp_runs_dir):
@@ -589,7 +659,7 @@ def test_basis_cell_states_when_no_quote_but_sources():
     assert cell.startswith("Норма акта, п. 2.2, 2.3, 4-6:")   # префикс «п.» не удваивается
     assert "цитата из акта не приведена" in cell
     assert "не на тексте акта" not in cell
-    assert "— https://www.privatmed.ru/a" in cell
+    assert "лист «Источники»" in cell
 
 
 def test_basis_cell_states_when_nothing_at_all():
@@ -616,8 +686,7 @@ def test_verdicts_sheet_basis_column(tmp_runs_dir):
     basis = ws.cell(row=rows[2], column=_col(ws, hdr, "На чём основано")).value
     assert basis.startswith("Норма акта, п. 2.1:\n«цитата»")
     assert "Внешние источники:" in basis
-    assert "— https://docs.cntd.ru/document/3666532" in basis
-    assert "— https://www.mos.ru/depr/" in basis
+    assert "лист «Источники»" in basis
 
     # индикатор 5 «не применимо» — ни цитаты, ни адресов, но клетка не пустая
     assert ws.cell(row=rows[5], column=_col(ws, hdr, "На чём основано")).value == (
@@ -660,9 +729,9 @@ def test_request_sheet_shows_source_rows(tmp_runs_dir):
     ws = load_workbook(path)["Запрос показателей"]
     hdr = _find_header_row(ws, "Показатель")
 
-    assert ws.cell(row=hdr + 1, column=_col(ws, hdr, "Откуда запрос")).value == (
-        "стр. 1 — инд. 1, 8\nстр. 2 — инд. 3"
-    )
+    value = ws.cell(row=hdr + 1, column=_col(ws, hdr, "Откуда запрос")).value
+    assert "Карта гипотез, строка 1; индикатор 1 —" in value
+    assert "Карта гипотез, строка 2; индикатор 3 —" in value
 
 
 def test_request_sheet_shows_clause(tmp_runs_dir):
@@ -709,7 +778,7 @@ def test_backref_round_trip(tmp_runs_dir):
 
     # обратно: номер строки из «Откуда запрос» есть среди номеров карты
     back = ws_req.cell(row=req_hdr + 1, column=_col(ws_req, req_hdr, "Откуда запрос")).value
-    assert back.startswith("стр. 1 — инд. ")
+    assert back.startswith("Карта гипотез, строка 1; индикатор ")
     assert 1 in map_ids
 
 
@@ -734,7 +803,7 @@ _SHEETS_AND_ANCHORS = (
 def test_sheet_names_say_what_is_on_them(tmp_runs_dir):
     path = build_excel(_map(), _request(), _buckets(with_failed=True), _passport(), "run_names")
     wb = load_workbook(path)
-    assert wb.sheetnames == ["Как заполнять"] + [name for name, _ in _SHEETS_AND_ANCHORS]
+    assert wb.sheetnames == ["Как заполнять"] + [name for name, _ in _SHEETS_AND_ANCHORS] + ["Источники"]
 
 
 def test_each_sheet_has_caption_above_header(tmp_runs_dir):
@@ -864,6 +933,7 @@ def test_expert_columns_have_dropdown_lists(tmp_runs_dir):
         col_letter = ws.cell(row=hdr, column=_col(ws, hdr, name)).column_letter
         dvs = [dv for dv in ws.data_validations.dataValidation if dv.formula1 == formula]
         assert dvs, (sheet, name)
+        assert dvs[0].showErrorMessage and dvs[0].errorStyle == "stop" and dvs[0].error
         covered = str(dvs[0].sqref)
         assert covered == f"{col_letter}{hdr + 1}:{col_letter}{ws.max_row}", (sheet, covered)
 
@@ -958,7 +1028,9 @@ def test_map_has_unverified_row_for_no_data_without_hypotheses(tmp_runs_dir):
     assert hyp.startswith("Нужна ручная проверка")
     assert "текст статей Закона города Москвы от 13.11.2024 № 27" in hyp, "что не проверено — из missing_data"
     assert "не открылся" not in hyp, "2.5: весь ход проверки агента в клетку больше не идёт"
-    assert "запрос органу не идёт" in data
+    assert "В запрос органу эта строка не входит" in data
+    assert "текст статей Закона города Москвы" in data
+    assert "Что проверить" in data and "не установлен" in data and "Где искать" in data
     assert "цитата вердикта 4" in basis and "2.6" in basis
 
 
@@ -1082,7 +1154,7 @@ def test_default_book_unchanged_by_version_features(tmp_runs_dir):
     """Без параметров версий: шесть листов (2.7: + «Вопросы органу»), колонки «Изменения» нет, строки «Версия файла» нет."""
     wb = load_workbook(build_excel(_map(), _request(), _buckets(with_failed=True), _passport(), "run_v0"))
     assert wb.sheetnames == ["Как заполнять", "Карта гипотез", "Запрос показателей", "Вопросы органу", "Вердикты",
-                             "Ошибки прогона"]
+                             "Ошибки прогона", "Источники"]
     for sheet, anchor in (("Карта гипотез", "Индикаторы"), ("Запрос показателей", "Показатель"), ("Вердикты", "Вердикт")):
         ws = wb[sheet]
         assert "Изменения" not in [c.value for c in ws[_find_header_row(ws, anchor)]]
@@ -1112,6 +1184,20 @@ def test_journal_sheet_lists_changes(tmp_runs_dir):
     assert len(body) == 2
     assert body[0][_col(ws, hdr, "Где") - 1] == "Вердикты, инд. 3"
     assert body[1][_col(ws, hdr, "Почему") - 1] == "убрать воду"
+
+
+def test_journal_does_not_truncate_long_recheck_evidence(tmp_runs_dir):
+    before = "Предыдущая проверка: " + "а" * 33000 + " ИСТОЧНИК В КОНЦЕ"
+    after = "Новый результат: " + "б" * 34000 + " НОВЫЙ ИСТОЧНИК"
+    entry = JournalEntry(version=1, at="2026-09-26T10:00:00", kind="решение эксперта",
+                         target="Вердикты, инд. 3", action="перепроверен", before=before, after=after)
+    path = build_excel(_map(), _request(), _buckets(with_failed=False), _passport(), "run_long_journal",
+                       version=1, journal=[entry])
+    ws = load_workbook(path)["Журнал изменений"]
+    hdr = _find_header_row(ws, "Что сделано")
+    rows = list(ws.iter_rows(min_row=hdr + 1, values_only=True))
+    assert "".join(str(r[_col(ws, hdr, "Было") - 1] or "") for r in rows) == before
+    assert "".join(str(r[_col(ws, hdr, "Стало") - 1] or "") for r in rows) == after
 
 
 def test_marks_column_on_three_sheets(tmp_runs_dir):
@@ -1245,7 +1331,7 @@ def test_questions_sheet_after_request_and_not_in_request(tmp_runs_dir):
     assert "Оценка (1–5)" in header and "Замечание" in header
     q = next(r for r in rows if r and r[0] == "2")
     assert q[1] == "Назовите три наиболее частых основания для продления срока ГЭЭ" and q[3] == "2.7.1.2"
-    assert "стр. 1" in q[4]
+    assert "Карта гипотез, строка 1" in q[4]
     assert "Вопросы органу словами" in str(rows[0])
 
 
@@ -1272,7 +1358,7 @@ def test_question_note_survives_export_and_feedback_columns(tmp_runs_dir):
     row = next(r for r in range(hdr + 1, ws.max_row + 1) if ws.cell(r, 1).value == "2")
     assert ws.cell(row, _col(ws, hdr, "Пояснение")).value == note
     assert ws.cell(row, _col(ws, hdr, "Пункт акта")).value == "2.7.1.2"
-    assert "стр. 1" in ws.cell(row, _col(ws, hdr, "Строки карты")).value
+    assert "Карта гипотез, строка 1" in ws.cell(row, _col(ws, hdr, "Строки карты")).value
     ws.cell(row, _col(ws, hdr, "Оценка (1–5)"), 4)
     ws.cell(row, _col(ws, hdr, "Замечание"), "Уточнить охват вопроса")
     wb.save(path)
@@ -1283,8 +1369,8 @@ def test_question_note_survives_export_and_feedback_columns(tmp_runs_dir):
     )
 
 
-def test_overlap_warning_is_visible_only_on_affected_rows_without_changing_map(tmp_runs_dir):
-    """Готовое предупреждение видно с обеих сторон, поля и чужие строки не меняются."""
+def test_overlap_warning_is_on_separate_sheet_without_changing_map(tmp_runs_dir):
+    """Полный текст и исходные номера отдельно; карта содержит короткую ссылку."""
     from app.contracts import PairDecision
 
     hyp_map = _map()
@@ -1300,9 +1386,12 @@ def test_overlap_warning_is_visible_only_on_affected_rows_without_changing_map(t
     wb = load_workbook(build_excel(hyp_map, _request(), _buckets(with_failed=False),
                                   _passport(), "run_overlap_note"))
     rows = {r[0]: r for r in _sheet_rows(wb["Карта гипотез"]) if r and isinstance(r[0], int)}
-    assert note in rows[1][4] and "Пересечение со строками 2" in rows[1][4]
-    assert note in rows[2][4] and "Пересечение со строками 1" in rows[2][4]
-    assert note not in rows[3][4]
+    assert all(note not in r[4] for r in rows.values())
+    warning = list(wb["Предупреждения"].iter_rows(min_row=3, values_only=True))
+    assert warning == [("1, 2", note)]
+    caption = wb["Карта гипотез"].cell(2, 1)
+    assert "Предупреждения" in caption.value and note not in caption.value
+    assert caption.hyperlink.target == "#'Предупреждения'!A1"
     for row in hyp_map.rows:
         assert row.hypothesis in rows[row.row_id][2]
         assert row.effects[0].metric in rows[row.row_id][3]
@@ -1321,16 +1410,12 @@ def _map_with_merge_and_partial_overlap() -> HypothesisMap:
     )
 
 
-def test_overlap_warning_uses_final_row_numbers_after_full_merge(tmp_runs_dir):
-    """Исходные1/2 слиты в итоговую1, исходная3 стала итоговой2."""
+def test_overlap_warning_retains_original_numbers_after_full_merge(tmp_runs_dir):
+    """Предупреждение сохраняет исходные номера, без выдуманных связей."""
     wb = load_workbook(build_excel(_map_with_merge_and_partial_overlap(), _request(),
                                   _buckets(with_failed=False), _passport(), "run_overlap_merged"))
-    rows = {r[0]: r for r in _sheet_rows(wb["Карта гипотез"]) if r and isinstance(r[0], int)}
-    assert "Пересечение со строками 2" in rows[1][4]
-    assert "Пересечение со строками 1" in rows[2][4]
-    assert "Не складывать пересекающиеся случаи." in rows[1][4]
-    assert "Не складывать пересекающиеся случаи." in rows[2][4]
-    assert "Пересечение со строками 3" not in str(rows)
+    rows = list(wb["Предупреждения"].iter_rows(min_row=3, values_only=True))
+    assert rows == [("2, 3", "Не складывать пересекающиеся случаи.")]
 
 
 def test_edited_map_keeps_original_warning_without_guessing_current_rows(tmp_runs_dir):
@@ -1338,8 +1423,9 @@ def test_edited_map_keeps_original_warning_without_guessing_current_rows(tmp_run
     wb = load_workbook(build_excel(_map_with_merge_and_partial_overlap(), _request(),
                                   _buckets(with_failed=False), _passport(), "run_overlap_version", version=1))
     rows = _sheet_rows(wb["Карта гипотез"])
-    assert "Исходные гипотезы 2, 3" in str(rows)
-    assert "Не складывать пересекающиеся случаи." in str(rows)
+    assert "2, 3" not in str(rows)
+    assert list(wb["Предупреждения"].iter_rows(min_row=3, values_only=True)) == [
+        ("2, 3", "Не складывать пересекающиеся случаи.")]
     data_rows = [r for r in rows if r and isinstance(r[0], int)]
     assert all("Пересечение со строками" not in str(r[4]) for r in data_rows)
 

@@ -35,7 +35,7 @@ def _ok(value: DialogTurn, cost: float = 0.4) -> CallResult:
 
 
 def test_turn_sends_all_blocks_and_records_chat(rid, monkeypatch):
-    """Первый ход — новая сессия: системный промпт = промпт 07 + карта прогона + акт + паспорт;
+    """Первый ход — новая сессия: системный промпт = промпт 07 + карта прогона;
     вход = служебная строка, история, сообщение; инструменты — чтение артефактов прогона (14.10)."""
     seen = {}
 
@@ -50,8 +50,10 @@ def test_turn_sends_all_blocks_and_records_chat(rid, monkeypatch):
 
     system, doc = seen["shared_context"], seen["document"]
     assert system.startswith("Промпт 07_dialog (фикстура).")
-    for block in ("# КАРТА ПРОГОНА", "## ПОЛНЫЙ ТЕКСТ АКТА", "ТЕКСТ АКТА: п. 2.4.1"):
-        assert block in system
+    assert "# КАРТА ПРОГОНА" in system
+    assert "## ПОЛНЫЙ ТЕКСТ АКТА" not in system
+    assert "ТЕКСТ АКТА: п. 2.4.1" not in system
+    assert "## ПАСПОРТ АКТА (JSON)" not in system
     for block in ("## СЛУЖЕБНО", "Сейчас версия v0.", "## ИСТОРИЯ ДИАЛОГА", "## СООБЩЕНИЕ ПОЛЬЗОВАТЕЛЯ"):
         assert block in doc
     assert "## ВЕРДИКТЫ (JSON)" not in doc + system          # вердикты помощник читает инструментом
@@ -60,7 +62,7 @@ def test_turn_sends_all_blocks_and_records_chat(rid, monkeypatch):
     assert seen["model_cls"] is DialogTurn and seen["allowed_tools"] == ["WebSearch", "WebFetch"]
     # решение владельца 14.10: весь Гарант всегда (и выгрузки) + чтение артефактов
     from app.config import GARANT_ALL_TOOLS
-    assert seen["mcp_tools"] == list(GARANT_ALL_TOOLS) + dialog_module.RUN_TOOLS
+    assert seen["mcp_tools"] == list(GARANT_ALL_TOOLS) + dialog_module.RUN_TOOLS + [dialog_module.WEB_TOOL]
     assert "garant_export_block_html" in seen["mcp_tools"]
     assert seen["model"] == dialog_module.DIALOG_MODEL and seen["short_cache_ttl"] is False
     assert seen["trace_name"].startswith("dialog/turns/")
@@ -78,6 +80,20 @@ def test_turn_returns_plan(rid, monkeypatch):
     res = dialog_module.turn(rid, "Эксперт: инд. 7 не соблюдён")
     assert res.plan == [op]
     assert dialog_module.read_chat(rid)[-1].plan[0]["kind"] == "смена вердикта"
+
+
+def test_old_context_starts_new_session_with_chat_history(rid, monkeypatch):
+    dialog_module.append_chat(rid, "пользователь", "старый вопрос")
+    dialog_module.append_chat(rid, "ассистент", "старый ответ")
+    dialog_module._save_session(rid, CliSession(session_id="old", started="x"))
+    call = Mock(return_value=_ok(DialogTurn(reply="новый ответ")))
+    monkeypatch.setattr(dialog_module, "call", call)
+
+    dialog_module.turn(rid, "новый вопрос")
+    args, kwargs = call.call_args
+    assert "resume_session_id" not in kwargs
+    assert "старый вопрос" in args[1] and "старый ответ" in args[1]
+    assert dialog_module.load_session(rid).context_revision == dialog_module.context_revision(dialog_module.shared_context(rid))
 
 
 def test_turn_failure_gives_readable_reply_without_plan(rid, monkeypatch):
@@ -98,6 +114,24 @@ def test_remarks_queue_one_by_one(rid):
     assert dialog_module.next_remark(rid) == rs[0]
     assert dialog_module.next_remark(rid) == rs[1]
     assert dialog_module.next_remark(rid) is None and dialog_module.remarks_progress(rid) == (2, 2)
+
+
+def test_failed_expert_remark_stays_in_chat_but_queue_moves_on(rid, monkeypatch):
+    from app.contracts import Remark
+    from app.feedback import remark_message
+
+    remarks = [Remark(sheet="Вердикты", key="1", title="тест", text="Проверить основание"),
+               Remark(sheet="Вердикты", key="2", title="тест", text="Следующее замечание")]
+    dialog_module.save_remarks(rid, "эксперт.xlsx", remarks)
+    failed = CallResult(value=None, ok=False, attempts=3, cost_usd=0, session_id=None, error="таймаут",
+                        permission_denials=[], duration_s=1.0)
+    monkeypatch.setattr(dialog_module, "call", Mock(return_value=failed))
+    remark = dialog_module.next_remark(rid)
+    dialog_module.turn(rid, remark_message(remark))
+    chat = dialog_module.read_chat(rid)
+    assert "Проверить основание" in chat[-2].text and chat[-1].mark == "сбой"
+    assert dialog_module.remarks_progress(rid) == (1, 2)
+    assert dialog_module.next_remark(rid).text == "Следующее замечание"
 
 
 def test_status_file_set_read_clear(rid):
@@ -123,6 +157,7 @@ def test_mcp_config_reads_only_this_run(rid):
     assert data["garant"]["headers"]["Authorization"] == "Bearer ${GARANT_TOKEN}"
     assert data["p10run"]["args"][0].endswith("app/mcp_run.py")
     assert data["p10run"]["env"]["P10_RUN_DIR"] == str(run_dir(rid).resolve())
+    assert data["garantweb"]["args"][0].endswith("app/mcp_garant_web.py")
 
 
 def test_second_turn_resumes_with_version_line(rid, monkeypatch):
@@ -160,7 +195,7 @@ def test_lost_session_falls_back_to_new_with_history(rid, monkeypatch):
                         permission_denials=[], duration_s=1.0)   # так CLI отвечает на --resume без сессии (проба 15.10)
     new = CallResult(value=DialogTurn(reply="ок"), ok=True, attempts=1, cost_usd=0.2, session_id="sess-B",
                      error=None, permission_denials=[], duration_s=1.0)
-    dialog_module._save_session(rid, CliSession(**{"session_id": "dead", "started": "x", "last_turn": "x", "version_seen": 0}))
+    dialog_module._save_session(rid, CliSession(**{"session_id": "dead", "started": "x", "last_turn": "x", "version_seen": 0, "context_revision": dialog_module.context_revision(dialog_module.shared_context(rid))}))
     mock = Mock(side_effect=[failed, new])
     monkeypatch.setattr(dialog_module, "call", mock)
     res = dialog_module.turn(rid, "вопрос")
@@ -217,7 +252,7 @@ def test_temporary_resume_failure_keeps_session(rid, monkeypatch):
     сессия не запускается: ход — «не получилось», следующий ход продолжит ту же сессию."""
     failed = CallResult(value=None, ok=False, attempts=3, cost_usd=0.05, session_id=None,
                         error="процесс завершился с кодом 1: таймаут", permission_denials=[], duration_s=1.0)
-    dialog_module._save_session(rid, CliSession(**{"session_id": "alive", "started": "x", "last_turn": "x", "version_seen": 0}))
+    dialog_module._save_session(rid, CliSession(**{"session_id": "alive", "started": "x", "last_turn": "x", "version_seen": 0, "context_revision": dialog_module.context_revision(dialog_module.shared_context(rid))}))
     mock = Mock(return_value=failed)
     monkeypatch.setattr(dialog_module, "call", mock)
     res = dialog_module.turn(rid, "вопрос")
@@ -235,9 +270,9 @@ def test_turn_without_garant_token_works_without_garant(rid, monkeypatch, tmp_pa
     monkeypatch.setattr(dialog_module, "call", mock)
     dialog_module.turn(rid, "вопрос")
     kw = mock.call_args.kwargs
-    assert kw["mcp_tools"] == dialog_module.RUN_TOOLS
+    assert kw["mcp_tools"] == dialog_module.RUN_TOOLS + [dialog_module.WEB_TOOL]
     assert "garant" not in __import__("json").loads(open(kw["mcp_config"], encoding="utf-8").read())["mcpServers"]
-    assert "Гарант сейчас недоступен" in mock.call_args.args[1]
+    assert "API Гаранта недоступен" in mock.call_args.args[1]
     assert [e.role for e in dialog_module.read_chat(rid)] == ["пользователь", "ассистент"]
 
 
@@ -269,7 +304,7 @@ def test_resume_failing_two_turns_in_a_row_starts_new_session(rid, monkeypatch):
                         error="ошибка API: Prompt is too long", permission_denials=[], duration_s=1.0)
     new = CallResult(value=DialogTurn(reply="ок"), ok=True, attempts=1, cost_usd=0.2, session_id="sess-B",
                      error=None, permission_denials=[], duration_s=1.0)
-    dialog_module._save_session(rid, CliSession(**{"session_id": "stuck", "started": "x", "last_turn": "x", "version_seen": 0}))
+    dialog_module._save_session(rid, CliSession(**{"session_id": "stuck", "started": "x", "last_turn": "x", "version_seen": 0, "context_revision": dialog_module.context_revision(dialog_module.shared_context(rid))}))
     mock = Mock(side_effect=[failed, failed, new])
     monkeypatch.setattr(dialog_module, "call", mock)
     assert "не получилось" in dialog_module.turn(rid, "первый").reply.lower()
@@ -283,7 +318,7 @@ def test_failed_resume_updates_cost_base(rid, monkeypatch):
     обновляется — иначе следующий ход ещё раз посчитает деньги упавшего хода."""
     failed = CallResult(value=None, ok=False, attempts=3, cost_usd=0.9, session_id="alive", error="ответ не по схеме",
                         permission_denials=[], duration_s=1.0, session_cost_usd=1.9)
-    dialog_module._save_session(rid, CliSession(**{"session_id": "alive", "started": "x", "last_turn": "x", "version_seen": 0,
+    dialog_module._save_session(rid, CliSession(**{"session_id": "alive", "started": "x", "last_turn": "x", "version_seen": 0, "context_revision": dialog_module.context_revision(dialog_module.shared_context(rid)),
                                       "cost_reported": 1.0}))
     monkeypatch.setattr(dialog_module, "call", Mock(return_value=failed))
     dialog_module.turn(rid, "вопрос")
